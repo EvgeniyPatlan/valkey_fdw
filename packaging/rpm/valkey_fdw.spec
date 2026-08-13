@@ -79,6 +79,20 @@ make %{?_smp_mflags} USE_PGXS=1 PG_CONFIG=%{pgpath}/bin/pg_config \
      VALKEY_VENDORED=1 LIBVALKEY_DIR=%{_builddir}/libvalkey-prefix
 
 %install
+# check-rpaths counts the runpath PGXS bakes in as invalid, on EL 10 only.
+#
+# Every PostgreSQL extension links with -Wl,-rpath,'<pkglibdir>' - here
+# /usr/pgsql-17/lib, which is both where this module is installed and where
+# the server's own libraries are. redhat-rpm-config's check classes an RPATH
+# equal to the file's own directory under 0x0002 and fails the build; EL 8 and
+# EL 9 ship a check that does not, which is why this surfaces on one target
+# and not its siblings.
+#
+# Suppressed by class and not by turning the check off. The other classes it
+# looks for are real - a relative runpath, or one reaching through '..' of a
+# symlinked path - and this package would still fail on them.
+export QA_RPATHS=$(( 0x0002 ))
+
 make install USE_PGXS=1 PG_CONFIG=%{pgpath}/bin/pg_config \
      VALKEY_VENDORED=1 LIBVALKEY_DIR=%{_builddir}/libvalkey-prefix \
      DESTDIR=%{buildroot}
