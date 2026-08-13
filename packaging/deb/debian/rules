@@ -1,0 +1,48 @@
+#!/usr/bin/make -f
+#
+# libvalkey is linked STATICALLY: no distribution in the target matrix
+# packages it, so a dynamic link would mean shipping a second package and
+# pinning its soname across eight targets. OpenSSL stays dynamic - it is
+# present everywhere and security-critical, and vendoring it would mean
+# shipping our own CVE surface.
+
+PG_MAJOR ?= 17
+PGC       = /usr/lib/postgresql/$(PG_MAJOR)/bin/pg_config
+PREFIX    = $(CURDIR)/debian/libvalkey-prefix
+
+%:
+	dh $@
+
+LIBVALKEY_REF ?= 0.5.0
+
+override_dh_auto_build:
+	# Cloned rather than taken from vendor/: the tree carries no vendored
+	# copy, so the package fetches the pinned tag and is self-contained.
+	rm -rf _libvalkey
+	git clone --depth 1 --branch $(LIBVALKEY_REF) \
+	    https://github.com/valkey-io/libvalkey.git _libvalkey
+	cmake -S _libvalkey -B _libvalkey/build \
+	      -DCMAKE_BUILD_TYPE=Release -DENABLE_TLS=ON -DDISABLE_TESTS=ON \
+	      -DBUILD_SHARED_LIBS=OFF -DCMAKE_INSTALL_PREFIX=$(PREFIX) \
+	      -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+	cmake --build _libvalkey/build -j$(shell nproc)
+	cmake --install _libvalkey/build
+	$(MAKE) USE_PGXS=1 PG_CONFIG=$(PGC) VALKEY_VENDORED=1 \
+	        LIBVALKEY_DIR=$(PREFIX)
+
+override_dh_auto_install:
+	$(MAKE) install USE_PGXS=1 PG_CONFIG=$(PGC) VALKEY_VENDORED=1 \
+	        LIBVALKEY_DIR=$(PREFIX) \
+	        DESTDIR=$(CURDIR)/debian/postgresql-$(PG_MAJOR)-valkey-fdw
+# The diagnostic extension does not ship. valkey_fdw_test carries entry points
+# that reach a Valkey server without going through a foreign table, three of
+# them dialling a host and port given as arguments. They are guarded - the
+# control file is superuser-only and every function is revoked from PUBLIC -
+# but a machine that will never run the suites has no use for the surface.
+# dh installs whatever the staging directory holds, so the choice is made by
+# what is left in it.
+	rm -f $(CURDIR)/debian/postgresql-$(PG_MAJOR)-valkey-fdw/usr/share/postgresql/$(PG_MAJOR)/extension/valkey_fdw_test.control \
+	      $(CURDIR)/debian/postgresql-$(PG_MAJOR)-valkey-fdw/usr/share/postgresql/$(PG_MAJOR)/extension/valkey_fdw_test--*.sql
+
+# The suite needs a running Valkey; packaging builds do not have one.
+override_dh_auto_test:

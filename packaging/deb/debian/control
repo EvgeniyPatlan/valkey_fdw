@@ -1,0 +1,26 @@
+Source: valkey-fdw
+Section: database
+Priority: optional
+Maintainer: Evgeniy Patlan <evgeniy.patlan@percona.com>
+Build-Depends: debhelper-compat (= 13),
+               postgresql-server-dev-PGMAJOR,
+               cmake,
+               git,
+               libssl-dev
+Standards-Version: 4.6.2
+# No Homepage field. It means "where this package comes from", and the answer
+# is not a published address yet; any plausible-looking one would place the
+# package inside an organisation that does not host it. Absent says nothing
+# false, and one line restores it once there is a home to name.
+
+Package: postgresql-PGMAJOR-valkey-fdw
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, postgresql-PGMAJOR
+Description: PostgreSQL foreign data wrapper for Valkey
+ valkey_fdw presents Valkey keys as PostgreSQL foreign tables: strings,
+ hashes, lists, sets and sorted sets, with TLS, ACL authentication and
+ cluster support.
+ .
+ Writes are buffered and applied atomically by a single script at
+ pre-commit, so a transaction that commits in PostgreSQL has been accepted
+ by Valkey in full or not at all.

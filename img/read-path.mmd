@@ -1,0 +1,14 @@
+sequenceDiagram
+    participant PG as Executor
+    participant F as valkey_fdw
+    participant V as Valkey
+    PG->>F: next tuple
+    F->>V: SCAN cursor MATCH prefix COUNT n
+    V-->>F: cursor + up to n keys
+    F->>V: GET/HGETALL ×n  (pipelined, up to pipeline_batch)
+    V-->>F: n replies
+    loop per key
+        F->>F: overlay check (this transaction's own writes)
+        F-->>PG: tuple
+    end
+    Note over F,V: cursor 0 ends the traversal —<br/>on a cluster, only after every primary

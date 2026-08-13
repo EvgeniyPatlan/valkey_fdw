@@ -1,0 +1,265 @@
+-- Protocol shapes that a well-behaved modern server never produces.
+--
+-- Three rows of the register lived here, and all three were unreachable for
+-- the same reason: every image this suite runs against speaks RESP3 and
+-- answers correctly. The fault proxy is the only way to meet a server that
+-- does neither.
+--
+-- Runs only on the `fault` topology, where 'valkey' is the proxy and
+-- 'valkey-upstream' is the real server behind it.
+CREATE TEMP TABLE resp_ctl(reply text);
+CREATE FUNCTION resp_arm(rule text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE r text;
+BEGIN
+    DELETE FROM resp_ctl;
+    EXECUTE format(
+        'COPY resp_ctl FROM PROGRAM %L',
+        'printf ' || quote_literal(rule || E'\n') || ' | nc -q1 valkey 6390');
+    SELECT reply INTO r FROM resp_ctl LIMIT 1;
+    RETURN r;
+END $$;
+-- A rule that never matches leaves the statement below it succeeding, and
+-- `harness.sh record` then bakes that success in as expected output. Counting
+-- fired rules is what separates "the fault was injected and handled" from
+-- "the fault was never injected", and this tree has shipped the latter.
+CREATE FUNCTION resp_fired() RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE r text;
+BEGIN
+    r := resp_arm('stats');
+    RETURN (regexp_match(r, 'faults_fired=([0-9]+)'))[1]::bigint;
+END $$;
+SELECT resp_arm('clear') AS cleared;
+ cleared 
+---------
+ +OK
+(1 row)
+
+-- The real server, reached directly. Fixtures are built here so that a rule
+-- armed against the proxy cannot eat a fixture command by mistake.
+CREATE SERVER rp_direct FOREIGN DATA WRAPPER valkey_fdw
+    OPTIONS (host 'valkey-upstream', port '6379');
+CREATE USER MAPPING FOR CURRENT_USER SERVER rp_direct;
+SELECT valkey_fdw_test_probe('rp_direct', 0, 'FLUSHDB') IS NOT NULL AS cleared_db;
+ cleared_db 
+------------
+ f
+(1 row)
+
+-- A hash and a zset, because those are the two shapes whose RESP2 and RESP3
+-- encodings differ. A string table would decode identically either way and
+-- would prove nothing about the fallback.
+SELECT valkey_fdw_test_probe('rp_direct', 0, 'HSET', 'rp:h',
+                             'a', 'alpha', 'b', 'beta', 'c', 'gamma')
+       IS NOT NULL AS seeded_hash;
+ seeded_hash 
+-------------
+ f
+(1 row)
+
+SELECT valkey_fdw_test_probe('rp_direct', 0, 'ZADD', 'rp:z',
+                             '1.5', 'one', '2.5', 'two', '3.5', 'three')
+       IS NOT NULL AS seeded_zset;
+ seeded_zset 
+-------------
+ f
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- G1. The RESP2 decoding branches.
+--
+-- HGETALL answers with a typed map under RESP3 and a flat alternating array
+-- under RESP2. ZRANGE ... WITHSCORES answers with an array of pairs under
+-- RESP3 and with alternating member/score under RESP2. Reading one layout as
+-- the other yields the wrong number of rows with null members, so the shapes
+-- are detected rather than assumed - and until now only one of the two
+-- detections had ever run.
+--
+-- THE ROWS ALONE CANNOT ASSERT THIS. Both protocols are meant to decode to
+-- identical output, so a suite that refused RESP3 and then checked the rows
+-- would pass whether the refusal arrived or not. The protocol is therefore
+-- asserted directly, and the rows are a second, separate assertion about
+-- decoding.
+-- ---------------------------------------------------------------------------
+-- Through the proxy, with the next HELLO answered as a pre-6.0 server does.
+-- The server is created first and touched second, so the connection is cold
+-- when the rule is armed and the HELLO that gets refused is certainly ours.
+CREATE SERVER rp2 FOREIGN DATA WRAPPER valkey_fdw
+    OPTIONS (host 'valkey', port '6379', command_timeout_ms '5000');
+CREATE USER MAPPING FOR CURRENT_USER SERVER rp2;
+CREATE FOREIGN TABLE rp2_h (k text OPTIONS (key 'true'),
+                            a text OPTIONS (field 'a'),
+                            b text OPTIONS (field 'b'),
+                            c text OPTIONS (field 'c'))
+    SERVER rp2 OPTIONS (tabletype 'hash', keyprefix 'rp:h');
+CREATE FOREIGN TABLE rp2_z (k text OPTIONS (key 'true'),
+                            member text OPTIONS (member 'true'),
+                            score float8 OPTIONS (score 'true'))
+    SERVER rp2 OPTIONS (tabletype 'zset', keyprefix 'rp:z');
+CREATE TEMP TABLE resp_base AS SELECT resp_fired() AS n;
+SELECT resp_arm('arm no_resp3 HELLO') AS armed;
+ armed 
+-------
+ +OK
+(1 row)
+
+-- The first touch of rp2 opens the connection and sends the HELLO that the
+-- rule is waiting for.
+SELECT valkey_fdw_test_resp3('rp2') AS rp2_negotiated_resp3;
+ rp2_negotiated_resp3 
+----------------------
+ f
+(1 row)
+
+-- And the rule really fired, so the `f` above is the fallback rather than a
+-- server that was never asked.
+SELECT resp_fired() - (SELECT n FROM resp_base) AS rules_fired;
+ rules_fired 
+-------------
+           1
+(1 row)
+
+-- The same physical data, read over RESP2.
+SELECT a, b, c FROM rp2_h;
+   a   |  b   |   c   
+-------+------+-------
+ alpha | beta | gamma
+(1 row)
+
+SELECT member, score FROM rp2_z ORDER BY score;
+ member | score 
+--------+-------
+ one    |   1.5
+ two    |   2.5
+ three  |   3.5
+(3 rows)
+
+-- ---------------------------------------------------------------------------
+-- And it agrees with RESP3, key for key.
+--
+-- A separate server, so this connection negotiates normally. The comparison
+-- is the assertion that matters: the fallback is not merely "some rows", it
+-- is the SAME rows, and a re-pairing bug would show up here as a row count or
+-- a null member rather than as an error.
+-- ---------------------------------------------------------------------------
+CREATE SERVER rp3 FOREIGN DATA WRAPPER valkey_fdw
+    OPTIONS (host 'valkey', port '6379', command_timeout_ms '5000');
+CREATE USER MAPPING FOR CURRENT_USER SERVER rp3;
+CREATE FOREIGN TABLE rp3_h (k text OPTIONS (key 'true'),
+                            a text OPTIONS (field 'a'),
+                            b text OPTIONS (field 'b'),
+                            c text OPTIONS (field 'c'))
+    SERVER rp3 OPTIONS (tabletype 'hash', keyprefix 'rp:h');
+CREATE FOREIGN TABLE rp3_z (k text OPTIONS (key 'true'),
+                            member text OPTIONS (member 'true'),
+                            score float8 OPTIONS (score 'true'))
+    SERVER rp3 OPTIONS (tabletype 'zset', keyprefix 'rp:z');
+SELECT valkey_fdw_test_resp3('rp3') AS rp3_negotiated_resp3;
+ rp3_negotiated_resp3 
+----------------------
+ t
+(1 row)
+
+SELECT count(*) AS hash_rows_differing FROM (
+    (SELECT a, b, c FROM rp2_h EXCEPT ALL SELECT a, b, c FROM rp3_h)
+    UNION ALL
+    (SELECT a, b, c FROM rp3_h EXCEPT ALL SELECT a, b, c FROM rp2_h)
+) d;
+ hash_rows_differing 
+---------------------
+                   0
+(1 row)
+
+SELECT count(*) AS zset_rows_differing FROM (
+    (SELECT member, score FROM rp2_z EXCEPT ALL SELECT member, score FROM rp3_z)
+    UNION ALL
+    (SELECT member, score FROM rp3_z EXCEPT ALL SELECT member, score FROM rp2_z)
+) d;
+ zset_rows_differing 
+---------------------
+                   0
+(1 row)
+
+-- Non-empty on both sides, so the comparison above is not two empty sets.
+SELECT (SELECT count(*) FROM rp2_z) AS resp2_zset_rows,
+       (SELECT count(*) FROM rp3_z) AS resp3_zset_rows;
+ resp2_zset_rows | resp3_zset_rows 
+-----------------+-----------------
+               3 |               3
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- U1. A RESP3 boolean.
+--
+-- Nothing in a stock Valkey produces one: Lua `true` becomes the integer 1
+-- and `false` becomes a nil under both protocols, which was checked against
+-- the running server rather than assumed. The arm is therefore reachable only
+-- from a fabricated frame - and libvalkey's reader parses RESP3 types off the
+-- wire regardless of what HELLO negotiated, so it arrives as a boolean here.
+-- ---------------------------------------------------------------------------
+SELECT resp_arm('arm boolean ECHO') AS armed;
+ armed 
+-------
+ +OK
+(1 row)
+
+SELECT reply_type, num FROM valkey_fdw_test_probe('rp3', 0, 'ECHO', 'ignored');
+ reply_type | num 
+------------+-----
+ boolean    |   1
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- U2. An error reply carrying no message text.
+--
+-- A real server always sends some, which is why the register called this
+-- unreachable. That reason was true and beside the point: fabricating the
+-- frame showed the branch did not fire even then.
+--
+-- libvalkey ALLOCATES an empty string for `-\r\n` rather than leaving str
+-- NULL, and the guard tested only for NULL - so the empty message was copied
+-- faithfully and the user got a bare "DETAIL:" with nothing after it, which
+-- is the exact outcome the branch's own comment says it exists to prevent.
+-- The guard now tests the length too, so what follows is "(no message)".
+--
+-- Routed through a command that RAISES rather than through the probe, which
+-- returns error replies as data and would never reach the message formatter.
+-- ---------------------------------------------------------------------------
+SELECT resp_arm('arm empty_error SET') AS armed;
+ armed 
+-------
+ +OK
+(1 row)
+
+SELECT valkey_fdw_test_poke('rp3', 'rp:poke', 'v');
+ERROR:  poke failed
+DETAIL:  (no message)
+-- The connection survived an error with no text, rather than the formatter
+-- taking the backend with it.
+SELECT valkey_fdw_test_poke('rp3', 'rp:poke', 'v') AS poke_after_empty_error;
+ poke_after_empty_error 
+------------------------
+                      1
+(1 row)
+
+SELECT resp_arm('clear') AS final_clear;
+ final_clear 
+-------------
+ +OK
+(1 row)
+
+SELECT valkey_fdw_test_probe('rp_direct', 0, 'FLUSHDB') IS NOT NULL AS cleaned_up;
+ cleaned_up 
+------------
+ f
+(1 row)
+
+DROP FOREIGN TABLE rp2_h, rp2_z, rp3_h, rp3_z;
+DROP FUNCTION resp_fired(), resp_arm(text);
+DROP USER MAPPING FOR CURRENT_USER SERVER rp2;
+DROP USER MAPPING FOR CURRENT_USER SERVER rp3;
+DROP USER MAPPING FOR CURRENT_USER SERVER rp_direct;
+DROP SERVER rp2;
+DROP SERVER rp3;
+DROP SERVER rp_direct;

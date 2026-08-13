@@ -1,0 +1,56 @@
+# Valkey server image for the valkey_fdw test topologies.
+#
+# Layers TLS material and an ACL file onto an upstream Valkey image. The base
+# is a build arg so the same Dockerfile produces both the plain server and the
+# module bundle used by the search topology:
+#
+#   VALKEY_IMAGE=valkey/valkey:9.0.5           -> standalone, tls, acl, cluster
+#   VALKEY_IMAGE=valkey/valkey-bundle:9.0.5    -> search (ships valkey-search)
+
+ARG VALKEY_IMAGE=valkey/valkey:9.0.5
+FROM ${VALKEY_IMAGE}
+
+USER root
+
+RUN set -eux; \
+    if command -v apt-get >/dev/null; then \
+        apt-get update && apt-get install -y --no-install-recommends openssl && \
+        rm -rf /var/lib/apt/lists/*; \
+    else \
+        apk add --no-cache openssl; \
+    fi
+
+# ---------------------------------------------------------------------------
+# TLS material.
+#
+# Four identities are generated: a CA, a good server cert, an already-expired
+# cert, and one issued for the wrong hostname. The last two exist so the
+# negative TLS tests assert real verification failures rather than being
+# skipped.
+# ---------------------------------------------------------------------------
+COPY docker/valkey/gen-certs.sh /usr/local/bin/gen-certs
+RUN chmod 0755 /usr/local/bin/gen-certs && /usr/local/bin/gen-certs /tls
+
+# An aclfile has no comment syntax: every line must begin with "user", and
+# the server refuses to start otherwise. The rules are worth explaining, so
+# the repository keeps a commented source and whole-line comments are stripped
+# here. Only leading-# lines are dropped, never a trailing fragment, so a rule
+# containing a '#' would still arrive intact.
+COPY docker/valkey/users.acl /etc/valkey/users.acl.in
+COPY docker/valkey/entrypoint.sh /usr/local/bin/valkey-entrypoint
+RUN sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' \
+        /etc/valkey/users.acl.in > /etc/valkey/users.acl \
+ && rm /etc/valkey/users.acl.in \
+ && chmod 0644 /etc/valkey/users.acl \
+ && chmod 0755 /usr/local/bin/valkey-entrypoint \
+ && chmod -R a+rX /tls
+
+EXPOSE 6379 6380 16379
+
+ENTRYPOINT ["/usr/local/bin/valkey-entrypoint"]
+CMD ["standalone"]
+
+# Stamped so the harness can tell whether this image still matches the files
+# it was built from. Last, so it invalidates no layer above it.
+ARG VFDW_SRC_SHA=unstamped
+LABEL vfdw.src_sha=$VFDW_SRC_SHA

@@ -1,0 +1,30 @@
+# DEB build image. BASE selects the target.
+#
+#   debian:12 / debian:13
+#   ubuntu:24.04 / ubuntu:26.04
+#
+# PostgreSQL comes from PGDG so that every target can build every supported
+# major, rather than only the one its release happened to freeze.
+ARG BASE=debian:13
+FROM ${BASE}
+
+ARG PG_MAJOR=17
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        build-essential debhelper devscripts fakeroot \
+        cmake git curl ca-certificates gnupg lsb-release libssl-dev; \
+    install -d /usr/share/postgresql-common/pgdg; \
+    curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+        -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc; \
+    echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+        > /etc/apt/sources.list.d/pgdg.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        "postgresql-server-dev-${PG_MAJOR}" "postgresql-${PG_MAJOR}"; \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /work

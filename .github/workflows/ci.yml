@@ -1,0 +1,208 @@
+name: CI
+
+on:
+  # Both names on purpose. The default branch is master; naming main as well
+  # means a repository that is later renamed keeps running its own CI instead
+  # of going quiet and looking green because nothing ever ran. A branch filter
+  # that matches nothing is silent, which is the failure mode worth avoiding.
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LIBVALKEY_REF: "0.5.0"
+
+  # Pinned by digest, and the digest is the pin - the version beside it is for
+  # the reader. scripts/diagrams.sh --check compares the re-render byte for
+  # byte, so a floating tag makes every fork of this repository turn red the
+  # first time the renderer upstream publishes, with nothing here changed. The
+  # same variable is what diagrams.sh reads, so the image that is pulled and
+  # the image that renders cannot drift apart.
+  MERMAID_IMAGE: "minlag/mermaid-cli:11.15.0@sha256:837e7f39ad890b443fa7dc9386a03649ce5391f3b92aa0a0dfcfcc1c7b6f0a37"
+
+jobs:
+  # Cheap checks first, so an obvious problem fails in under a minute rather
+  # than after the matrix has spun up.
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build toolchain image
+        run: ./scripts/harness.sh images --pg 17 --valkey 9.0.5
+      - name: Structural limits and banned constructs
+        run: ./scripts/harness.sh lint --pg 17
+
+  # A diagram is documentation, and documentation that can disagree with its
+  # source in silence is the failure the option-table drift check already
+  # exists to prevent. The PNGs are committed because a reader should not need
+  # a renderer; this is what keeps them honest about what they were made from.
+  diagrams:
+    name: diagrams
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Pull the renderer
+        run: docker pull "$MERMAID_IMAGE"
+      - name: Every committed diagram matches its source
+        run: ./scripts/diagrams.sh --check
+
+  matrix:
+    name: pg${{ matrix.pg }} / valkey ${{ matrix.valkey }}
+    runs-on: ubuntu-latest
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [16, 17, 18]
+        valkey: ["8.1.9", "9.0.5"]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build images
+        run: ./scripts/harness.sh images --pg ${{ matrix.pg }} --valkey ${{ matrix.valkey }}
+
+      # Each topology runs in sequence against the same images. Failures are
+      # collected so one broken topology does not mask the others.
+      - name: Run all topologies
+        run: |
+          set -u
+          failed=""
+          for topo in standalone tls acl cluster search fault; do
+            echo "::group::topology ${topo}"
+            if ! ./scripts/harness.sh test \
+                  --pg ${{ matrix.pg }} \
+                  --valkey ${{ matrix.valkey }} \
+                  --topology "$topo"; then
+              failed="${failed} ${topo}"
+              echo "::error title=topology ${topo}::suite failed"
+            fi
+            echo "::endgroup::"
+            ./scripts/harness.sh down || true
+          done
+          if [ -n "$failed" ]; then
+            echo "failed topologies:${failed}"
+            exit 1
+          fi
+
+      - name: Upload regression diffs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-pg${{ matrix.pg }}-valkey${{ matrix.valkey }}
+          path: |
+            test/regress/regression.diffs
+            test/regress/results/
+          if-no-files-found: ignore
+
+  # UndefinedBehaviorSanitizer only, and the omission is the point.
+  #
+  # AddressSanitizer cannot run here. The extension is dlopened by a postmaster
+  # that is not itself instrumented, so loading an ASan-built library aborts the
+  # backend at CREATE EXTENSION, and LD_PRELOADing the runtime hangs the
+  # postmaster instead. It would not earn its keep even if it loaded: PostgreSQL
+  # carves palloc chunks out of large malloc'd blocks, so a use-after-free of
+  # context memory happens inside a region ASan considers live - which is most
+  # of the memory this extension touches, since the ledger and the overlay both
+  # point into the write buffer. The cassert job below is what covers that
+  # class, through CLOBBER_FREED_MEMORY and MEMORY_CONTEXT_CHECKING.
+  #
+  # UBSan has neither problem: it needs no preloaded runtime, and integer
+  # overflow, misaligned access and invalid shifts are exactly the kind of thing
+  # a wrapper doing pointer arithmetic over a length the far end chose can get
+  # wrong.
+  sanitizers:
+    name: ubsan
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v5
+      - run: ./scripts/harness.sh images --pg 17 --valkey 9.0.5
+      - name: Suites under UndefinedBehaviorSanitizer
+        run: |
+          ./scripts/harness.sh test --pg 17 --valkey 9.0.5 \
+            --topology standalone --sanitize undefined
+
+  # The mutation manifest: re-run the edit behind each closed defect and
+  # require it to still turn its suite red.
+  #
+  # This is not belt-and-braces. Three closed rows were found STALE in one
+  # session - the code moved, the assertion stopped asserting, and the suite
+  # stayed green - and every one was found by running the mutation, never by
+  # reading the test. A check that only runs when someone remembers decays
+  # exactly the way the register it guards did.
+  mutations:
+    name: mutation manifest
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v5
+      - run: ./scripts/harness.sh images --pg 17 --valkey 9.0.5
+      - name: Every closed row still fails when its defect is reintroduced
+        run: ./scripts/harness.sh mutate --pg 17
+
+  # Two-session properties, which no pg_regress file can reach: concurrent
+  # writers, and a query cancelled from elsewhere.
+  concurrency:
+    name: isolation + tap
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v5
+      - run: ./scripts/harness.sh images --pg 17 --valkey 9.0.5
+      - run: ./scripts/harness.sh isolation --pg 17
+      - run: ./scripts/harness.sh tap --pg 17
+
+  # CLOBBER_FREED_MEMORY, MEMORY_CONTEXT_CHECKING and every Assert().
+  #
+  # Slow - it builds PostgreSQL from source - and worth it: the ledger and the
+  # overlay both point into the write buffer, and ASan cannot see that class
+  # of bug at all, because palloc carves chunks out of blocks ASan considers
+  # live. See docker/Dockerfile.cassert.
+  cassert:
+    name: assertion-enabled server
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v5
+      - run: ./scripts/harness.sh images --pg 17 --valkey 9.0.5 --cassert
+      - name: Full suite under an --enable-cassert PostgreSQL
+        run: ./scripts/harness.sh test --pg 17 --cassert
+
+  vendored:
+    name: vendored libvalkey
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - run: ./scripts/harness.sh images --pg 17 --valkey 9.0.5
+      - name: Link against the pinned in-tree libvalkey
+        run: ./scripts/harness.sh test --pg 17 --valkey 9.0.5 --vendored
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v5
+      - run: ./scripts/harness.sh images --pg 17 --valkey 9.0.5
+      - name: Run suites with coverage instrumentation
+        run: ./scripts/harness.sh test --pg 17 --valkey 9.0.5 --coverage
+      - name: Enforce the coverage gate
+        run: ./scripts/harness.sh coverage-report --pg 17
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage/
+          if-no-files-found: ignore

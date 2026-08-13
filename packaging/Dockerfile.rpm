@@ -1,0 +1,48 @@
+# RPM build image. BASE selects the target; PG_MAJOR selects the PGDG repo.
+#
+#   oraclelinux:8 / :9 / :10        -> Oracle Linux
+#   amazonlinux:2023                -> Amazon Linux 2023
+#
+# Amazon Linux 2023 has no PGDG repository, so PostgreSQL comes from its own
+# repos and only the majors AL2023 ships are buildable there. That is a fact
+# about the distribution, not something the spec can paper over, and the
+# driver refuses the combination rather than producing a package linked
+# against a different major than its name claims.
+ARG BASE=oraclelinux:9
+FROM ${BASE}
+
+ARG PG_MAJOR=17
+ARG EL=9
+
+RUN set -eux; \
+    # NOT in parentheses. A subshell would set PKG inside it and leave it
+    # unset out here, and `set -u` then aborts on the very next line with
+    # "PKG: unbound variable" - which is what actually failed here twice
+    # while two rounds of repository guessing went looking for a dnf problem.
+    if command -v dnf >/dev/null; then PKG=dnf; else PKG=yum; fi; \
+    $PKG install -y --allowerasing \
+        gcc gcc-c++ make cmake git tar rpm-build openssl-devel \
+        redhat-rpm-config findutils which dnf-plugins-core || true; \
+    if command -v amazon-linux-extras >/dev/null 2>&1 || grep -qi amazon /etc/os-release; then \
+        $PKG install -y "postgresql${PG_MAJOR}-devel" "postgresql${PG_MAJOR}-server"; \
+    else \
+        $PKG install -y \
+          "https://download.postgresql.org/pub/repos/yum/reporpms/EL-${EL}-x86_64/pgdg-redhat-repo-latest.noarch.rpm" \
+          || $PKG install -y \
+          "https://download.postgresql.org/pub/repos/yum/reporpms/EL-${EL}-aarch64/pgdg-redhat-repo-latest.noarch.rpm"; \
+        $PKG -qy module disable postgresql || true; \
+        # postgresql-devel needs perl(IPC::Run), which on Oracle Linux lives
+        # in CodeReady Builder - NOT in EPEL, which is what two rounds of
+        # guessing assumed before asking `dnf provides` and being told
+        # plainly. dnf-plugins-core is installed above because config-manager
+        # comes from it: without it this line fails, `|| true` swallows the
+        # failure, the repo is never enabled, and the error you finally see
+        # names only the Perl module - which sends you looking for a Perl
+        # problem rather than a repository one.
+        $PKG config-manager --set-enabled "ol${EL}_codeready_builder" \
+            || $PKG config-manager --set-enabled crb; \
+        $PKG install -y "postgresql${PG_MAJOR}-devel" "postgresql${PG_MAJOR}-server"; \
+    fi; \
+    $PKG clean all
+
+WORKDIR /work

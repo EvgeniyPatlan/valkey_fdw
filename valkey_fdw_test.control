@@ -1,0 +1,25 @@
+# valkey_fdw diagnostics
+#
+# The wrapper's own extension creates five functions. The thirty-nine
+# valkey_fdw_test_* entry points the suites drive are here instead, because
+# PostgreSQL grants EXECUTE on a new function to PUBLIC and every one of them
+# reaches a Valkey server: most through the pool, and three - ping, binary and
+# block - through a host and a port supplied by the caller, which is an
+# arbitrary host on an arbitrary port reached from the database server's
+# network position by any role that can log in. A production install must not
+# carry that surface.
+#
+# A build flag would have removed them from the binary and was rejected: the
+# object a user installs would then not be the object the suites ran against.
+# Moving only the catalog exposure keeps one shared library, so the tested
+# library is the shipped library - module_pathname below is valkey_fdw's own.
+#
+# superuser is spelled out even though true is the default. It is the whole
+# point of this file, and a default that goes unstated is a default someone
+# later changes without noticing what it was holding up.
+comment = 'valkey_fdw diagnostic entry points, for the test suites'
+default_version = '0.1'
+module_pathname = '$libdir/valkey_fdw'
+requires = 'valkey_fdw'
+relocatable = true
+superuser = true

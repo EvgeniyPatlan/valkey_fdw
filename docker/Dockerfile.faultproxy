@@ -1,0 +1,20 @@
+# Fault-injection proxy.
+#
+# Stands between PostgreSQL and Valkey in the `fault` topology and misbehaves
+# on command, so that every connection-error, malformed-reply and timeout path
+# in the FDW is reachable from a test. Pure standard library - no wheels to
+# resolve, nothing to pin.
+
+FROM python:3.12-slim
+
+COPY docker/faultproxy/faultproxy.py /app/faultproxy.py
+
+EXPOSE 6379 6390
+
+ENTRYPOINT ["python3", "-u", "/app/faultproxy.py"]
+CMD ["--upstream-host", "valkey"]
+
+# Stamped so the harness can tell whether this image still matches the files
+# it was built from. Last, so it invalidates no layer above it.
+ARG VFDW_SRC_SHA=unstamped
+LABEL vfdw.src_sha=$VFDW_SRC_SHA

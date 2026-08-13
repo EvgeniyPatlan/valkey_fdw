@@ -1,0 +1,187 @@
+-- Connection pooling and transaction integration.
+--
+-- The per-statement alternative opens three connections for each statement
+-- and closes none of them on an error path, so an aborted statement leaks
+-- its descriptor outright. These assertions are what
+-- make that impossible here: connections are keyed by (server, user) and
+-- outlive statements, and a connection left mid-conversation is discarded
+-- rather than handed on.
+
+CREATE SERVER pool_srv FOREIGN DATA WRAPPER valkey_fdw
+    OPTIONS (host 'valkey', port '6379');
+CREATE USER MAPPING FOR CURRENT_USER SERVER pool_srv;
+
+-- Nothing is opened until something asks for a connection.
+SELECT open, opened_total FROM valkey_fdw_test_pool_stats();
+
+SELECT valkey_fdw_test_pooled_ping('pool_srv') AS first_ping;
+SELECT open, opened_total FROM valkey_fdw_test_pool_stats();
+
+-- ---------------------------------------------------------------------------
+-- Reuse.
+--
+-- 200 statements against the same mapping must still be one connection and
+-- one connect() call. Under the per-statement model this would be 600
+-- connects, each paying a TCP handshake, an AUTH and a SELECT.
+-- ---------------------------------------------------------------------------
+SELECT count(*) AS pings
+FROM generate_series(1, 200) g,
+     LATERAL valkey_fdw_test_pooled_ping('pool_srv') p;
+
+SELECT open, opened_total FROM valkey_fdw_test_pool_stats();
+
+-- ---------------------------------------------------------------------------
+-- A clean connection survives an aborted transaction.
+--
+-- The abort must not leak the descriptor, and must not throw away a
+-- connection that was left in a well-defined state.
+-- ---------------------------------------------------------------------------
+BEGIN;
+SELECT valkey_fdw_test_pooled_ping('pool_srv') AS ping_in_xact;
+SELECT 1 / 0;
+ROLLBACK;
+
+SELECT open, opened_total FROM valkey_fdw_test_pool_stats();
+SELECT valkey_fdw_test_pooled_ping('pool_srv') AS usable_after_abort;
+SELECT open, opened_total FROM valkey_fdw_test_pool_stats();
+
+-- The same through a savepoint, which unwinds a subtransaction rather than
+-- the whole thing.
+BEGIN;
+SAVEPOINT s1;
+SELECT valkey_fdw_test_pooled_ping('pool_srv') AS ping_in_subxact;
+ROLLBACK TO SAVEPOINT s1;
+SELECT valkey_fdw_test_pooled_ping('pool_srv') AS ping_after_rollback_to;
+COMMIT;
+
+SELECT open, opened_total FROM valkey_fdw_test_pool_stats();
+
+-- ---------------------------------------------------------------------------
+-- Catalog invalidation.
+--
+-- ALTER SERVER must take effect without asking the user to reconnect, so the
+-- affected connection is dropped and the next use reopens it.
+-- ---------------------------------------------------------------------------
+ALTER SERVER pool_srv OPTIONS (SET port '6379');
+SELECT valkey_fdw_test_pooled_ping('pool_srv') AS ping_after_alter;
+
+-- opened_total must have advanced: the old connection was discarded rather
+-- than kept with stale settings.
+SELECT opened_total > 1 AS reconnected_after_alter
+FROM valkey_fdw_test_pool_stats();
+
+-- ---------------------------------------------------------------------------
+-- Distinct mappings get distinct connections; the pool is keyed by
+-- (server, user), not shared blindly.
+-- ---------------------------------------------------------------------------
+CREATE SERVER pool_srv2 FOREIGN DATA WRAPPER valkey_fdw
+    OPTIONS (host 'valkey', port '6379');
+CREATE USER MAPPING FOR CURRENT_USER SERVER pool_srv2;
+
+SELECT valkey_fdw_test_pooled_ping('pool_srv2') AS second_server;
+SELECT open AS two_servers_two_connections FROM valkey_fdw_test_pool_stats();
+
+-- ---------------------------------------------------------------------------
+-- A non-superuser mapping must carry a password.
+--
+-- Without this rule a user granted USAGE on a foreign server can borrow the
+-- PostgreSQL process's network identity and reach any Valkey that trusts the
+-- database host by address. postgres_fdw enforces the same rule.
+-- ---------------------------------------------------------------------------
+CREATE ROLE vfdw_unpriv LOGIN;
+GRANT USAGE ON FOREIGN SERVER pool_srv TO vfdw_unpriv;
+CREATE USER MAPPING FOR vfdw_unpriv SERVER pool_srv;
+GRANT EXECUTE ON FUNCTION valkey_fdw_test_pooled_ping(text) TO vfdw_unpriv;
+
+SET ROLE vfdw_unpriv;
+SELECT valkey_fdw_test_pooled_ping('pool_srv');
+RESET ROLE;
+
+-- A superuser may waive it explicitly.
+ALTER USER MAPPING FOR vfdw_unpriv SERVER pool_srv
+    OPTIONS (ADD password_required 'false');
+SET ROLE vfdw_unpriv;
+SELECT valkey_fdw_test_pooled_ping('pool_srv') AS unpriv_ping_when_waived;
+RESET ROLE;
+
+DROP USER MAPPING FOR vfdw_unpriv SERVER pool_srv;
+REVOKE USAGE ON FOREIGN SERVER pool_srv FROM vfdw_unpriv;
+REVOKE EXECUTE ON FUNCTION valkey_fdw_test_pooled_ping(text) FROM vfdw_unpriv;
+DROP ROLE vfdw_unpriv;
+
+-- ---------------------------------------------------------------------------
+-- A caught error gives its connection slot back.
+--
+-- A reader holds a lease for the whole of its scan and does not release it
+-- when it raises: invariant I1 says an error path frees nothing. That is fine
+-- when the error reaches the top, because the transaction callback sweeps
+-- every lease. It was not fine when a plpgsql EXCEPTION block swallowed the
+-- error, because then the transaction does not end - the statement carries on
+-- with the slot held by a scan that no longer exists. There are 32 slots per
+-- (server, user), so the 33rd caught failure onwards reported "too many
+-- concurrent Valkey scans on one server" rather than the real cause, and the
+-- message named a condition the query had not created.
+--
+-- 40 iterations, well past the 32 slots. What is asserted is that all 40
+-- report the SAME thing: the moment a slot leaks, the tail of this loop
+-- changes its error and the second count drops.
+--
+-- valkey_fdw_test_keys over its cap is used because the raise happens after
+-- the lease is taken. Most of the probe's refusals are argument checks that
+-- run before it, which would leak nothing and prove nothing.
+-- ---------------------------------------------------------------------------
+SELECT num AS seeded FROM valkey_fdw_test_probe('pool_srv', 0, 'EVAL',
+       'for i=1,10001 do server.call("SET", "pool:cap:"..i, "1") end return 1',
+       '0');
+
+DO $$
+DECLARE
+    i          int;
+    caught     int := 0;
+    was_cap    int := 0;
+    last       text := '';
+    laststate  text := '';
+BEGIN
+    FOR i IN 1..40 LOOP
+        BEGIN
+            PERFORM * FROM valkey_fdw_test_keys('pool_srv', 0, 'pool:cap:');
+            RAISE EXCEPTION 'the dump did not exceed its cap, so nothing here '
+                            'ever took a lease and raised while holding it';
+        EXCEPTION WHEN OTHERS THEN
+            caught := caught + 1;
+            last := SQLERRM;
+            laststate := SQLSTATE;
+            -- Positively the cap error (program_limit_exceeded), not merely
+            -- "not slot exhaustion". Testing for the absence of 53300 passed
+            -- with the leak still present: the seed was too small, the probe
+            -- returned normally, and the hand-written RAISE above satisfied
+            -- the check every time.
+            IF SQLSTATE = '54000' THEN
+                was_cap := was_cap + 1;
+            END IF;
+        END;
+    END LOOP;
+
+    IF caught <> 40 THEN
+        RAISE EXCEPTION 'expected 40 failures, saw %', caught;
+    END IF;
+    IF was_cap <> 40 THEN
+        RAISE EXCEPTION
+            'only % of 40 failures were the cap; the rest reported %(%), so a '
+            'caught error is not returning its connection slot',
+            was_cap, laststate, last;
+    END IF;
+    RAISE NOTICE 'all 40 caught errors reported the cap, not slot exhaustion';
+END $$;
+
+SELECT num AS cleaned FROM valkey_fdw_test_probe('pool_srv', 0, 'EVAL',
+       'for i=1,10001 do server.call("DEL", "pool:cap:"..i) end return 1', '0');
+
+-- The slots really are back, not merely unasked for: a plain scan after all
+-- that must still find one.
+SELECT valkey_fdw_test_pooled_ping('pool_srv') AS usable_after_40_caught_errors;
+
+DROP USER MAPPING FOR CURRENT_USER SERVER pool_srv2;
+DROP SERVER pool_srv2;
+DROP USER MAPPING FOR CURRENT_USER SERVER pool_srv;
+DROP SERVER pool_srv;

@@ -1,0 +1,87 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_begin s2_begin s1_insert s2_insert s2_read s1_commit s2_commit s1_read
+valkey_fdw_test_probe
+---------------------
+(integer,0,,,0,)     
+(1 row)
+
+step s1_begin: BEGIN;
+step s2_begin: BEGIN;
+step s1_insert: INSERT INTO iso VALUES ('iso:k', 'from s1');
+step s2_insert: INSERT INTO iso VALUES ('iso:k', 'from s2');
+step s2_read: SELECT k, v FROM iso ORDER BY k;
+k    |v      
+-----+-------
+iso:k|from s2
+(1 row)
+
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  a key this transaction creates already exists in Valkey
+step s1_read: SELECT k, v FROM iso ORDER BY k;
+k    |v      
+-----+-------
+iso:k|from s1
+(1 row)
+
+
+starting permutation: s1_begin s2_begin s2_insert s1_insert s2_commit s1_commit s1_read
+valkey_fdw_test_probe
+---------------------
+(integer,0,,,0,)     
+(1 row)
+
+step s1_begin: BEGIN;
+step s2_begin: BEGIN;
+step s2_insert: INSERT INTO iso VALUES ('iso:k', 'from s2');
+step s1_insert: INSERT INTO iso VALUES ('iso:k', 'from s1');
+step s2_commit: COMMIT;
+step s1_commit: COMMIT;
+ERROR:  a key this transaction creates already exists in Valkey
+step s1_read: SELECT k, v FROM iso ORDER BY k;
+k    |v      
+-----+-------
+iso:k|from s2
+(1 row)
+
+
+starting permutation: s1_begin s2_begin s1_insert s2_insert s1_abort s2_commit s1_read
+valkey_fdw_test_probe
+---------------------
+(integer,0,,,0,)     
+(1 row)
+
+step s1_begin: BEGIN;
+step s2_begin: BEGIN;
+step s1_insert: INSERT INTO iso VALUES ('iso:k', 'from s1');
+step s2_insert: INSERT INTO iso VALUES ('iso:k', 'from s2');
+step s1_abort: ROLLBACK;
+step s2_commit: COMMIT;
+step s1_read: SELECT k, v FROM iso ORDER BY k;
+k    |v      
+-----+-------
+iso:k|from s2
+(1 row)
+
+
+starting permutation: s1_begin s2_begin s2_insert s2_commit s1_insert s1_other s1_commit s1_read
+valkey_fdw_test_probe
+---------------------
+(integer,0,,,0,)     
+(1 row)
+
+step s1_begin: BEGIN;
+step s2_begin: BEGIN;
+step s2_insert: INSERT INTO iso VALUES ('iso:k', 'from s2');
+step s2_commit: COMMIT;
+step s1_insert: INSERT INTO iso VALUES ('iso:k', 'from s1');
+step s1_other: INSERT INTO iso VALUES ('iso:other', 'also s1');
+step s1_commit: COMMIT;
+ERROR:  a key this transaction creates already exists in Valkey
+step s1_read: SELECT k, v FROM iso ORDER BY k;
+k    |v      
+-----+-------
+iso:k|from s2
+(1 row)
+

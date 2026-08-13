@@ -1,0 +1,9 @@
+flowchart TD
+    DML["INSERT / UPDATE / DELETE / COPY"] --> BUF["write buffer<br/>ops appended in order"]
+    BUF --> FOLD["ledger fold<br/>per key: preconditions + actions"]
+    FOLD --> CHK{"COMMIT"}
+    CHK -->|pre-commit| LUA["one EVALSHA:<br/>check every precondition,<br/>then apply every action"]
+    CHK -->|ROLLBACK| DROP["discard — nothing is sent"]
+    LUA --> OK["all applied"]
+    LUA --> CONFLICT["refused whole<br/>(23505 / 40001)"]
+    BUF -.->|"SELECT in the same<br/>transaction"| OVL["overlay:<br/>read your own writes"]

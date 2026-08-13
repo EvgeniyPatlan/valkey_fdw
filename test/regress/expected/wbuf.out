@@ -1,0 +1,1187 @@
+-- The deferred write buffer, its transaction integration, and the flush stub.
+--
+-- Every write a transaction performs is held in backend memory and applied as
+-- one atomic unit at pre-commit. This suite asserts the memory half of that:
+-- what the buffer holds, what the two caps refuse, what a savepoint does to
+-- it, and that the pre-commit hook is really reached. The wire half - what
+-- actually lands in Valkey - lands with implementation step S6 and is not
+-- asserted here, because in this step nothing is ever sent.
+--
+-- No assertion below compares an ABSOLUTE alloc_bytes value. That number
+-- carries AllocSet block granularity and sizeof(VfdwWriteOp), so pinning it
+-- would make this a change detector across builds and majors. The assertions
+-- are relations: exceeded, unchanged, strictly greater.
+CREATE SERVER wb_srv FOREIGN DATA WRAPPER valkey_fdw
+    OPTIONS (host 'valkey', port '6379');
+CREATE USER MAPPING FOR CURRENT_USER SERVER wb_srv;
+-- A cap test MUST set the cap it tests. The defaults are 10000 operations and
+-- 67108864 bytes; a test that inserted a few thousand rows against those
+-- would never reach the code under test at all, and that exact defect has
+-- shipped in this tree before.
+CREATE SERVER wb_cap_srv FOREIGN DATA WRAPPER valkey_fdw
+    OPTIONS (host 'valkey', port '6379',
+             write_max_ops '5', write_max_bytes '65536');
+CREATE USER MAPPING FOR CURRENT_USER SERVER wb_cap_srv;
+CREATE FOREIGN TABLE wb_str (k text OPTIONS (key 'true'), v text)
+    SERVER wb_srv OPTIONS (tabletype 'string', keyprefix 'wb:');
+CREATE FOREIGN TABLE wb_hash (k text OPTIONS (key 'true'),
+                             a text OPTIONS (field 'alpha'),
+                             b text OPTIONS (field 'beta'))
+    SERVER wb_srv OPTIONS (tabletype 'hash', keyprefix 'wb:');
+-- Structurally identical to wb_hash but with different field NAMES of the
+-- same lengths. That is deliberate, and it is what gives the field-name test
+-- below any teeth at all: the per-statement context freed at EndForeignModify
+-- is handed straight back to the allocator, and the next statement's context
+-- reclaims it and writes its own option strings into the same bytes. With two
+-- statements on the SAME table the recycled block holds the same names, so a
+-- borrowed pointer reads correctly by accident and the test proves nothing.
+CREATE FOREIGN TABLE wb_hash2 (k text OPTIONS (key 'true'),
+                              a text OPTIONS (field 'gamma'),
+                              b text OPTIONS (field 'zeta'))
+    SERVER wb_srv OPTIONS (tabletype 'hash', keyprefix 'wb:');
+-- Same server, a different logical database. Used everywhere below as the
+-- probe for "is the unit still bound": a second database is refused while a
+-- binding stands and accepted once it is released, so one INSERT distinguishes
+-- the two states without needing a second server.
+CREATE FOREIGN TABLE wb_str_db3 (k text OPTIONS (key 'true'), v text)
+    SERVER wb_srv OPTIONS (tabletype 'string', keyprefix 'wb:', database '3');
+CREATE FOREIGN TABLE wb_cap (k text OPTIONS (key 'true'), v text)
+    SERVER wb_cap_srv OPTIONS (tabletype 'string', keyprefix 'wb:');
+CREATE FOREIGN TABLE wb_cap_b (k text OPTIONS (key 'true'), v bytea)
+    SERVER wb_cap_srv OPTIONS (tabletype 'string', keyprefix 'wb:');
+-- A refusal is as much a result as a value. WHEN OTHERS rather than a named
+-- condition, so a wrong-but-plausible SQLSTATE fails the comparison instead of
+-- being caught by the handler that was looking for the right one. The message
+-- text is kept because several refusals below share a SQLSTATE with each other
+-- and only the text tells them apart.
+CREATE FUNCTION wb_err(sql text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    EXECUTE sql;
+    RETURN 'no error';
+EXCEPTION WHEN OTHERS THEN
+    RETURN SQLSTATE || ': ' || SQLERRM;
+END $$;
+-- SQLSTATE only, for a failure whose message carries an OS error string.
+CREATE FUNCTION wb_state(sql text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    EXECUTE sql;
+    RETURN 'no error';
+EXCEPTION WHEN OTHERS THEN
+    RETURN SQLSTATE;
+END $$;
+-- ---------------------------------------------------------------------------
+-- ROLLBACK leaves the Valkey keyspace untouched.
+--
+-- THIS NOW BITES. Through S5 it could not: nothing sent a write, so no
+-- mutation could make a key appear and the comparison was green whether the
+-- buffer worked or not - which the earlier version of this comment said
+-- plainly, and which is why the shape was landed early. S6 made the flush
+-- real, and every transaction below rolls back, so a key appearing here is a
+-- write escaping a ROLLBACK.
+--
+-- Every fixture this suite needs is seeded ABOVE the baseline, so the only
+-- thing that can move the keyspace afterwards is the code under test.
+-- ---------------------------------------------------------------------------
+-- Populated through the probe, never through the FDW: reading through the FDW
+-- will consult the overlay from S7 on, and would then prove only that the two
+-- halves of the wrapper agree with each other.
+-- SEEDED THROUGH THE PROBE, because until S7's overlay lands a statement
+-- cannot see this transaction's own buffered writes. An UPDATE after an
+-- INSERT of the same key matches ZERO rows and produces no operation at all -
+-- the first draft of this block asserted exactly that and read as a passing
+-- test of a fold it never exercised. Anything below that needs a row to
+-- already exist writes it with valkey_fdw_test_poke first.
+SELECT valkey_fdw_test_poke('wb_srv', 'wb:f1', 'seeded');
+ valkey_fdw_test_poke 
+----------------------
+                    1
+(1 row)
+
+SELECT valkey_fdw_test_poke('wb_srv', 'wb:g1', 'seeded');
+ valkey_fdw_test_poke 
+----------------------
+                    1
+(1 row)
+
+SELECT valkey_fdw_test_poke('wb_srv', 'wb:r1', 'seeded');
+ valkey_fdw_test_poke 
+----------------------
+                    1
+(1 row)
+
+SELECT valkey_fdw_test_poke('wb_srv', 'wb:k2', 'seeded');
+ valkey_fdw_test_poke 
+----------------------
+                    1
+(1 row)
+
+SELECT valkey_fdw_test_poke('wb_srv', 'wb:dup2', 'seeded');
+ valkey_fdw_test_poke 
+----------------------
+                    1
+(1 row)
+
+-- A keyset table discovers its rows THROUGH the index, so seeding the key
+-- alone leaves the DELETE below matching nothing.
+SELECT count(*) FROM valkey_fdw_test_probe('wb_srv', 0, 'SADD', 'wb:index', 'wb:k2');
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM valkey_fdw_test_probe('wb_srv', 0, 'ZADD', 'wbz:k', '1', 'old');
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM valkey_fdw_test_probe('wb_srv', 0, 'RPUSH', 'wbl:d', 'gone');
+ count 
+-------
+     1
+(1 row)
+
+SELECT valkey_fdw_test_poke('wb_srv', 'wb:g1', 'before');
+ valkey_fdw_test_poke 
+----------------------
+                    1
+(1 row)
+
+CREATE TEMP TABLE wb_before AS
+    SELECT key, keytype FROM valkey_fdw_test_keys('wb_srv', 0, 'wb:');
+BEGIN;
+INSERT INTO wb_str SELECT 'wb:g' || i, 'v' || i FROM generate_series(2,6) i;
+ROLLBACK;
+-- Compared as a sorted (key, keytype) SET, never as a count: a count is
+-- accidentally satisfied when one key appears and another disappears, which is
+-- exactly the shape a half-applied flush has.
+SELECT count(*) = 0 AS keyspace_identical
+FROM ((SELECT key, keytype FROM valkey_fdw_test_keys('wb_srv', 0, 'wb:')
+       EXCEPT ALL
+       SELECT key, keytype FROM wb_before)
+      UNION ALL
+      (SELECT key, keytype FROM wb_before
+       EXCEPT ALL
+       SELECT key, keytype FROM valkey_fdw_test_keys('wb_srv', 0, 'wb:'))) d;
+ keyspace_identical 
+--------------------
+ t
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- ROLLBACK empties the buffer, and the next transaction starts free.
+--
+-- This is the half of the assertion above that does bite, and it is not a
+-- substitute for it.
+-- ---------------------------------------------------------------------------
+BEGIN;
+INSERT INTO wb_str SELECT 'wb:r'||i, 'v' FROM generate_series(1,3) i;
+SELECT live_ops, bound, database FROM valkey_fdw_test_wbuf_stats();
+ live_ops | bound | database 
+----------+-------+----------
+        3 | t     |        0
+(1 row)
+
+ROLLBACK;
+SELECT live_ops, alloc_bytes, bound FROM valkey_fdw_test_wbuf_stats();
+ live_ops | alloc_bytes | bound 
+----------+-------------+-------
+        0 |           0 | f
+(1 row)
+
+-- The unit must not survive either: a table on a different logical database is
+-- accepted by the next transaction.
+BEGIN;
+INSERT INTO wb_str_db3 VALUES ('wb:r9','v');
+SELECT live_ops, database FROM valkey_fdw_test_wbuf_stats();
+ live_ops | database 
+----------+----------
+        1 |        3
+(1 row)
+
+ROLLBACK;
+-- ---------------------------------------------------------------------------
+-- The operation cap fires at the offending row and names itself.
+--
+-- Three assertions, not one: the SQLSTATE, the message (which must name
+-- write_max_ops and not write_max_bytes - both are 54000), and live_ops at the
+-- moment of failure, which is what "fires AT the offending row" means.
+--
+-- The five accepted operations are appended in the OUTER transaction so they
+-- survive the subtransaction that overflows the cap. Caught at the same nest
+-- level they would be dropped, and the observation destroyed with them.
+-- ---------------------------------------------------------------------------
+BEGIN;
+INSERT INTO wb_cap SELECT 'wb:c'||i, 'v' FROM generate_series(1,5) i;
+SELECT live_ops, max_ops FROM valkey_fdw_test_wbuf_stats();
+ live_ops | max_ops 
+----------+---------
+        5 |       5
+(1 row)
+
+SELECT wb_err($$INSERT INTO wb_cap VALUES ('wb:c6','v')$$) AS op_cap;
+                         op_cap                          
+---------------------------------------------------------
+ 54000: deferred write buffer would exceed write_max_ops
+(1 row)
+
+SELECT live_ops AS live_ops_after_refusal FROM valkey_fdw_test_wbuf_stats();
+ live_ops_after_refusal 
+------------------------
+                      5
+(1 row)
+
+ROLLBACK;
+-- ---------------------------------------------------------------------------
+-- The byte cap fires while the operation count stays at zero.
+--
+-- The one test that distinguishes the two counters, so it observes both. Each
+-- iteration buffers a 16 KiB row and then rolls its subtransaction back, which
+-- drops the operation and keeps the bytes; the cap must still be reached.
+--
+-- plpgsql forbids an explicit SAVEPOINT, so the rollback is a BEGIN/EXCEPTION
+-- block deliberately raised out of. That is the same subtransaction machinery
+-- ROLLBACK TO SAVEPOINT drives.
+--
+-- HOW MANY ROWS IT TOOK IS PART OF THE ASSERTION, and the first draft of this
+-- test did not observe it - which made the test unfalsifiable. A build that
+-- hands byte budget back when an operation is dropped still eventually trips
+-- the cap on allocator drift; measured, it took 105 rolled-back rows instead
+-- of 2, and a test that only asked "did it fire" was green for both. The bound
+-- is stated as "within ten rows" rather than as the exact count because the
+-- exact count is AllocSet block granularity, which no assertion here may pin:
+-- each row costs roughly 33 kB against a 65536-byte cap, so two rows is the
+-- honest answer and ten leaves room for the per-row cost to change severalfold
+-- without turning this into a change detector.
+-- ---------------------------------------------------------------------------
+BEGIN;
+DO $$
+DECLARE
+    n     int  := 0;
+    fired text := 'never fired';
+    ops   int;
+    bytes bigint;
+BEGIN
+    FOR i IN 1..200 LOOP
+        n := i;
+        BEGIN
+            INSERT INTO wb_cap_b VALUES ('wb:b'||i, repeat('x', 16384)::bytea);
+            RAISE EXCEPTION 'roll this operation back';
+        EXCEPTION
+            WHEN program_limit_exceeded THEN
+                fired := SQLERRM;
+                EXIT;
+            WHEN raise_exception THEN
+                NULL;                   -- the deliberate rollback
+        END;
+    END LOOP;
+
+    SELECT live_ops, alloc_bytes INTO ops, bytes FROM valkey_fdw_test_wbuf_stats();
+    RAISE NOTICE 'terminated_by_cap=%, within_ten_rows=%, live_ops=%, over_cap=%, msg=%',
+                 (n < 200), (n <= 10), ops, bytes > 65536, fired;
+END $$;
+NOTICE:  terminated_by_cap=t, within_ten_rows=t, live_ops=0, over_cap=t, msg=deferred write buffer would exceed write_max_bytes
+ROLLBACK;
+-- ---------------------------------------------------------------------------
+-- ROLLBACK TO SAVEPOINT truncates by nest level and recomputes the binding.
+--
+-- Two halves. The negative control alone passes whether or not the binding is
+-- recomputed, so the POSITIVE half is the assertion.
+-- ---------------------------------------------------------------------------
+-- Negative control: the refusal exists at all.
+BEGIN;
+INSERT INTO wb_str VALUES ('wb:u1','v');
+SELECT wb_err($$INSERT INTO wb_str_db3 VALUES ('wb:u2','v')$$) AS second_database;
+                             second_database                             
+-------------------------------------------------------------------------
+ 0A000: cannot write to more than one Valkey database in one transaction
+(1 row)
+
+ROLLBACK;
+-- The assertion: a later statement on a different database is ACCEPTED once
+-- the first one's operations have been rolled back.
+BEGIN;
+SAVEPOINT sp;
+INSERT INTO wb_str VALUES ('wb:u1','v');
+ROLLBACK TO SAVEPOINT sp;
+SELECT live_ops, bound FROM valkey_fdw_test_wbuf_stats();
+ live_ops | bound 
+----------+-------
+        0 | f
+(1 row)
+
+INSERT INTO wb_str_db3 VALUES ('wb:u2','v');
+SELECT live_ops, database FROM valkey_fdw_test_wbuf_stats();
+ live_ops | database 
+----------+----------
+        1 |        3
+(1 row)
+
+ROLLBACK;
+-- ---------------------------------------------------------------------------
+-- A subtransaction aborting UNDER a running DML statement leaves its binding
+-- alone.
+--
+-- Regression test. The buffer used to unbind on any subtransaction abort that
+-- found it empty, and BeginForeignModify binds before the first row is
+-- buffered - so an ordinary INSERT whose value expression contained a plpgsql
+-- BEGIN ... EXCEPTION (the usual way to write a safe cast) had its own binding
+-- dropped mid-statement and died on an internal elog before buffering a row.
+--
+-- wb_err runs its argument inside an EXCEPTION block, so evaluating the second
+-- column opens a subtransaction and aborts it while the INSERT that already
+-- bound the unit is still running. The INSERT must survive and buffer its row.
+-- ---------------------------------------------------------------------------
+BEGIN;
+INSERT INTO wb_str VALUES ('wb:sx1', wb_err($$SELECT 1/0$$));
+SELECT live_ops, bound FROM valkey_fdw_test_wbuf_stats();
+ live_ops | bound 
+----------+-------
+        1 | t
+(1 row)
+
+SELECT convert_from(key,'UTF8') AS key, convert_from(value,'UTF8') AS value
+FROM valkey_fdw_test_wbuf_dump();
+  key   |          value          
+--------+-------------------------
+ wb:sx1 | 22012: division by zero
+(1 row)
+
+ROLLBACK;
+-- The same abort must not spare a binding it DID create. A statement that
+-- binds and buffers nothing inside a savepoint is rolled back completely, so
+-- a later statement on a different database is accepted. Without this half,
+-- gating the unbind on "did the abort drop anything" would pass while leaving
+-- a rolled-back statement's binding standing for the rest of the transaction.
+BEGIN;
+SAVEPOINT sp0;
+INSERT INTO wb_str SELECT 'wb:none', 'v' WHERE false;
+SELECT live_ops, bound FROM valkey_fdw_test_wbuf_stats();
+ live_ops | bound 
+----------+-------
+        0 | t
+(1 row)
+
+ROLLBACK TO SAVEPOINT sp0;
+SELECT live_ops, bound FROM valkey_fdw_test_wbuf_stats();
+ live_ops | bound 
+----------+-------
+        0 | f
+(1 row)
+
+INSERT INTO wb_str_db3 VALUES ('wb:none3','v');
+SELECT live_ops, database FROM valkey_fdw_test_wbuf_stats();
+ live_ops | database 
+----------+----------
+        1 |        3
+(1 row)
+
+ROLLBACK;
+-- ---------------------------------------------------------------------------
+-- The generation counter advances when the operation list changes.
+--
+-- S7's overlay caches per generation, so a counter that never moves is a stale
+-- read that returns rolled-back rows. Nothing in S3 consumes it, which is why
+-- both bumps were free to be deleted with every suite still green.
+--
+-- Asserted as a relation (strictly greater, unchanged) rather than a value:
+-- the absolute count depends on how many statements ran before it.
+-- ---------------------------------------------------------------------------
+BEGIN;
+SAVEPOINT g1;
+INSERT INTO wb_str VALUES ('wb:g10','v');
+SELECT generation AS g_before FROM valkey_fdw_test_wbuf_stats() \gset
+ROLLBACK TO SAVEPOINT g1;
+SELECT generation > :g_before AS bumped_by_truncation
+FROM valkey_fdw_test_wbuf_stats();
+ bumped_by_truncation 
+----------------------
+ t
+(1 row)
+
+-- An abort that drops nothing must not bump it: a counter that advanced on
+-- every subtransaction event would satisfy the assertion above while telling
+-- the overlay nothing about whether the list actually changed.
+SELECT generation AS g_quiet FROM valkey_fdw_test_wbuf_stats() \gset
+SAVEPOINT g2;
+SELECT 1 AS nothing_buffered;
+ nothing_buffered 
+------------------
+                1
+(1 row)
+
+ROLLBACK TO SAVEPOINT g2;
+SELECT generation = :g_quiet AS unchanged_when_nothing_dropped
+FROM valkey_fdw_test_wbuf_stats();
+ unchanged_when_nothing_dropped 
+--------------------------------
+ t
+(1 row)
+
+ROLLBACK;
+-- ---------------------------------------------------------------------------
+-- A refused row's bytes are charged, so a loop over refusals is still capped.
+--
+-- The byte cap used to be consulted only in vfdw_wbuf_append, which a row
+-- refused during rendering never reaches. Each attempt still allocated its
+-- operation and whatever it had retained before the refusal, and nothing ever
+-- freed it - so a LOOP ... EXCEPTION over bad rows grew the buffer without
+-- limit and no cap ever fired. Charging at allocation is what bounds it.
+--
+-- write_max_ops is deliberately huge here: nothing is ever appended, so the
+-- operation cap cannot fire, and if it somehow did it would mask the failure
+-- this block is looking for.
+-- ---------------------------------------------------------------------------
+CREATE SERVER wb_bytes_srv FOREIGN DATA WRAPPER valkey_fdw
+    OPTIONS (host 'valkey', port '6379',
+             write_max_ops '1000000', write_max_bytes '65536');
+CREATE USER MAPPING FOR CURRENT_USER SERVER wb_bytes_srv;
+CREATE FOREIGN TABLE wb_bytes_t (k text OPTIONS (key 'true'), v text)
+    SERVER wb_bytes_srv OPTIONS (tabletype 'string', keyprefix 'wb:');
+BEGIN;
+DO $$
+DECLARE
+    i         int;
+    capped    boolean := false;
+    other     text    := NULL;
+BEGIN
+    -- A NULL key is refused after the operation is allocated and before
+    -- anything is appended: the shape that used to escape both caps.
+    FOR i IN 1..5000 LOOP
+        BEGIN
+            INSERT INTO wb_bytes_t VALUES (NULL, 'v');
+        EXCEPTION WHEN OTHERS THEN
+            IF SQLERRM LIKE '%write_max_bytes%' THEN
+                capped := true;
+                EXIT;
+            ELSIF other IS NULL THEN
+                other := SQLSTATE || ': ' || SQLERRM;
+            END IF;
+        END;
+    END LOOP;
+    RAISE NOTICE 'byte cap fired on refused rows: %', capped;
+    RAISE NOTICE 'refusal seen before the cap: %', other;
+END $$;
+NOTICE:  byte cap fired on refused rows: t
+NOTICE:  refusal seen before the cap: 23502: null value in column "k" has no representation in Valkey
+SELECT live_ops FROM valkey_fdw_test_wbuf_stats();
+ live_ops 
+----------
+        0
+(1 row)
+
+ROLLBACK;
+-- ---------------------------------------------------------------------------
+-- RELEASE SAVEPOINT promotes an operation's nest level.
+--
+-- Re-tagging has no observable unless a savepoint is released and then a NEW
+-- savepoint at the same level is rolled back to. A plain nest-and-rollback
+-- test passes with the promotion deleted, which is why the two RELEASEs and
+-- the second savepoint are all necessary.
+-- ---------------------------------------------------------------------------
+BEGIN;
+INSERT INTO wb_str VALUES ('wb:l1','v');    -- level 1
+SAVEPOINT a;
+INSERT INTO wb_str VALUES ('wb:l2','v');    -- level 2
+SAVEPOINT b;
+INSERT INTO wb_str VALUES ('wb:l3','v');    -- level 3
+RELEASE SAVEPOINT b;                        -- >= 3 promoted to 2
+RELEASE SAVEPOINT a;                        -- >= 2 promoted to 1
+SAVEPOINT c;
+INSERT INTO wb_str VALUES ('wb:l4','v');    -- level 2
+ROLLBACK TO SAVEPOINT c;                    -- drops >= 2: only wb:l4
+SELECT live_ops FROM valkey_fdw_test_wbuf_stats();
+ live_ops 
+----------
+        3
+(1 row)
+
+SELECT nest_level, count(*) FROM valkey_fdw_test_wbuf_dump()
+GROUP BY 1 ORDER BY 1;
+ nest_level | count 
+------------+-------
+          1 |     3
+(1 row)
+
+ROLLBACK;
+-- ---------------------------------------------------------------------------
+-- Every operation carries the command id of the statement that made it.
+--
+-- S3 stamps it and S7 consumes it, so this is the only step in which the stamp
+-- is testable at all, and the one place where getting it wrong stays silent
+-- for three steps. Three statements must produce three distinct command ids,
+-- and one multi-row statement must produce one.
+--
+-- What this does NOT test, and the design document says it does: the `true`
+-- in GetCurrentCommandId(true). Changing it to false was run and produced no
+-- difference, because standard_ExecutorStart already marks the command id
+-- used for every DML statement. What it does test is that the stamp is taken
+-- per statement at append time at all - replacing it with a constant reads
+-- one distinct id instead of three.
+-- ---------------------------------------------------------------------------
+BEGIN;
+INSERT INTO wb_str VALUES ('wb:x1','v');
+INSERT INTO wb_str VALUES ('wb:x2','v');
+INSERT INTO wb_str SELECT 'wb:y'||i, 'v' FROM generate_series(1,3) i;
+SELECT count(DISTINCT cid) AS distinct_cids, count(*) AS ops
+FROM valkey_fdw_test_wbuf_dump();
+ distinct_cids | ops 
+---------------+-----
+             3 |   5
+(1 row)
+
+SELECT count(DISTINCT cid) AS one_cid_for_the_multirow_statement
+FROM valkey_fdw_test_wbuf_dump() WHERE ordinal >= 3;
+ one_cid_for_the_multirow_statement 
+------------------------------------
+                                  1
+(1 row)
+
+ROLLBACK;
+-- ---------------------------------------------------------------------------
+-- The new row's HeapTuple is copied, not borrowed.
+--
+-- Read operation 1's stored tuple back after 49 further rows have reused the
+-- per-tuple context. tuple_probe renders the first attribute out of the stored
+-- tuple, so a borrowed pointer shows up as the wrong row rather than as a
+-- claim nobody checked.
+-- ---------------------------------------------------------------------------
+BEGIN;
+INSERT INTO wb_str SELECT 'wb:t'||i, 'value-'||i FROM generate_series(1,50) i;
+SELECT ordinal, tuple_natts, tuple_probe
+FROM valkey_fdw_test_wbuf_dump() WHERE ordinal IN (1, 25, 50) ORDER BY 1;
+ ordinal | tuple_natts | tuple_probe 
+---------+-------------+-------------
+       1 |           2 | wb:t1
+      25 |           2 | wb:t25
+      50 |           2 | wb:t50
+(3 rows)
+
+-- Borrowing the slot's own tuple instead of copying it was run: operation 1
+-- reads the fiftieth row's key. No sanitizer was needed, and none is
+-- available - an ASan-instrumented module cannot be dlopened into the stock
+-- server this harness runs.
+ROLLBACK;
+-- ---------------------------------------------------------------------------
+-- An operation points at nothing that dies with its statement.
+--
+-- The likely victim is a hash field name: it points into the VfdwTableMap,
+-- which lives in the per-statement context that EndForeignModify deletes. The
+-- second INSERT runs to completion, so the first one's context is gone by the
+-- time its operation is read back - and it is on a table whose field names
+-- differ, so the recycled block holds different bytes rather than the same
+-- ones. There is no ASan in this harness (an instrumented module cannot be
+-- dlopened into the stock server), so this reuse is the only detector
+-- available; it is a strong one in practice but it is heap behaviour rather
+-- than a guarantee.
+-- ---------------------------------------------------------------------------
+BEGIN;
+INSERT INTO wb_hash  VALUES ('wb:h1', 'a1', 'b1');
+INSERT INTO wb_hash2 VALUES ('wb:h2', 'a2', 'b2');
+SELECT ordinal, nfields, convert_from(key,'UTF8') AS key
+FROM valkey_fdw_test_wbuf_dump() ORDER BY ordinal;
+ ordinal | nfields |  key  
+---------+---------+-------
+       1 |       2 | wb:h1
+       2 |       2 | wb:h2
+(2 rows)
+
+SELECT ordinal, field_no, convert_from(name,'UTF8') AS field,
+       convert_from(value,'UTF8') AS value
+FROM valkey_fdw_test_wbuf_fields() ORDER BY 1, 2;
+ ordinal | field_no | field | value 
+---------+----------+-------+-------
+       1 |        1 | alpha | a1
+       1 |        2 | beta  | b1
+       2 |        1 | gamma | a2
+       2 |        2 | zeta  | b2
+(4 rows)
+
+ROLLBACK;
+-- A NULL mapped field is recorded rather than dropped: at flush time it is an
+-- HDEL, and a field the table does not map is simply not in the array.
+BEGIN;
+INSERT INTO wb_hash VALUES ('wb:h3', 'a3', NULL);
+SELECT ordinal, field_no, convert_from(name,'UTF8') AS field,
+       value IS NULL AS is_null
+FROM valkey_fdw_test_wbuf_fields() ORDER BY 1, 2;
+ ordinal | field_no | field | is_null 
+---------+----------+-------+---------
+       1 |        1 | alpha | f
+       1 |        2 | beta  | t
+(2 rows)
+
+ROLLBACK;
+-- ---------------------------------------------------------------------------
+-- The flush hook is reached, and returns at step 0 on an empty buffer.
+--
+-- The only observation in this step that distinguishes "the flush returned
+-- early" from "the flush was never called at all".
+--
+-- The counters advance by TWO, not one: the \gset statement below is itself a
+-- transaction and commits before the BEGIN.
+-- ---------------------------------------------------------------------------
+SELECT calls, empty_returns, flushes FROM valkey_fdw_test_flush_stats() \gset f0_
+BEGIN;
+SELECT count(*) >= 0 AS read_ok FROM wb_str;
+ read_ok 
+---------
+ t
+(1 row)
+
+COMMIT;
+SELECT calls         = :f0_calls + 2         AS hook_was_called,
+       empty_returns = :f0_empty_returns + 2 AS returned_at_step_0,
+       flushes       = :f0_flushes           AS nothing_flushed
+FROM valkey_fdw_test_flush_stats();
+ hook_was_called | returned_at_step_0 | nothing_flushed 
+-----------------+--------------------+-----------------
+ t               | t                  | t
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- A failed flush re-enters as ABORT and leaves the session usable.
+--
+-- The only re-entrancy this step can test, and the same path every real flush
+-- failure will take from S6 on.
+-- ---------------------------------------------------------------------------
+SELECT open FROM valkey_fdw_test_pool_stats() \gset flush_before_
+BEGIN;
+INSERT INTO wb_str VALUES ('wb:f1','v');
+COMMIT;
+ERROR:  a key this transaction creates already exists in Valkey
+DETAIL:  Valkey refused the write: 1 wb:f1 check 2
+HINT:  No changes were applied in Valkey; the transaction has been rolled back.
+CONTEXT:  valkey_fdw pre-commit flush; no changes were applied in Valkey.
+SELECT live_ops, alloc_bytes, bound FROM valkey_fdw_test_wbuf_stats();
+ live_ops | alloc_bytes | bound 
+----------+-------------+-------
+        0 |           0 | f
+(1 row)
+
+BEGIN;
+INSERT INTO wb_str_db3 VALUES ('wb:f2','v');
+SELECT live_ops, database FROM valkey_fdw_test_wbuf_stats();
+ live_ops | database 
+----------+----------
+        1 |        3
+(1 row)
+
+ROLLBACK;
+SELECT count(*) >= 0 AS scan_still_works FROM wb_str;
+ scan_still_works 
+------------------
+ t
+(1 row)
+
+SELECT open = :flush_before_open AS pool_unchanged
+FROM valkey_fdw_test_pool_stats();
+ pool_unchanged 
+----------------
+ t
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- PREPARE TRANSACTION is refused, and the session is usable afterwards.
+--
+-- The second clause carries the weight: a refusal that leaves the buffer, the
+-- binding or a connection lease in a bad state is visible only in the next
+-- statement.
+-- ---------------------------------------------------------------------------
+SELECT open, opened_total FROM valkey_fdw_test_pool_stats() \gset prep_before_
+BEGIN;
+INSERT INTO wb_str VALUES ('wb:p1','v');
+PREPARE TRANSACTION 'wb_prep';
+ERROR:  cannot PREPARE a transaction that has written to valkey_fdw foreign tables
+DETAIL:  1 write operations are buffered for one atomic Valkey unit.
+HINT:  Valkey has no two-phase commit, so the wrapper cannot hold a prepared write. COMMIT or ROLLBACK instead.
+-- Usable: a new write transaction on a DIFFERENT database, so a surviving unit
+-- binding shows up as a refusal rather than as a pass.
+BEGIN;
+INSERT INTO wb_str_db3 VALUES ('wb:p2','v');
+SELECT live_ops, database FROM valkey_fdw_test_wbuf_stats();
+ live_ops | database 
+----------+----------
+        1 |        3
+(1 row)
+
+ROLLBACK;
+SELECT count(*) >= 0 AS read_still_works FROM wb_str;
+ read_still_works 
+------------------
+ t
+(1 row)
+
+SELECT open = :prep_before_open                 AS pool_open_unchanged,
+       opened_total = :prep_before_opened_total AS no_reconnect
+FROM valkey_fdw_test_pool_stats();
+ pool_open_unchanged | no_reconnect 
+---------------------+--------------
+ t                   | t
+(1 row)
+
+-- PREPARE with an EMPTY buffer still works. This is the clause that catches an
+-- over-broad refusal, and it needs max_prepared_transactions > 0, which
+-- docker/build-entrypoint.sh sets.
+BEGIN;
+SELECT count(*) >= 0 AS read_ok FROM wb_str;
+ read_ok 
+---------
+ t
+(1 row)
+
+PREPARE TRANSACTION 'wb_prep_empty';
+COMMIT PREPARED 'wb_prep_empty';
+-- ---------------------------------------------------------------------------
+-- The connection is acquired at the DML statement, and the lease is returned.
+-- ---------------------------------------------------------------------------
+-- A server pointed at a port nothing listens on: the failure must be reported
+-- at the INSERT, not at COMMIT.
+CREATE SERVER wb_dead FOREIGN DATA WRAPPER valkey_fdw
+    OPTIONS (host 'valkey', port '1');
+CREATE USER MAPPING FOR CURRENT_USER SERVER wb_dead;
+CREATE FOREIGN TABLE wb_dead_t (k text OPTIONS (key 'true'), v text)
+    SERVER wb_dead OPTIONS (tabletype 'string', keyprefix 'wb:');
+BEGIN;
+SELECT wb_state($$INSERT INTO wb_dead_t VALUES ('wb:d','v')$$) AS unreachable_at_dml;
+ unreachable_at_dml 
+--------------------
+ 08006
+(1 row)
+
+SELECT live_ops, bound FROM valkey_fdw_test_wbuf_stats();
+ live_ops | bound 
+----------+-------
+        0 | f
+(1 row)
+
+ROLLBACK;
+-- The lease is returned, so a transaction may run more DML statements than
+-- there are connection slots. Holding one per statement would fail the 33rd
+-- with "too many concurrent Valkey scans on one server" - a message wrong in
+-- both of its nouns.
+SELECT open FROM valkey_fdw_test_pool_stats() \gset lease_before_
+BEGIN;
+DO $$
+BEGIN
+    FOR i IN 1..40 LOOP
+        EXECUTE format('INSERT INTO wb_str VALUES (%L, %L)', 'wb:lease'||i, 'v');
+    END LOOP;
+END $$;
+SELECT live_ops FROM valkey_fdw_test_wbuf_stats();
+ live_ops 
+----------
+       40
+(1 row)
+
+SELECT open = :lease_before_open AS no_extra_connections
+FROM valkey_fdw_test_pool_stats();
+ no_extra_connections 
+----------------------
+ t
+(1 row)
+
+ROLLBACK;
+-- Nothing above reached Valkey, so the keyspace is still where it started.
+SELECT count(*) = 0 AS keyspace_still_identical
+FROM ((SELECT key, keytype FROM valkey_fdw_test_keys('wb_srv', 0, 'wb:')
+       EXCEPT ALL
+       SELECT key, keytype FROM wb_before)
+      UNION ALL
+      (SELECT key, keytype FROM wb_before
+       EXCEPT ALL
+       SELECT key, keytype FROM valkey_fdw_test_keys('wb_srv', 0, 'wb:'))) d;
+ keyspace_still_identical 
+--------------------------
+ t
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- The ledger: the buffer folded into one plan per Valkey key.
+--
+-- The buffer records what SQL did; the ledger records what the server has to
+-- be told. Everything below reads the fold rather than the log, because the
+-- fold is what S5 encodes and S6 sends, and two operations on one key must
+-- collapse into one plan rather than two.
+--
+-- Rendered through names, never opcode numbers. A recorded file of small
+-- integers survives a renumbering of the enum unchanged - every number moves
+-- together - while the Lua dispatch tables that decode them would not.
+-- ---------------------------------------------------------------------------
+-- keyset rather than keyprefix: they are alternatives and naming both is
+-- refused, so this table addresses its keys unprefixed.
+CREATE FOREIGN TABLE wb_ks (k text OPTIONS (key 'true'), v text)
+    SERVER wb_srv OPTIONS (tabletype 'string', keyset 'wb:index');
+CREATE FOREIGN TABLE wb_zs (k text OPTIONS (key 'true'),
+                           m text OPTIONS (member 'true'),
+                           s text OPTIONS (score 'true'))
+    SERVER wb_srv OPTIONS (tabletype 'zset', keyprefix 'wbz:');
+CREATE FOREIGN TABLE wb_ls (k text OPTIONS (key 'true'), m text)
+    SERVER wb_srv OPTIONS (tabletype 'list', keyprefix 'wbl:');
+-- INSERT then UPDATE of one key is ONE plan, and the precondition is the one
+-- the INSERT established. This is section 6.2's own example, and until S7 it
+-- could not be written in SQL at all: the UPDATE matched zero rows, because a
+-- statement could not see its own transaction's buffered INSERT. The overlay
+-- is what makes it expressible, so the assertion and the thing it asserts
+-- arrived one step apart.
+BEGIN;
+INSERT INTO wb_str VALUES ('wb:iu', 'first');
+UPDATE wb_str SET v = 'second' WHERE k = 'wb:iu';
+SELECT live_ops FROM valkey_fdw_test_wbuf_stats();
+ live_ops 
+----------
+        2
+(1 row)
+
+SELECT plan_no, convert_from(key,'UTF8') AS key, require, state,
+       kind, step_no, op, convert_from(args,'UTF8') AS args
+FROM valkey_fdw_test_ledger() ORDER BY plan_no, kind DESC, step_no;
+ plan_no |  key  |  require   |  state  |  kind  | step_no |     op     |  args  
+---------+-------+------------+---------+--------+---------+------------+--------
+       1 | wb:iu | KEY_ABSENT | CREATED | check  |       1 | TYPE_OK    | 
+       1 | wb:iu | KEY_ABSENT | CREATED | check  |       2 | KEY_ABSENT | 
+       1 | wb:iu | KEY_ABSENT | CREATED | action |       1 | SET        | first
+       1 | wb:iu | KEY_ABSENT | CREATED | action |       2 | SET        | second
+(4 rows)
+
+ROLLBACK;
+-- Two UPDATEs of one key are ONE plan, and the precondition is the one the
+-- FIRST established. A second UPDATE that re-established it would append a
+-- duplicate KEY_PRESENT; a fold that rebuilt it per operation would emit the
+-- check twice and the flush would pay for it on every row of a bulk update.
+BEGIN;
+UPDATE wb_str SET v = 'once'  WHERE k = 'wb:f1';
+UPDATE wb_str SET v = 'twice' WHERE k = 'wb:f1';
+SELECT live_ops FROM valkey_fdw_test_wbuf_stats();
+ live_ops 
+----------
+        2
+(1 row)
+
+SELECT plan_no, convert_from(key,'UTF8') AS key, require, state,
+       kind, step_no, op, convert_from(args,'UTF8') AS args
+FROM valkey_fdw_test_ledger() ORDER BY plan_no, kind DESC, step_no;
+ plan_no |  key  |   require   | state |  kind  | step_no |     op      | args  
+---------+-------+-------------+-------+--------+---------+-------------+-------
+       1 | wb:f1 | KEY_PRESENT | LIVE  | check  |       1 | TYPE_OK     | 
+       1 | wb:f1 | KEY_PRESENT | LIVE  | check  |       2 | KEY_PRESENT | 
+       1 | wb:f1 | KEY_PRESENT | LIVE  | action |       1 | SET         | once
+       1 | wb:f1 | KEY_PRESENT | LIVE  | action |       2 | SET         | twice
+(4 rows)
+
+ROLLBACK;
+-- DELETE then INSERT is legal and keeps KEY_PRESENT from the delete. Turning
+-- it into KEY_ABSENT would fail the flush for doing exactly what SQL asked -
+-- the key IS present on the server, which is why the delete is there.
+BEGIN;
+DELETE FROM wb_str WHERE k = 'wb:g1';
+INSERT INTO wb_str VALUES ('wb:g1', 'again');
+SELECT plan_no, convert_from(key,'UTF8') AS key, require, state,
+       kind, step_no, op, convert_from(args,'UTF8') AS args
+FROM valkey_fdw_test_ledger() ORDER BY plan_no, kind DESC, step_no;
+ plan_no |  key  |   require   | state |  kind  | step_no |     op      | args  
+---------+-------+-------------+-------+--------+---------+-------------+-------
+       1 | wb:g1 | KEY_PRESENT | LIVE  | check  |       1 | TYPE_OK     | 
+       1 | wb:g1 | KEY_PRESENT | LIVE  | check  |       2 | KEY_PRESENT | 
+       1 | wb:g1 | KEY_PRESENT | LIVE  | action |       1 | DEL         | 
+       1 | wb:g1 | KEY_PRESENT | LIVE  | action |       2 | SET         | again
+(4 rows)
+
+ROLLBACK;
+-- A key rename emits RENAME, not a delete and a recreate: the hash fields and
+-- the TTL a delete would destroy are exactly what the user did not ask to
+-- lose.
+BEGIN;
+UPDATE wb_str SET k = 'wb:r2' WHERE k = 'wb:r1';
+SELECT plan_no, convert_from(key,'UTF8') AS key, require,
+       kind, step_no, op, convert_from(args,'UTF8') AS args
+FROM valkey_fdw_test_ledger() ORDER BY plan_no, kind DESC, step_no;
+ plan_no |  key  |   require   |  kind  | step_no |     op      |  args  
+---------+-------+-------------+--------+---------+-------------+--------
+       1 | wb:r2 | KEY_ABSENT  | check  |       1 | TYPE_OK     | 
+       1 | wb:r2 | KEY_ABSENT  | check  |       2 | KEY_ABSENT  | 
+       1 | wb:r2 | KEY_ABSENT  | action |       1 | RENAME      | wb:r1
+       1 | wb:r2 | KEY_ABSENT  | action |       2 | SET         | seeded
+       2 | wb:r1 | KEY_PRESENT | check  |       1 | TYPE_OK     | 
+       2 | wb:r1 | KEY_PRESENT | check  |       2 | KEY_PRESENT | 
+(6 rows)
+
+ROLLBACK;
+-- The keyset index is maintained inside the same unit as the write, so it
+-- cannot be left pointing at a key that was never created.
+BEGIN;
+INSERT INTO wb_ks VALUES ('wb:k1', 'v');
+DELETE FROM wb_ks WHERE k = 'wb:k2';
+-- require is selected here and nowhere else with an INSERT-created key: every
+-- other block above establishes its precondition from an UPDATE or a DELETE,
+-- so KEY_ABSENT could be replaced by KEY_PRESENT throughout and only the check
+-- opcode would move. Measured, not assumed.
+SELECT plan_no, convert_from(key,'UTF8') AS key, require, kind, step_no, op,
+       convert_from(args,'UTF8') AS args
+FROM valkey_fdw_test_ledger() ORDER BY plan_no, kind DESC, step_no;
+ plan_no |  key  |   require   |  kind  | step_no |     op      |      args      
+---------+-------+-------------+--------+---------+-------------+----------------
+       1 | wb:k1 | KEY_ABSENT  | check  |       1 | TYPE_OK     | 
+       1 | wb:k1 | KEY_ABSENT  | check  |       2 | KEY_ABSENT  | 
+       1 | wb:k1 | KEY_ABSENT  | action |       1 | SET         | v
+       1 | wb:k1 | KEY_ABSENT  | action |       2 | KSET_ADD    | wb:index|wb:k1
+       2 | wb:k2 | KEY_PRESENT | check  |       1 | TYPE_OK     | 
+       2 | wb:k2 | KEY_PRESENT | check  |       2 | KEY_PRESENT | 
+       2 | wb:k2 | KEY_PRESENT | action |       1 | DEL         | 
+       2 | wb:k2 | KEY_PRESENT | action |       2 | KSET_REM    | wb:index|wb:k2
+(8 rows)
+
+ROLLBACK;
+-- A member rename is ZREM then ZADD, in that order. The reverse ordering is
+-- correct only because the two names differ, and silently deletes the row on
+-- the day they do not.
+BEGIN;
+UPDATE wb_zs SET m = 'new' WHERE k = 'wbz:k' AND m = 'old';
+SELECT kind, step_no, op, convert_from(args,'UTF8') AS args
+FROM valkey_fdw_test_ledger() ORDER BY kind DESC, step_no;
+  kind  | step_no |       op        | args  
+--------+---------+-----------------+-------
+ check  |       1 | TYPE_OK         | 
+ check  |       2 | KEY_PRESENT     | 
+ check  |       3 | ZMEMBER_PRESENT | old
+ action |       1 | ZREM            | old
+ action |       2 | ZADD            | 1|new
+(5 rows)
+
+ROLLBACK;
+-- A list may hold one value many times, so presence is a count rather than a
+-- yes or no. Two pushes of one value emit two RPUSHes and ask the server for
+-- nothing; a delete of a value this transaction did NOT push asks for one.
+BEGIN;
+INSERT INTO wb_ls VALUES ('wbl:k', 'dup');
+INSERT INTO wb_ls VALUES ('wbl:k', 'dup');
+SELECT kind, step_no, op, convert_from(args,'UTF8') AS args
+FROM valkey_fdw_test_ledger() ORDER BY kind DESC, step_no;
+  kind  | step_no |     op     | args 
+--------+---------+------------+------
+ check  |       1 | TYPE_OK    | 
+ check  |       2 | KEY_ABSENT | 
+ action |       1 | RPUSH      | dup
+ action |       2 | RPUSH      | dup
+(4 rows)
+
+ROLLBACK;
+BEGIN;
+DELETE FROM wb_ls WHERE k = 'wbl:d' AND m = 'gone';
+SELECT live_ops FROM valkey_fdw_test_wbuf_stats();
+ live_ops 
+----------
+        1
+(1 row)
+
+SELECT kind, step_no, op, convert_from(args,'UTF8') AS args
+FROM valkey_fdw_test_ledger() ORDER BY kind DESC, step_no;
+  kind  | step_no |       op        |  args  
+--------+---------+-----------------+--------
+ check  |       1 | TYPE_OK         | 
+ check  |       2 | KEY_PRESENT     | 
+ check  |       3 | LVALUE_COUNT_GE | gone|1
+ action |       1 | LREM1           | gone
+(4 rows)
+
+ROLLBACK;
+-- ---------------------------------------------------------------------------
+-- Inserting a key this transaction already created raises 23505 AT THE
+-- STATEMENT.
+--
+-- The alternative every plain per-key fold produces is a last-writer-wins
+-- overwrite that reports two rows inserted and leaves one - a lost row with
+-- no error anywhere. The row count matters as much as the SQLSTATE, so both
+-- are asserted.
+-- ---------------------------------------------------------------------------
+BEGIN;
+INSERT INTO wb_str VALUES ('wb:dup', 'one');
+SELECT wb_err($$INSERT INTO wb_str VALUES ('wb:dup', 'two')$$) AS second_insert;
+                      second_insert                      
+---------------------------------------------------------
+ 23505: duplicate key value violates the Valkey keyspace
+(1 row)
+
+SELECT live_ops FROM valkey_fdw_test_wbuf_stats();
+ live_ops 
+----------
+        1
+(1 row)
+
+SELECT count(*) AS plans FROM (SELECT DISTINCT plan_no
+                               FROM valkey_fdw_test_ledger()) d;
+ plans 
+-------
+     1
+(1 row)
+
+ROLLBACK;
+-- An UPDATE first, then an INSERT of the same key: the key exists remotely,
+-- so this is the same duplicate and must be refused for the same reason.
+BEGIN;
+UPDATE wb_str SET v = 'x' WHERE k = 'wb:dup2';
+SELECT wb_err($$INSERT INTO wb_str VALUES ('wb:dup2', 'y')$$) AS insert_after_update;
+                   insert_after_update                   
+---------------------------------------------------------
+ 23505: duplicate key value violates the Valkey keyspace
+(1 row)
+
+ROLLBACK;
+-- A second INSERT of the same zset MEMBER is refused one level down, while a
+-- second row on the same KEY is not: a zset key holds many rows by design.
+BEGIN;
+INSERT INTO wb_zs VALUES ('wbz:m', 'a', '1');
+INSERT INTO wb_zs VALUES ('wbz:m', 'b', '2');
+SELECT live_ops FROM valkey_fdw_test_wbuf_stats();
+ live_ops 
+----------
+        2
+(1 row)
+
+SELECT wb_err($$INSERT INTO wb_zs VALUES ('wbz:m', 'a', '3')$$) AS duplicate_member;
+                   duplicate_member                   
+------------------------------------------------------
+ 23505: duplicate member violates the Valkey keyspace
+(1 row)
+
+ROLLBACK;
+-- ---------------------------------------------------------------------------
+-- The incremental fold and the rebuild agree.
+--
+-- vfdw_ledger_note runs per row; vfdw_ledger_rebuild_from_buffer re-folds the
+-- whole surviving log after a truncation. If they could disagree, a savepoint
+-- would silently change what COMMIT applies. ROLLBACK TO SAVEPOINT forces the
+-- rebuild; the surviving prefix must fold to exactly what it folded to on the
+-- way in.
+-- ---------------------------------------------------------------------------
+BEGIN;
+INSERT INTO wb_str VALUES ('wb:eq1', 'a');
+INSERT INTO wb_ks VALUES ('wb:eq2', 'b');
+UPDATE wb_str SET v = 'c' WHERE k = 'wb:eq1';
+CREATE TEMP TABLE wb_fold_before AS
+    SELECT plan_no, key, require, state, kind, step_no, op, args
+    FROM valkey_fdw_test_ledger();
+SAVEPOINT eq;
+INSERT INTO wb_str VALUES ('wb:eq3', 'd');
+UPDATE wb_ks SET v = 'e' WHERE k = 'wb:eq2';
+ROLLBACK TO SAVEPOINT eq;
+SELECT count(*) = 0 AS fold_identical_after_rebuild
+FROM ((SELECT * FROM wb_fold_before
+       EXCEPT ALL
+       SELECT plan_no, key, require, state, kind, step_no, op, args
+       FROM valkey_fdw_test_ledger())
+      UNION ALL
+      (SELECT plan_no, key, require, state, kind, step_no, op, args
+       FROM valkey_fdw_test_ledger()
+       EXCEPT ALL
+       SELECT * FROM wb_fold_before)) d;
+ fold_identical_after_rebuild 
+------------------------------
+ t
+(1 row)
+
+-- And the rebuild really did discard the rolled-back work: the key the
+-- savepoint created is gone from the fold entirely.
+SELECT count(*) AS eq3_plans FROM valkey_fdw_test_ledger()
+WHERE key = 'wb:eq3'::bytea;
+ eq3_plans 
+-----------
+         0
+(1 row)
+
+ROLLBACK;
+-- The ledger is dropped with the buffer. It points into the buffer's memory,
+-- so surviving a reset would mean reading the next transaction's bytes.
+SELECT count(*) AS ledger_empty_between_transactions
+FROM valkey_fdw_test_ledger();
+ ledger_empty_between_transactions 
+-----------------------------------
+                                 0
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- Which columns each operation was planned against.
+--
+-- vfdw_modify_target_attrs had no observable anywhere: not in the buffer
+-- dump, not in EXPLAIN, not in fdw_private printing. Making it return NIL was
+-- run and left every suite green - thirty-five lines of plan-time logic whose
+-- removal nothing noticed.
+--
+-- The distinction worth asserting is INSERT against UPDATE. An INSERT writes
+-- every non-dropped column and targets all of them. An UPDATE targets only
+-- the columns the statement assigned, so updating one column of a three-
+-- column table must show ONE attnum here. Collapsing the two would make an
+-- UPDATE rewrite fields it was never asked to touch.
+-- ---------------------------------------------------------------------------
+CREATE FOREIGN TABLE wt (k text OPTIONS (key 'true'),
+                         a text OPTIONS (field 'a'),
+                         b text OPTIONS (field 'b'))
+    SERVER wb_srv OPTIONS (tabletype 'hash', keyprefix 'wt:');
+BEGIN;
+INSERT INTO wt VALUES ('wt:1', 'x', 'y');
+-- All three columns: k, a, b.
+SELECT ordinal, kind, attnum FROM valkey_fdw_test_wbuf_targets()
+ORDER BY ordinal, attnum;
+ ordinal |  kind  | attnum 
+---------+--------+--------
+       1 | insert |      1
+       1 | insert |      2
+       1 | insert |      3
+(3 rows)
+
+ROLLBACK;
+BEGIN;
+INSERT INTO wt VALUES ('wt:2', 'x', 'y');
+UPDATE wt SET b = 'z' WHERE k = 'wt:2';
+-- The INSERT still targets all three; the UPDATE targets only b (attnum 3).
+-- If the UPDATE branch were dropped it would show all three here too.
+SELECT ordinal, kind, attnum FROM valkey_fdw_test_wbuf_targets()
+ORDER BY ordinal, attnum;
+ ordinal |  kind  | attnum 
+---------+--------+--------
+       1 | insert |      1
+       1 | insert |      2
+       1 | insert |      3
+       2 | update |      3
+(4 rows)
+
+ROLLBACK;
+DROP FOREIGN TABLE wt;
+-- ---------------------------------------------------------------------------
+-- A statement that buffers nothing costs nothing.
+--
+-- target_attrs has to live in the write-buffer context, because the fold
+-- reads it at pre-commit long after the statement that planned it is gone.
+-- Building it at BeginForeignModify charged every DML statement against
+-- write_max_bytes whether or not it buffered a row: an UPDATE matching
+-- nothing, or a statement refused before its first row, left a bitmap behind
+-- for the rest of the transaction. Building it on first use instead is
+-- buffered no rows at all.
+-- ---------------------------------------------------------------------------
+CREATE FOREIGN TABLE wg (k text OPTIONS (key 'true'),
+                         a text OPTIONS (field 'a'),
+                         b text OPTIONS (field 'b'))
+    SERVER wb_srv OPTIONS (tabletype 'hash', keyprefix 'wg:');
+BEGIN;
+INSERT INTO wg VALUES ('wg:1', 'x', 'y');
+SELECT alloc_bytes AS wg_before FROM valkey_fdw_test_wbuf_stats() \gset
+-- MANY statements, not one. alloc_bytes reports the context's allocated
+-- BLOCKS, so a single bitmap fits inside a block already held and the delta
+-- is zero whether it was built eagerly or not - the first version of this
+-- assertion said 0 with the eager build restored, and asserted nothing.
+-- Five hundred crosses a block boundary and makes the difference visible.
+DO $wg$
+BEGIN
+    FOR i IN 1..500 LOOP
+        UPDATE wg SET a = 'q' WHERE k = 'wg:nosuchkey';
+    END LOOP;
+END $wg$;
+SELECT alloc_bytes - :wg_before AS bytes_for_500_statements_that_buffered_nothing
+FROM valkey_fdw_test_wbuf_stats();
+ bytes_for_500_statements_that_buffered_nothing 
+------------------------------------------------
+                                              0
+(1 row)
+
+ROLLBACK;
+DROP FOREIGN TABLE wg;

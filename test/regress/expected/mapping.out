@@ -1,0 +1,283 @@
+-- Table shape resolution.
+--
+-- Building every tuple from a two-element array regardless of the relation's
+-- width means a third column reads past the end of that array - any user who
+-- can CREATE FOREIGN TABLE can crash the backend. Here every attribute must
+-- resolve to a source at plan time, so a table that cannot be filled is
+-- refused instead of being scanned.
+CREATE SERVER map_srv FOREIGN DATA WRAPPER valkey_fdw
+    OPTIONS (host 'valkey', port '6379');
+CREATE USER MAPPING FOR CURRENT_USER SERVER map_srv;
+-- Shape resolution happens while planning, so EXPLAIN is what exercises it -
+-- and it exercises nothing else. Selecting instead would make every case
+-- depend on what the server happens to hold, which is how a suite ends up
+-- measuring the previous run rather than its own fixture.
+-- One column: the key alone is a legitimate table.
+CREATE FOREIGN TABLE map_key_only (k text) SERVER map_srv;
+EXPLAIN (COSTS OFF) SELECT * FROM map_key_only;
+            QUERY PLAN            
+----------------------------------
+ Foreign Scan on map_key_only
+   Valkey Strategy: Keyspace Scan
+(2 rows)
+
+-- Two columns: key and value, no options needed.
+CREATE FOREIGN TABLE map_two (k text, v text) SERVER map_srv;
+EXPLAIN (COSTS OFF) SELECT * FROM map_two;
+            QUERY PLAN            
+----------------------------------
+ Foreign Scan on map_two
+   Valkey Strategy: Keyspace Scan
+(2 rows)
+
+-- Three columns on a string table. A string table supplies a key and one
+-- value, so with TWO spare columns it is not the third that is wrong - it is
+-- that the table does not say WHICH of them is the value. Both are therefore
+-- named, and the default that map_two relies on is deliberately not applied:
+-- picking one would make a typo look like it worked. This is the exact shape
+-- that crashes a two-element tuple builder.
+CREATE FOREIGN TABLE map_three (k text, v text, extra text) SERVER map_srv;
+EXPLAIN (COSTS OFF) SELECT * FROM map_three;
+ERROR:  2 column(s) have no source in Valkey: "v", "extra"
+DETAIL:  Table type is "string", which supplies a key and one value.
+HINT:  Give each remaining column OPTIONS (field '...'), or one of member, score, ttl, distance.
+-- The same width is fine once every column says where it comes from.
+CREATE FOREIGN TABLE map_three_hash (
+    k     text,
+    name  text OPTIONS (field 'name'),
+    email text OPTIONS (field 'email')
+) SERVER map_srv OPTIONS (tabletype 'hash');
+EXPLAIN (COSTS OFF) SELECT * FROM map_three_hash;
+            QUERY PLAN            
+----------------------------------
+ Foreign Scan on map_three_hash
+   Valkey Strategy: Keyspace Scan
+(2 rows)
+
+-- Width is not the constraint; having a source is.
+CREATE FOREIGN TABLE map_wide (
+    k text,
+    f1 text OPTIONS (field 'f1'), f2 text OPTIONS (field 'f2'),
+    f3 text OPTIONS (field 'f3'), f4 text OPTIONS (field 'f4'),
+    f5 text OPTIONS (field 'f5'), f6 text OPTIONS (field 'f6'),
+    f7 text OPTIONS (field 'f7'), f8 text OPTIONS (field 'f8')
+) SERVER map_srv OPTIONS (tabletype 'hash');
+EXPLAIN (COSTS OFF) SELECT * FROM map_wide;
+            QUERY PLAN            
+----------------------------------
+ Foreign Scan on map_wide
+   Valkey Strategy: Keyspace Scan
+(2 rows)
+
+-- A dropped column leaves a gap in the descriptor that must be skipped, not
+-- counted as unmapped.
+ALTER FOREIGN TABLE map_wide DROP COLUMN f4;
+EXPLAIN (COSTS OFF) SELECT * FROM map_wide;
+            QUERY PLAN            
+----------------------------------
+ Foreign Scan on map_wide
+   Valkey Strategy: Keyspace Scan
+(2 rows)
+
+-- A list or set leaves exactly one meaning for a spare column, so it need not
+-- be spelled out. A zset leaves two - member and score - and must be.
+CREATE FOREIGN TABLE map_set_default (k text, m text) SERVER map_srv
+    OPTIONS (tabletype 'set');
+EXPLAIN (COSTS OFF) SELECT * FROM map_set_default;
+            QUERY PLAN            
+----------------------------------
+ Foreign Scan on map_set_default
+   Valkey Strategy: Keyspace Scan
+(2 rows)
+
+CREATE FOREIGN TABLE map_zset_ambiguous (k text, a text, b text) SERVER map_srv
+    OPTIONS (tabletype 'zset');
+EXPLAIN (COSTS OFF) SELECT * FROM map_zset_ambiguous;
+ERROR:  2 column(s) have no source in Valkey: "a", "b"
+DETAIL:  Table type is "zset", which supplies a key, a member and a score.
+HINT:  Give each remaining column OPTIONS (field '...'), or one of member, score, ttl, distance.
+-- A singleton table names its key in its options, so no column carries it and
+-- none is claimed by default: the lone column here is the member, not the key.
+CREATE FOREIGN TABLE map_singleton_set (m text) SERVER map_srv
+    OPTIONS (tabletype 'set', singleton_key 's');
+EXPLAIN (COSTS OFF) SELECT * FROM map_singleton_set;
+            QUERY PLAN             
+-----------------------------------
+ Foreign Scan on map_singleton_set
+   Valkey Strategy: Singleton Key
+(2 rows)
+
+-- A key column is still permitted, and gets the fixed name.
+CREATE FOREIGN TABLE map_singleton_keyed (
+    k text OPTIONS (key 'true'),
+    m text OPTIONS (member 'true')
+) SERVER map_srv OPTIONS (tabletype 'set', singleton_key 's');
+EXPLAIN (COSTS OFF) SELECT * FROM map_singleton_keyed;
+             QUERY PLAN              
+-------------------------------------
+ Foreign Scan on map_singleton_keyed
+   Valkey Strategy: Singleton Key
+(2 rows)
+
+-- Being a singleton does not excuse a column from having a source. Two spare
+-- columns on a singleton set leave the same ambiguity map_three has, so both
+-- are named for the same reason.
+CREATE FOREIGN TABLE map_singleton_extra (m text, x text) SERVER map_srv
+    OPTIONS (tabletype 'set', singleton_key 's');
+EXPLAIN (COSTS OFF) SELECT * FROM map_singleton_extra;
+ERROR:  2 column(s) have no source in Valkey: "m", "x"
+DETAIL:  Table type is "set", which supplies a key and one member.
+HINT:  Give each remaining column OPTIONS (field '...'), or one of member, score, ttl, distance.
+-- ---------------------------------------------------------------------------
+-- Definitions that must be refused.
+-- ---------------------------------------------------------------------------
+CREATE FOREIGN TABLE map_two_keys (
+    a text OPTIONS (key 'true'),
+    b text OPTIONS (key 'true')
+) SERVER map_srv;
+EXPLAIN (COSTS OFF) SELECT * FROM map_two_keys;
+ERROR:  only one column may be the Valkey key
+DETAIL:  Both "a" and "b" declare key 'true'.
+-- Every column claimed by something other than the key leaves nothing to be
+-- the key, and a non-singleton table cannot be read without one.
+CREATE FOREIGN TABLE map_no_key (
+    m text OPTIONS (member 'true')
+) SERVER map_srv OPTIONS (tabletype 'set');
+EXPLAIN (COSTS OFF) SELECT * FROM map_no_key;
+ERROR:  no column holds the Valkey key
+HINT:  Mark one column with OPTIONS (key 'true'), or name the key with OPTIONS (singleton_key '...').
+CREATE FOREIGN TABLE map_conflicting_col (
+    k text,
+    v text OPTIONS (field 'f', score 'true')
+) SERVER map_srv OPTIONS (tabletype 'zset');
+EXPLAIN (COSTS OFF) SELECT * FROM map_conflicting_col;
+ERROR:  column options conflict
+DETAIL:  A column may name only one source: key, field, member, score, ttl or distance.
+-- score belongs to zset tables only.
+CREATE FOREIGN TABLE map_score_on_hash (
+    k text,
+    s double precision OPTIONS (score 'true')
+) SERVER map_srv OPTIONS (tabletype 'hash');
+EXPLAIN (COSTS OFF) SELECT * FROM map_score_on_hash;
+ERROR:  column "s" cannot be used with tabletype "hash"
+DETAIL:  score columns require tabletype 'zset'.
+-- A ttl column has to say which field's lifetime it reports.
+CREATE FOREIGN TABLE map_ttl_no_field (
+    k text,
+    t interval OPTIONS (ttl 'true')
+) SERVER map_srv OPTIONS (tabletype 'hash');
+EXPLAIN (COSTS OFF) SELECT * FROM map_ttl_no_field;
+ERROR:  column "t" cannot be used with tabletype "hash"
+DETAIL:  a ttl column must also name its field.
+-- distance needs an index to have come from.
+CREATE FOREIGN TABLE map_distance_no_index (
+    k text,
+    d double precision OPTIONS (distance 'true')
+) SERVER map_srv OPTIONS (tabletype 'hash');
+EXPLAIN (COSTS OFF) SELECT * FROM map_distance_no_index;
+ERROR:  column "d" cannot be used with tabletype "hash"
+DETAIL:  distance columns require the search_index option.
+-- field columns are meaningless on a set.
+CREATE FOREIGN TABLE map_field_on_set (
+    k text,
+    f text OPTIONS (field 'f')
+) SERVER map_srv OPTIONS (tabletype 'set');
+EXPLAIN (COSTS OFF) SELECT * FROM map_field_on_set;
+ERROR:  column "f" cannot be used with tabletype "set"
+DETAIL:  field columns require tabletype 'hash' or 'json'.
+-- The three key-discovery strategies are alternatives. Documenting that and
+-- then accepting the combination anyway means silently ignoring one.
+--
+-- Refused at CREATE, not at the first SELECT: the validator sees a table's
+-- whole option list at once, so it can answer this, and answering it later
+-- meant the table existed for a while - long enough for
+-- pg_relation_is_updatable, which reads options and never builds a map, to
+-- call it fully writable. There is no EXPLAIN below because there is no table.
+CREATE FOREIGN TABLE map_singleton_and_prefix (k text, v text) SERVER map_srv
+    OPTIONS (singleton_key 's', keyprefix 'p:');
+ERROR:  a table may name only one key-discovery option
+DETAIL:  This table names "singleton_key", "keyprefix".
+HINT:  singleton_key, keyprefix and keyset are alternatives; keep exactly one.
+CREATE FOREIGN TABLE map_prefix_and_keyset (k text, v text) SERVER map_srv
+    OPTIONS (keyprefix 'p:', keyset 'ks');
+ERROR:  a table may name only one key-discovery option
+DETAIL:  This table names "keyprefix", "keyset".
+HINT:  singleton_key, keyprefix and keyset are alternatives; keep exactly one.
+-- ALTER goes through the same validator over the merged list, which is the
+-- path that would otherwise let a valid table become an invalid one.
+CREATE FOREIGN TABLE map_alter_conflict (k text, v text) SERVER map_srv
+    OPTIONS (keyprefix 'p:');
+ALTER FOREIGN TABLE map_alter_conflict OPTIONS (ADD keyset 'ks');
+ERROR:  a table may name only one key-discovery option
+DETAIL:  This table names "keyprefix", "keyset".
+HINT:  singleton_key, keyprefix and keyset are alternatives; keep exactly one.
+EXPLAIN (COSTS OFF) SELECT * FROM map_alter_conflict;
+             QUERY PLAN             
+------------------------------------
+ Foreign Scan on map_alter_conflict
+   Valkey Strategy: Keyspace Scan
+   Valkey Match: p:*
+(3 rows)
+
+-- Legacy shape is exactly two columns. Width is checked before support is,
+-- so a malformed legacy table is reported as malformed.
+CREATE FOREIGN TABLE map_legacy_wide (k text, v text[], x text) SERVER map_srv
+    OPTIONS (tabletype 'hash', legacy_value 'true');
+EXPLAIN (COSTS OFF) SELECT * FROM map_legacy_wide;
+ERROR:  legacy_value tables must have exactly two columns
+DETAIL:  This table has 3.
+-- ---------------------------------------------------------------------------
+-- Shapes that are designed and validated but not yet read.
+--
+-- Their options parse and their definitions are coherent, so nothing earlier
+-- rejects them - but no code fills their columns. Returning NULL would be a
+-- plausible empty result, which is the failure this wrapper exists to avoid,
+-- so they are refused at plan time until the phase that implements them.
+-- ---------------------------------------------------------------------------
+CREATE FOREIGN TABLE map_legacy (k text, v text[]) SERVER map_srv
+    OPTIONS (tabletype 'hash', legacy_value 'true');
+EXPLAIN (COSTS OFF) SELECT * FROM map_legacy;
+ERROR:  legacy_value tables are not implemented yet
+CREATE FOREIGN TABLE map_json (k text, a text OPTIONS (field '$.a'))
+    SERVER map_srv OPTIONS (tabletype 'json');
+EXPLAIN (COSTS OFF) SELECT * FROM map_json;
+ERROR:  tabletype "json" is not implemented yet
+CREATE FOREIGN TABLE map_ttl (
+    k text,
+    f text      OPTIONS (field 'f'),
+    t interval  OPTIONS (ttl 'true', field 'f')
+) SERVER map_srv OPTIONS (tabletype 'hash');
+EXPLAIN (COSTS OFF) SELECT * FROM map_ttl;
+ERROR:  column "t" reads ttl, which is not implemented yet
+CREATE FOREIGN TABLE map_distance (
+    k text,
+    d double precision OPTIONS (distance 'true')
+) SERVER map_srv OPTIONS (tabletype 'hash', search_index 'idx');
+EXPLAIN (COSTS OFF) SELECT * FROM map_distance;
+ERROR:  column "d" reads distance, which is not implemented yet
+DROP SERVER map_srv CASCADE;
+NOTICE:  drop cascades to 24 other objects
+DETAIL:  drop cascades to user mapping for vfdw on server map_srv
+drop cascades to foreign table map_key_only
+drop cascades to foreign table map_two
+drop cascades to foreign table map_three
+drop cascades to foreign table map_three_hash
+drop cascades to foreign table map_wide
+drop cascades to foreign table map_set_default
+drop cascades to foreign table map_zset_ambiguous
+drop cascades to foreign table map_singleton_set
+drop cascades to foreign table map_singleton_keyed
+drop cascades to foreign table map_singleton_extra
+drop cascades to foreign table map_two_keys
+drop cascades to foreign table map_no_key
+drop cascades to foreign table map_conflicting_col
+drop cascades to foreign table map_score_on_hash
+drop cascades to foreign table map_ttl_no_field
+drop cascades to foreign table map_distance_no_index
+drop cascades to foreign table map_field_on_set
+drop cascades to foreign table map_alter_conflict
+drop cascades to foreign table map_legacy_wide
+drop cascades to foreign table map_legacy
+drop cascades to foreign table map_json
+drop cascades to foreign table map_ttl
+drop cascades to foreign table map_distance

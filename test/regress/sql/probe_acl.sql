@@ -1,0 +1,82 @@
+-- The keyspace probes, against a server with ACLs.
+--
+-- The companion to probe_tls.sql. There, a plaintext valkey-cli cannot connect
+-- at all; here it connects and is nobody - the default user is off, so a shell
+-- fixture without credentials is refused, and the existing ones swallow that
+-- refusal and print "ok". The probes take their identity from the user
+-- mapping, which is the second half of why they are in-process.
+--
+-- This file also carries the one behaviour the standalone suite cannot reach:
+-- valkey_fdw_test_keys and valkey_fdw_test_probe answer a permission refusal
+-- DIFFERENTLY, and until now that was recorded in neither a comment nor a
+-- test. fdw_noperm can authenticate and do nothing else, which is exactly the
+-- shape needed to show it.
+
+CREATE SERVER pacl_srv FOREIGN DATA WRAPPER valkey_fdw
+    OPTIONS (host 'valkey', port '6379');
+CREATE USER MAPPING FOR CURRENT_USER SERVER pacl_srv
+    OPTIONS (username 'fdw_app', password 'app_pw');
+
+-- fdw_app may read and write vfdw:*, so the round trip works end to end -
+-- including the NUL that a shell fixture could not have carried.
+SELECT count(*) FROM valkey_fdw_test_probe('pacl_srv', 0, 'SET',
+                                           'vfdw:pacl:nul', '\x610062'::bytea);
+SELECT encode(val_part, 'hex') AS bytes, octet_length(val_part) AS len
+  FROM valkey_fdw_test_probe('pacl_srv', 0, 'GET', 'vfdw:pacl:nul');
+SELECT num AS server_says_strlen
+  FROM valkey_fdw_test_probe('pacl_srv', 0, 'STRLEN', 'vfdw:pacl:nul');
+
+SELECT convert_from(key, 'UTF8') AS keyname, keytype
+  FROM valkey_fdw_test_keys('pacl_srv', 0, 'vfdw:pacl:') ORDER BY key;
+
+SELECT num AS deleted
+  FROM valkey_fdw_test_probe('pacl_srv', 0, 'DEL', 'vfdw:pacl:nul');
+
+-- ---------------------------------------------------------------------------
+-- A key the credentials do not reach.
+--
+-- fdw_app is scoped to vfdw:* and test:*, so a command naming any other key
+-- is refused by the server rather than by us. The probe returns that refusal
+-- as a row: an error reply is a result, and a test asserting "this user cannot
+-- read that key" needs to see it rather than have it raised out from under it.
+-- ---------------------------------------------------------------------------
+SELECT reply_type, convert_from(val_part, 'UTF8') LIKE 'NOPERM%' AS is_noperm
+  FROM valkey_fdw_test_probe('pacl_srv', 0, 'GET', 'forbidden:key');
+
+-- ---------------------------------------------------------------------------
+-- The two entry points disagree about refusals, and this is where that shows.
+--
+-- fdw_noperm authenticates and is allowed nothing further. valkey_fdw_test_probe
+-- hands the server's refusal back as data, exactly as above; valkey_fdw_test_keys
+-- RAISES, because a key dump has no row in which to put an error.
+--
+-- Defensible, but it was undocumented, and two sibling helpers with opposite
+-- error contracts is how a suite author writes a wrong assertion and believes
+-- it. Recorded here as observed behaviour so the difference is a fact in the
+-- expected output rather than a surprise. Whether the two should answer a
+-- refusal the same way is open; this is the evidence for deciding.
+-- ---------------------------------------------------------------------------
+CREATE SERVER pacl_noperm FOREIGN DATA WRAPPER valkey_fdw
+    OPTIONS (host 'valkey', port '6379');
+CREATE USER MAPPING FOR CURRENT_USER SERVER pacl_noperm
+    OPTIONS (username 'fdw_noperm', password 'noperm_pw');
+
+-- It really can connect: the refusals below are authorisation, not
+-- authentication, and without this line they would be indistinguishable.
+SELECT valkey_fdw_test_pooled_ping('pacl_noperm') AS authenticated;
+
+SELECT reply_type FROM valkey_fdw_test_probe('pacl_noperm', 0, 'GET',
+                                             'vfdw:pacl:nul');
+
+DO $$
+DECLARE
+    n int;
+BEGIN
+    SELECT count(*) INTO n FROM valkey_fdw_test_keys('pacl_noperm', 0, 'vfdw:');
+    RAISE EXCEPTION 'the dump returned % rows for a user denied SCAN', n;
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'the dump raises where the probe returns a row: %', SQLSTATE;
+END $$;
+
+DROP SERVER pacl_noperm CASCADE;
+DROP SERVER pacl_srv CASCADE;

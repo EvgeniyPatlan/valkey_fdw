@@ -1,0 +1,8 @@
+flowchart LR
+    subgraph PG["PostgreSQL backend"]
+        EX["Executor"] --> FDW["valkey_fdw"]
+        FDW --> WB["write buffer<br/>(transaction-scoped)"]
+        FDW --> POOL["connection pool<br/>(server, user, node)"]
+    end
+    WB -. "one Lua script<br/>at pre-commit" .-> POOL
+    POOL --> VK[("Valkey")]

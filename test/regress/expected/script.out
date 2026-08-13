@@ -1,0 +1,459 @@
+-- The server-side program: its identity, its vocabulary, and its replies.
+--
+-- Nothing here runs the program against real data - that is S6, once the
+-- flush exists. What is asserted here is everything that must be true BEFORE
+-- the first write is ever sent, because each of these failures is silent:
+-- a digest that names a different script, a dispatch table that decodes the
+-- wrong opcode, a sentinel that reads as the wrong SQLSTATE.
+CREATE SERVER sc_srv FOREIGN DATA WRAPPER valkey_fdw
+    OPTIONS (host 'valkey', port '6379');
+CREATE USER MAPPING FOR CURRENT_USER SERVER sc_srv;
+-- ---------------------------------------------------------------------------
+-- The compiled-in SHA1 is the one the SERVER computes.
+--
+-- This is the assertion that makes always-EVALSHA-first safe. A digest we
+-- computed and then compared against our own computation proves only that
+-- SHA1 is deterministic. Asking the server is what catches a trailing NUL
+-- hashed by mistake, a text encoding difference, or an editor that rewrote
+-- the line endings - each of which produces a valid digest for a script the
+-- server has never seen, so every EVALSHA misses and the retry path becomes
+-- the normal path without anyone noticing.
+-- ---------------------------------------------------------------------------
+SELECT valkey_fdw_test_script_sha1() = convert_from(val_part, 'UTF8')
+           AS sha1_agrees_with_server
+FROM valkey_fdw_test_probe('sc_srv', 0, 'SCRIPT', 'LOAD',
+                           valkey_fdw_test_script()::bytea);
+ sha1_agrees_with_server 
+-------------------------
+ t
+(1 row)
+
+-- The digest is 40 lowercase hex characters, so a truncation or an uppercase
+-- rendering is a diff rather than a mismatch nobody reads.
+SELECT length(valkey_fdw_test_script_sha1()) AS sha1_length,
+       valkey_fdw_test_script_sha1() ~ '^[0-9a-f]{40}$' AS sha1_shape;
+ sha1_length | sha1_shape 
+-------------+------------
+          40 | t
+(1 row)
+
+-- The server can execute it. EVALSHA with no keys and a deliberately empty
+-- plan set exercises the decoder's happy path and nothing else - it writes
+-- nothing, which is what makes it safe to run here.
+SELECT convert_from(val_part, 'UTF8') AS empty_program
+FROM valkey_fdw_test_probe('sc_srv', 0, 'EVALSHA',
+                           valkey_fdw_test_script_sha1()::bytea,
+                           '0', 'V1', '0');
+ empty_program 
+---------------
+ VFDW1 OK 0
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- The C enums and the two Lua dispatch tables are the same vocabulary.
+--
+-- They are two independent spellings and nothing but this holds them
+-- together. An opcode inserted in the middle of the C enum without the same
+-- insertion in Lua renames every opcode after it - consistently, silently,
+-- and wrongly: the ledger would emit ZADD and the script would run ZREM.
+--
+-- The tables are parsed out of the script TEXT rather than out of a second C
+-- array, because a C-side comparison would compare the enum against itself.
+-- ---------------------------------------------------------------------------
+CREATE TEMP TABLE sc_lua AS
+SELECT 'check'::text AS kind,
+       (regexp_matches(body, '\[(\d+)\] = ', 'g'))[1]::int AS op_no
+FROM (SELECT substring(valkey_fdw_test_script()
+                       FROM 'local CHECK = \{(.*?)\n\}') AS body) c
+UNION ALL
+SELECT 'action'::text,
+       (regexp_matches(body, '\[(\d+)\] = ', 'g'))[1]::int
+FROM (SELECT substring(valkey_fdw_test_script()
+                       FROM 'local ACTION = \{(.*?)\n\}') AS body) a;
+-- Both tables were found and are non-empty. Without this a regexp that
+-- stopped matching would leave sc_lua empty and every comparison below would
+-- pass by vacuum.
+SELECT kind, count(*) AS entries FROM sc_lua GROUP BY kind ORDER BY kind;
+  kind  | entries 
+--------+---------
+ action |      13
+ check  |      12
+(2 rows)
+
+-- Every C opcode has a Lua entry and every Lua entry has a C opcode. A FULL
+-- JOIN, so a surplus on either side is a row rather than an absence.
+SELECT coalesce(c.kind, l.kind) AS kind,
+       coalesce(c.op_no, l.op_no) AS op_no,
+       c.name AS c_name,
+       (l.op_no IS NOT NULL) AS in_lua
+FROM valkey_fdw_test_opcodes() c
+FULL JOIN sc_lua l ON l.kind = c.kind AND l.op_no = c.op_no
+WHERE c.op_no IS NULL OR l.op_no IS NULL
+ORDER BY 1, 2;
+ kind | op_no | c_name | in_lua 
+------+-------+--------+--------
+(0 rows)
+
+-- The counts agree, stated positively so the query above is not the only
+-- thing standing between a renumbering and a green suite.
+SELECT (SELECT count(*) FROM valkey_fdw_test_opcodes() WHERE kind = 'check')
+         = (SELECT count(*) FROM sc_lua WHERE kind = 'check') AS check_parity,
+       (SELECT count(*) FROM valkey_fdw_test_opcodes() WHERE kind = 'action')
+         = (SELECT count(*) FROM sc_lua WHERE kind = 'action') AS action_parity;
+ check_parity | action_parity 
+--------------+---------------
+ t            | t
+(1 row)
+
+-- TYPE_OK is the one check with no dispatch entry: it is applied to every
+-- plan directly, before the table is consulted, because it is what makes
+-- phase 2 incapable of raising WRONGTYPE. Named here so its absence from the
+-- Lua table reads as intent rather than as the omission the parity query
+-- would otherwise be reporting.
+SELECT name AS check_without_dispatch_entry
+FROM valkey_fdw_test_opcodes()
+WHERE kind = 'check' AND name = 'TYPE_OK';
+ check_without_dispatch_entry 
+------------------------------
+ TYPE_OK
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- Sentinel decoding, including the word boundaries.
+--
+-- vfdw_reply_has_prefix is a raw prefix test. Every code is a prefix of a
+-- longer string that means something else, so without a boundary check
+-- "VFDW1 CONFLICTX" reports a unique violation for something that is not one.
+-- The last two vectors are the ones a prefix test gets wrong.
+-- ---------------------------------------------------------------------------
+SELECT v AS reply, (c).verdict, (c).detail
+FROM (VALUES
+        ('VFDW1 OK 3'),
+        ('VFDW1 CONFLICT 2 wb:k1 check 2'),
+        ('VFDW1 MISSING 1 wb:g1'),
+        ('VFDW1 WRONGTYPE 1 wb:x list'),
+        ('VFDW1 BADPROTO 0 - version'),
+        ('VFDW1 INTERNAL 2 wb:k 3 OOM'),
+        -- No detail: the code ends the reply.
+        ('VFDW1 CONFLICT'),
+        -- Not ours at all.
+        ('WRONGTYPE Operation against a key holding the wrong kind of value'),
+        ('NOSCRIPT No matching script'),
+        (''),
+        -- Ours, but a code this build does not know: BADPROTO, not UNKNOWN.
+        ('VFDW1 NEWCODE 1 k'),
+        -- The boundary cases. A raw prefix test calls both of these CONFLICT.
+        ('VFDW1 CONFLICTX 1 k'),
+        ('VFDW1 OKAY 1 k'),
+        -- A prefix that is not ours on a boundary.
+        ('VFDW10 CONFLICT 1 k')
+     ) AS t(v),
+     LATERAL (SELECT valkey_fdw_test_script_classify(v::bytea)) AS s(c);
+                               reply                               |  verdict  |     detail      
+-------------------------------------------------------------------+-----------+-----------------
+ VFDW1 OK 3                                                        | OK        | 3
+ VFDW1 CONFLICT 2 wb:k1 check 2                                    | CONFLICT  | 2 wb:k1 check 2
+ VFDW1 MISSING 1 wb:g1                                             | MISSING   | 1 wb:g1
+ VFDW1 WRONGTYPE 1 wb:x list                                       | WRONGTYPE | 1 wb:x list
+ VFDW1 BADPROTO 0 - version                                        | BADPROTO  | 0 - version
+ VFDW1 INTERNAL 2 wb:k 3 OOM                                       | INTERNAL  | 2 wb:k 3 OOM
+ VFDW1 CONFLICT                                                    | CONFLICT  | 
+ WRONGTYPE Operation against a key holding the wrong kind of value | UNKNOWN   | 
+ NOSCRIPT No matching script                                       | UNKNOWN   | 
+                                                                   | UNKNOWN   | 
+ VFDW1 NEWCODE 1 k                                                 | BADPROTO  | NEWCODE 1 k
+ VFDW1 CONFLICTX 1 k                                               | BADPROTO  | CONFLICTX 1 k
+ VFDW1 OKAY 1 k                                                    | BADPROTO  | OKAY 1 k
+ VFDW10 CONFLICT 1 k                                               | UNKNOWN   | 
+(14 rows)
+
+-- A NUL inside the detail survives classification: replies are bytes, and a
+-- classifier that took a cstring would truncate here.
+SELECT (c).verdict, length((c).detail) AS detail_len
+FROM (SELECT valkey_fdw_test_script_classify(
+               'VFDW1 CONFLICT 1 a'::bytea || '\x00'::bytea || 'b'::bytea)) AS s(c);
+ verdict  | detail_len 
+----------+------------
+ CONFLICT |          3
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- The golden ARGV vector.
+--
+-- src/vfdw_script_encode.c is the only writer of this format and the Lua
+-- program the only reader. A change to either that the other does not match
+-- produces a BADPROTO from inside a commit, which is the worst place to find
+-- out. Recorded here, the same change is a diff in this file.
+--
+-- The digest renders as a placeholder: it moves whenever the script text
+-- changes, including for a comment, and a golden vector that churns on every
+-- edit stops being read. The real digest is asserted above, against the
+-- server.
+-- ---------------------------------------------------------------------------
+CREATE FOREIGN TABLE sc_str (k text OPTIONS (key 'true'), v text)
+    SERVER sc_srv OPTIONS (tabletype 'string', keyprefix 'sc:');
+CREATE FOREIGN TABLE sc_ks (k text OPTIONS (key 'true'), v text)
+    SERVER sc_srv OPTIONS (tabletype 'string', keyset 'sc:index');
+CREATE FOREIGN TABLE sc_zs (k text OPTIONS (key 'true'),
+                            m text OPTIONS (member 'true'),
+                            s text OPTIONS (score 'true'))
+    SERVER sc_srv OPTIONS (tabletype 'zset', keyprefix 'scz:');
+SELECT valkey_fdw_test_poke('sc_srv', 'sc:ren', 'x');
+ valkey_fdw_test_poke 
+----------------------
+                    1
+(1 row)
+
+SELECT count(*) FROM valkey_fdw_test_probe('sc_srv', 0, 'SADD', 'sc:index', 'sc:gone');
+ count 
+-------
+     1
+(1 row)
+
+-- One INSERT, one keyset INSERT, one rename and one zset member: between them
+-- they cover every shape of argument the encoder can emit - data, a key index
+-- for a keyset, and a key index for a RENAME source.
+BEGIN;
+INSERT INTO sc_str VALUES ('sc:a', 'one');
+INSERT INTO sc_ks  VALUES ('sc:b', 'two');
+UPDATE sc_str SET k = 'sc:renamed' WHERE k = 'sc:ren';
+INSERT INTO sc_zs  VALUES ('scz:z', 'm1', '1.5');
+SELECT ordinal, kind, convert_from(value, 'UTF8') AS value
+FROM valkey_fdw_test_script_program() ORDER BY ordinal;
+ ordinal |  kind  |   value    
+---------+--------+------------
+       0 | arg    | EVALSHA
+       1 | <sha1> | <sha1>
+       2 | arg    | 6
+       3 | arg    | sc:a
+       4 | arg    | sc:b
+       5 | arg    | sc:renamed
+       6 | arg    | sc:ren
+       7 | arg    | scz:z
+       8 | arg    | sc:index
+       9 | arg    | V1
+      10 | arg    | 5
+      11 | arg    | 1
+      12 | arg    | 0
+      13 | arg    | 1
+      14 | arg    | 2
+      15 | arg    | 1
+      16 | arg    | 2
+      17 | arg    | 0
+      18 | arg    | 0
+      19 | arg    | 0
+      20 | arg    | 0
+      21 | arg    | 1
+      22 | arg    | one
+      23 | arg    | 2
+      24 | arg    | 0
+      25 | arg    | 1
+      26 | arg    | 2
+      27 | arg    | 2
+      28 | arg    | 2
+      29 | arg    | 0
+      30 | arg    | 0
+      31 | arg    | 0
+      32 | arg    | 0
+      33 | arg    | 1
+      34 | arg    | two
+      35 | arg    | 11
+      36 | arg    | 2
+      37 | arg    | 6
+      38 | arg    | sc:b
+      39 | arg    | 3
+      40 | arg    | 0
+      41 | arg    | 1
+      42 | arg    | 2
+      43 | arg    | 2
+      44 | arg    | 2
+      45 | arg    | 0
+      46 | arg    | 0
+      47 | arg    | 0
+      48 | arg    | 10
+      49 | arg    | 1
+      50 | arg    | 4
+      51 | arg    | 0
+      52 | arg    | 1
+      53 | arg    | x
+      54 | arg    | 4
+      55 | arg    | 0
+      56 | arg    | 2
+      57 | arg    | 2
+      58 | arg    | 0
+      59 | arg    | 2
+      60 | arg    | 0
+      61 | arg    | 1
+      62 | arg    | 0
+      63 | arg    | 5
+      64 | arg    | 4
+      65 | arg    | 1
+      66 | arg    | 2
+      67 | arg    | 1
+      68 | arg    | 2
+      69 | arg    | 0
+      70 | arg    | 0
+      71 | arg    | 0
+      72 | arg    | 6
+      73 | arg    | 2
+      74 | arg    | 1.5
+      75 | arg    | m1
+(76 rows)
+
+-- ---------------------------------------------------------------------------
+-- W2: every key index the encoder emits is within KEYS.
+--
+-- Keys travel as 1-based indices because the shebang makes the server enforce
+-- the declared-key rule. An index past the end is a nil in Lua - SISMEMBER
+-- would see a missing argument and RENAME a nil key, both a long way from the
+-- cause. Checked here as a property of the emitted program rather than only
+-- as the C-side elog, because the elog fires on a disagreement between two
+-- walks and this catches a wrong rule in both of them.
+-- ---------------------------------------------------------------------------
+WITH prog AS (
+    SELECT ordinal, convert_from(value, 'UTF8') AS v
+    FROM valkey_fdw_test_script_program()
+), nkeys AS (
+    SELECT v::int AS n FROM prog WHERE ordinal = 2
+)
+SELECT (SELECT n FROM nkeys) AS numkeys,
+       -- KEYS occupy ordinals 3 .. 2+n, so every one of them must exist and
+       -- the ARGV that follows must start with the version marker.
+       (SELECT count(*) FROM prog
+         WHERE ordinal BETWEEN 3 AND 2 + (SELECT n FROM nkeys)) AS keys_present,
+       (SELECT v FROM prog
+         WHERE ordinal = 3 + (SELECT n FROM nkeys)) AS first_argv;
+ numkeys | keys_present | first_argv 
+---------+--------------+------------
+       6 |            6 | V1
+(1 row)
+
+ROLLBACK;
+-- With an empty buffer the program is a well-formed no-op rather than
+-- something the script has to special-case: nplans 0 and no keys at all.
+SELECT ordinal, convert_from(value, 'UTF8') AS value
+FROM valkey_fdw_test_script_program() ORDER BY ordinal;
+ ordinal |  value  
+---------+---------
+       0 | EVALSHA
+       1 | <sha1>
+       2 | 0
+       3 | V1
+       4 | 0
+(5 rows)
+
+-- ---------------------------------------------------------------------------
+-- The encoder and the program agree, end to end.
+--
+-- Everything above compares each side against a recorded expectation. This is
+-- the only assertion that puts them together: the exact bytes the encoder
+-- produces are handed to the server, which decodes them with the real script.
+-- A disagreement the golden vector cannot see - an opcode whose argument
+-- order differs between the two, a key index off by one - surfaces here as a
+-- BADPROTO instead of at someone's COMMIT.
+--
+-- This WRITES, which nothing else in this suite does. That is the point: the
+-- checks have to pass and the actions have to land, and until now no phase-1
+-- check had ever refused anything and no phase-2 action had ever run.
+-- ---------------------------------------------------------------------------
+BEGIN;
+INSERT INTO sc_str VALUES ('sc:e1', 'hello');
+INSERT INTO sc_ks  VALUES ('sc:e2', 'indexed');
+INSERT INTO sc_zs  VALUES ('scz:e', 'mem', '2.5');
+SELECT convert_from(val_part, 'UTF8') AS applied
+FROM valkey_fdw_test_probe('sc_srv', 0,
+       VARIADIC (SELECT array_agg(CASE WHEN ordinal = 1
+                                       THEN valkey_fdw_test_script_sha1()::bytea
+                                       ELSE value END ORDER BY ordinal)
+                 FROM valkey_fdw_test_script_program()));
+  applied   
+------------
+ VFDW1 OK 3
+(1 row)
+
+ROLLBACK;
+-- The actions really landed, and the keyset was maintained inside the same
+-- execution as the write it indexes.
+SELECT convert_from(key,'UTF8') AS key, keytype
+FROM valkey_fdw_test_keys('sc_srv', 0, 'sc:') ORDER BY 1;
+   key    | keytype 
+----------+---------
+ sc:e1    | string
+ sc:e2    | string
+ sc:index | set
+ sc:ren   | string
+(4 rows)
+
+-- Scalar commands, not ZRANGE ... WITHSCORES: libvalkey leaves reply->str
+-- NULL for every aggregate element, so a nested reply renders as NULLs and
+-- would read as "the zset is empty" whether it is or not.
+SELECT convert_from(val_part,'UTF8') AS zset_member
+FROM valkey_fdw_test_probe('sc_srv', 0, 'ZRANGE', 'scz:e', '0', '-1');
+ zset_member 
+-------------
+ 
+ mem
+(2 rows)
+
+SELECT dbl AS zset_score
+FROM valkey_fdw_test_probe('sc_srv', 0, 'ZSCORE', 'scz:e', 'mem');
+ zset_score 
+------------
+        2.5
+(1 row)
+
+-- Re-running the SAME program must now be refused by phase 1, not applied
+-- twice: the keys it required absent are present because it created them.
+-- This is the check half, and it is the first time one has ever refused.
+BEGIN;
+INSERT INTO sc_str VALUES ('sc:e1', 'hello');
+SELECT convert_from(val_part, 'UTF8') AS refused_second_time
+FROM valkey_fdw_test_probe('sc_srv', 0,
+       VARIADIC (SELECT array_agg(CASE WHEN ordinal = 1
+                                       THEN valkey_fdw_test_script_sha1()::bytea
+                                       ELSE value END ORDER BY ordinal)
+                 FROM valkey_fdw_test_script_program()));
+      refused_second_time       
+--------------------------------
+ VFDW1 CONFLICT 1 sc:e1 check 2
+(1 row)
+
+ROLLBACK;
+-- And a type mismatch is refused by TYPE_OK rather than reaching a write.
+-- sc:index is the keyset, so it is a SET under a key this string table is
+-- entitled to address - a real collision rather than a contrived one.
+BEGIN;
+INSERT INTO sc_str VALUES ('sc:index', 'not a set');
+SELECT convert_from(val_part, 'UTF8') AS refused_wrong_type
+FROM valkey_fdw_test_probe('sc_srv', 0,
+       VARIADIC (SELECT array_agg(CASE WHEN ordinal = 1
+                                       THEN valkey_fdw_test_script_sha1()::bytea
+                                       ELSE value END ORDER BY ordinal)
+                 FROM valkey_fdw_test_script_program()));
+       refused_wrong_type       
+--------------------------------
+ VFDW1 WRONGTYPE 1 sc:index set
+(1 row)
+
+ROLLBACK;
+-- ---------------------------------------------------------------------------
+-- The program itself carries no user data and no dynamic verb.
+--
+-- scripts/lint.sh enforces the write verbs being literal; this asserts the
+-- shape a reader can check from SQL. Both matter: the lint gate is what
+-- fails a refactor, and this is what a reviewer reads.
+-- ---------------------------------------------------------------------------
+SELECT left(valkey_fdw_test_script(), 6) AS shebang,
+       valkey_fdw_test_script() LIKE '%PHASE 1%'  AS has_phase1,
+       valkey_fdw_test_script() LIKE '%PHASE 2%'  AS has_phase2,
+       strpos(valkey_fdw_test_script(), 'PHASE 1')
+         < strpos(valkey_fdw_test_script(), 'PHASE 2') AS phases_in_order;
+ shebang | has_phase1 | has_phase2 | phases_in_order 
+---------+------------+------------+-----------------
+ #!lua  +| t          | t          | t
+         |            |            | 
+(1 row)
+
+DROP FOREIGN TABLE sc_str, sc_ks, sc_zs;
+DROP USER MAPPING FOR CURRENT_USER SERVER sc_srv;
+DROP SERVER sc_srv;

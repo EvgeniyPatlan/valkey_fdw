@@ -1,0 +1,49 @@
+# Build output
+*.o
+*.so
+*.bc
+*.gcno
+*.gcda
+*.gcov
+/coverage/
+/vendor/libvalkey/
+
+# Distribution packages. scripts/package.sh builds them from the tree, so they
+# are release output rather than source: committing them adds roughly a
+# megabyte of undeltifiable binary per version, permanently, to describe
+# something the tree already describes.
+/dist/
+
+# pg_regress
+/test/regress/results/
+/test/regress/regression.diffs
+/test/regress/regression.out
+/test/regress/tmp_check/
+/test/regress/log/
+/log/
+/results/
+/tmp_check/
+
+# Harness scratch
+/.harness/
+
+# Header dependency files (see the -MMD note in Makefile)
+src/*.d
+
+# Isolation specs
+/test/isolation/output_iso/
+/test/isolation/results/
+/test/isolation/regression.diffs
+/test/isolation/regression.out
+/test/tap/tmp_check/
+/test/tap/log/
+vendor/
+
+# scripts/mutate.py leaves these behind wherever it is run from.
+__pycache__/
+*.pyc
+
+# Scratch space for design notes while a phase is being worked out. Nothing
+# in the tree depends on anything here: what a note settled belongs in the
+# code it governs, in INTERNALS.md, or in the suite that pins it.
+docs/

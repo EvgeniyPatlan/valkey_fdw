@@ -1,0 +1,19 @@
+# ACL users for the acl topology.
+#
+# Three identities with deliberately different reach, so the tests can tell a
+# wrong password apart from an insufficient permission apart from success.
+
+# Full access, used by fixture setup.
+user fdw_admin on >admin_pw ~* &* +@all
+
+# The identity the FDW normally connects as: read and write on the test
+# keyspace only.
+user fdw_app on >app_pw ~vfdw:* ~test:* +@read +@write +@keyspace +@connection -@dangerous
+
+# Can authenticate but is denied everything interesting, so an authorisation
+# failure is distinguishable from an authentication failure.
+user fdw_noperm on >noperm_pw resetkeys +@connection
+
+# Default user is disabled: any connection that fails to AUTH must fail
+# loudly rather than silently falling back to unrestricted access.
+user default off

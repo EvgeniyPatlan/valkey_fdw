@@ -1,0 +1,117 @@
+# valkey_fdw build and test image.
+#
+# Contains a PostgreSQL server + development headers, the toolchain, the Perl
+# modules the TAP suite needs, coverage tooling, and libvalkey built from a
+# pinned tag. Every supported build of valkey_fdw happens in here.
+#
+#   docker build -f docker/Dockerfile.build \
+#       --build-arg PG_MAJOR=17 --build-arg UID=$(id -u) --build-arg GID=$(id -g) \
+#       -t valkey_fdw/build:pg17 .
+
+FROM debian:bookworm-slim
+
+ARG PG_MAJOR=17
+ARG LIBVALKEY_REF=0.5.0
+ARG UID=1000
+ARG GID=1000
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    PG_MAJOR=${PG_MAJOR}
+
+# ---------------------------------------------------------------------------
+# Base toolchain and the PGDG repository.
+# ---------------------------------------------------------------------------
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg lsb-release; \
+    install -d /usr/share/postgresql-common/pgdg; \
+    curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+        https://www.postgresql.org/media/keys/ACCC4CF8.asc; \
+    echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+        > /etc/apt/sources.list.d/pgdg.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        "postgresql-${PG_MAJOR}" \
+        "postgresql-server-dev-${PG_MAJOR}" \
+        "postgresql-client-${PG_MAJOR}" \
+        build-essential \
+        clang \
+        clang-tidy \
+        cmake \
+        git \
+        pkg-config \
+        libssl-dev \
+        libipc-run-perl \
+        libtest-simple-perl \
+        lcov \
+        gcovr \
+        python3 \
+        gdb \
+        sudo \
+        procps \
+        netcat-openbsd \
+        redis-tools; \
+    rm -rf /var/lib/apt/lists/*; \
+    # Debian bookworm has no valkey-tools package, and a valkey-cli lifted
+    # from the trixie-based server image would not link against this glibc.
+    # redis-cli speaks the same RESP protocol and is only ever used by the
+    # test fixtures, never by the extension itself.
+    ln -sf /usr/bin/redis-cli /usr/local/bin/valkey-cli
+
+# ---------------------------------------------------------------------------
+# libvalkey, pinned. TLS is enabled so the tls topology is testable; the flag
+# name is passed defensively - CMake warns about an unused -D rather than
+# failing, so this stays correct if upstream renames it.
+# ---------------------------------------------------------------------------
+RUN set -eux; \
+    git clone --depth 1 --branch "${LIBVALKEY_REF}" \
+        https://github.com/valkey-io/libvalkey.git /tmp/libvalkey; \
+    cmake -S /tmp/libvalkey -B /tmp/libvalkey/build \
+        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DENABLE_TLS=ON \
+        -DDISABLE_TESTS=ON; \
+    cmake --build /tmp/libvalkey/build -j"$(nproc)"; \
+    cmake --install /tmp/libvalkey/build; \
+    ldconfig; \
+    rm -rf /tmp/libvalkey
+
+# ---------------------------------------------------------------------------
+# Run as the invoking host user. PostgreSQL refuses to run as root, and this
+# keeps build artefacts out of the bind mount owned by root.
+# ---------------------------------------------------------------------------
+RUN set -eux; \
+    if ! getent group "${GID}" >/dev/null; then groupadd -g "${GID}" vfdw; fi; \
+    if ! getent passwd "${UID}" >/dev/null; then \
+        useradd -m -u "${UID}" -g "${GID}" -s /bin/bash vfdw; \
+    fi; \
+    VFDW_USER="$(getent passwd "${UID}" | cut -d: -f1)"; \
+    echo "${VFDW_USER} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/vfdw; \
+    install -d -o "${UID}" -g "${GID}" /work /pgdata; \
+    # 'make install' must work without sudo, so hand the extension and
+    # library directories to the build user.
+    chown -R "${UID}:${GID}" \
+        "/usr/lib/postgresql/${PG_MAJOR}/lib" \
+        "/usr/share/postgresql/${PG_MAJOR}/extension"
+
+ENV PATH=/usr/lib/postgresql/${PG_MAJOR}/bin:$PATH \
+    PGDATA=/pgdata/data \
+    PGPORT=5432 \
+    PGHOST=/tmp
+
+COPY docker/build-entrypoint.sh /usr/local/bin/entrypoint
+RUN chmod 0755 /usr/local/bin/entrypoint
+
+USER ${UID}:${GID}
+WORKDIR /work
+
+ENTRYPOINT ["/usr/local/bin/entrypoint"]
+CMD ["bash"]
+
+# Stamped so the harness can tell whether this image still matches the files
+# it was built from. Last, so it invalidates no layer above it.
+ARG VFDW_SRC_SHA=unstamped
+LABEL vfdw.src_sha=$VFDW_SRC_SHA

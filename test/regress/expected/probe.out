@@ -1,0 +1,1186 @@
+-- The keyspace probes: what actually landed in Valkey.
+--
+-- This file asserts the instrument, not the wrapper. Every write suite from
+-- here on reads its result through valkey_fdw_test_probe, and a probe that
+-- reported a nil as an empty array, dropped an element, truncated a value at
+-- the first NUL, or answered a failed command with zero rows would make those
+-- suites green for reasons that have nothing to do with the write path. So the
+-- probe gets its own vectors first.
+--
+-- Two properties are worth stating up front because they shape every
+-- assertion below.
+--
+-- The probe reaches Valkey through the same connection, command and I/O layers
+-- as the code under test. That is deliberate - it is what makes it work on the
+-- tls, acl and cluster topologies, where a plaintext valkey-cli either cannot
+-- connect or connects as nobody - but it means a defect in those layers is
+-- invisible here, and invisible SYMMETRICALLY: a bug that truncates an
+-- outgoing argument truncates it identically on the way in and on the way out,
+-- so a probe-write/probe-read round trip agrees with itself. Every keyspace
+-- assertion below therefore includes at least one number the SERVER computed
+-- and the probe cannot echo - STRLEN, LLEN, HLEN, EXISTS, TYPE.
+--
+-- Nothing here is projected raw when it is large or not known-ASCII. bytea
+-- renders as \x hex, which is unreadable in an expected file, so known-ASCII
+-- payloads go through convert_from, byte-exact ones through encode(...,
+-- 'escape'), and large ones through length() and md5() only.
+--
+-- Topology note: this suite runs on standalone. It hardcodes a plaintext
+-- server with no credentials, so it cannot run unmodified on tls, acl or
+-- cluster; giving it per-topology servers is a harness change, not a probe
+-- change, and is recorded in the task rather than faked here.
+CREATE SERVER p5_srv FOREIGN DATA WRAPPER valkey_fdw
+    OPTIONS (host 'valkey', port '6379');
+CREATE USER MAPPING FOR CURRENT_USER SERVER p5_srv;
+-- A refusal is as much a result as a value. This reduces both to one string -
+-- and reports a ROW COUNT when nothing was raised, so "the helper quietly
+-- returned nothing" can never be mistaken for "the helper refused". That
+-- distinction is the entire reason these functions are CALLED ON NULL INPUT
+-- rather than STRICT.
+CREATE FUNCTION p5_err(call text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+    n bigint;
+BEGIN
+    EXECUTE 'SELECT count(*) FROM ' || call INTO n;
+    RETURN 'no error, ' || n || ' rows';
+EXCEPTION WHEN OTHERS THEN
+    RETURN SQLSTATE;
+END $$;
+-- The 'no error' branch, exercised once so it is known to work. Every other
+-- call to p5_err in this file takes the EXCEPTION branch, which left the half
+-- that distinguishes "refused" from "returned nothing" never executed - so a
+-- p5_err that could only ever report a SQLSTATE would have read exactly the
+-- same everywhere and the distinction the comment above claims would have
+-- been unproven.
+SELECT p5_err($$valkey_fdw_test_probe('p5_srv', 0, 'PING')$$) AS a_call_that_works;
+ a_call_that_works 
+-------------------
+ no error, 1 rows
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- 1. A nil is not an empty array, and neither one is "no rows".
+--
+-- This is the distinction a shell fixture cannot make: through
+-- `COPY ... FROM PROGRAM` in raw mode both are the single byte E'\n', and
+-- string_agg collapses both to SQL NULL. It is also exactly the shape the
+-- ROLLBACK gate depends on, so it is asserted as a full row rather than as a
+-- count.
+-- ---------------------------------------------------------------------------
+SELECT * FROM valkey_fdw_test_probe('p5_srv', 0, 'GET', 'p5:missing');
+ reply_type | ordinal | key_part | val_part | num | dbl 
+------------+---------+----------+----------+-----+-----
+ nil        |       0 |          |          |     |    
+(1 row)
+
+SELECT * FROM valkey_fdw_test_probe('p5_srv', 0, 'LRANGE', 'p5:missing', '0', '-1');
+ reply_type | ordinal | key_part | val_part | num | dbl 
+------------+---------+----------+----------+-----+-----
+ array      |       0 |          |          |   0 |    
+(1 row)
+
+SELECT * FROM valkey_fdw_test_probe('p5_srv', 0, 'SMEMBERS', 'p5:missing');
+ reply_type | ordinal | key_part | val_part | num | dbl 
+------------+---------+----------+----------+-----+-----
+ set        |       0 |          |          |   0 |    
+(1 row)
+
+SELECT * FROM valkey_fdw_test_probe('p5_srv', 0, 'HGETALL', 'p5:missing');
+ reply_type | ordinal | key_part | val_part | num | dbl 
+------------+---------+----------+----------+-----+-----
+ map        |       0 |          |          |   0 |    
+(1 row)
+
+-- Every reply emits at least one row, at ordinal 0. Zero rows is impossible by
+-- construction, which is what makes "the probe returned nothing" a third,
+-- visibly different outcome rather than a synonym for either of the two above.
+SELECT count(*) AS rows_for_a_nil
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'GET', 'p5:missing');
+ rows_for_a_nil 
+----------------
+              1
+(1 row)
+
+SELECT count(*) AS rows_for_an_empty_array
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'LRANGE', 'p5:missing', '0', '-1');
+ rows_for_an_empty_array 
+-------------------------
+                       1
+(1 row)
+
+-- A key holding the empty string is a THIRD thing, and the one most easily
+-- lost: a probe that answered `data == NULL || len == 0` with SQL NULL would
+-- render it exactly like the absent key above, and every vector in this file
+-- still passed when that mutation was made. It matters because
+-- `INSERT ... VALUES ('')` must reach Valkey as a key that exists and holds
+-- nothing, not as no key at all - a distinction the write path is required to
+-- preserve and would have no way to check.
+--
+-- EXISTS and STRLEN are asked of the server so the answer does not come from
+-- the same rendering being tested.
+SELECT count(*) FROM valkey_fdw_test_probe('p5_srv', 0, 'SET', 'p5:empty', '');
+ count 
+-------
+     1
+(1 row)
+
+SELECT val_part IS NULL AS is_sql_null,
+       octet_length(val_part) AS len,
+       reply_type
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'GET', 'p5:empty');
+ is_sql_null | len | reply_type 
+-------------+-----+------------
+ f           |   0 | string
+(1 row)
+
+SELECT num AS server_says_exists
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'EXISTS', 'p5:empty');
+ server_says_exists 
+--------------------
+                  1
+(1 row)
+
+SELECT num AS server_says_strlen
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'STRLEN', 'p5:empty');
+ server_says_strlen 
+--------------------
+                  0
+(1 row)
+
+-- Side by side with the absent key, which is where the two must differ.
+SELECT val_part IS NULL AS is_sql_null,
+       octet_length(val_part) AS len,
+       reply_type
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'GET', 'p5:missing');
+ is_sql_null | len | reply_type 
+-------------+-----+------------
+ t           |     | nil
+(1 row)
+
+SELECT num AS server_says_exists
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'EXISTS', 'p5:missing');
+ server_says_exists 
+--------------------
+                  0
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- 2. Scalar type discrimination.
+--
+-- Every one of these pairs is two different RESP types carrying bytes that a
+-- text-shaped helper would render identically.
+-- ---------------------------------------------------------------------------
+-- SET answers with a status; a GET of a key whose value is 'OK' answers with a
+-- string. Same bytes on the wire, different reply type.
+SELECT reply_type, convert_from(val_part, 'UTF8') AS body
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'SET', 'p5:ok', 'OK');
+ reply_type | body 
+------------+------
+ status     | OK
+(1 row)
+
+SELECT reply_type, convert_from(val_part, 'UTF8') AS body
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'GET', 'p5:ok');
+ reply_type | body 
+------------+------
+ string     | OK
+(1 row)
+
+-- EXISTS answers with the integer 1; a GET of a key whose value is '1'
+-- answers with the one-byte string '1'. num is populated for one and val_part
+-- for the other, and neither borrows the other's column.
+SELECT reply_type FROM valkey_fdw_test_probe('p5_srv', 0, 'SET', 'p5:one', '1');
+ reply_type 
+------------
+ status
+(1 row)
+
+SELECT reply_type, num, val_part
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'EXISTS', 'p5:one');
+ reply_type | num | val_part 
+------------+-----+----------
+ integer    |   1 | 
+(1 row)
+
+SELECT reply_type, num, val_part
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'GET', 'p5:one');
+ reply_type | num | val_part 
+------------+-----+----------
+ string     |     | \x31
+(1 row)
+
+-- TYPE of a key that is not there is the status 'none', not a nil. That is the
+-- cheapest single-statement proof that a DELETE removed a key.
+SELECT reply_type, convert_from(val_part, 'UTF8') AS body
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'TYPE', 'p5:missing');
+ reply_type | body 
+------------+------
+ status     | none
+(1 row)
+
+SELECT reply_type, convert_from(val_part, 'UTF8') AS body
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'TYPE', 'p5:one');
+ reply_type |  body  
+------------+--------
+ status     | string
+(1 row)
+
+-- TTL is -1 for a key with no expiry and -2 for a key that does not exist. Two
+-- different negative integers, and a helper that reported both as "no value"
+-- would hide the difference an UPDATE-preserves-TTL assertion depends on.
+SELECT num AS ttl_no_expiry
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'TTL', 'p5:one');
+ ttl_no_expiry 
+---------------
+            -1
+(1 row)
+
+SELECT num AS ttl_missing_key
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'TTL', 'p5:missing');
+ ttl_missing_key 
+-----------------
+              -2
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- 3. Binary fidelity, on the key as well as on the value.
+--
+-- The key here is 'p5:bin:a\000b' and the value is 'a\000b'. STRLEN is the
+-- assertion that matters: it is computed by the SERVER from what was actually
+-- stored, so the probe cannot echo an argument it truncated on the way out.
+-- The GET of the truncated key 'p5:bin:a' is the same proof from the other
+-- side - if the key had been cut at the NUL, that key would exist.
+-- ---------------------------------------------------------------------------
+SELECT reply_type FROM valkey_fdw_test_probe('p5_srv', 0, 'SET',
+       '\x70353a62696e3a610062'::bytea, '\x610062'::bytea);
+ reply_type 
+------------
+ status
+(1 row)
+
+SELECT num AS strlen_must_be_3 FROM valkey_fdw_test_probe('p5_srv', 0,
+       'STRLEN', '\x70353a62696e3a610062'::bytea);
+ strlen_must_be_3 
+------------------
+                3
+(1 row)
+
+SELECT num AS exists_must_be_1 FROM valkey_fdw_test_probe('p5_srv', 0,
+       'EXISTS', '\x70353a62696e3a610062'::bytea);
+ exists_must_be_1 
+------------------
+                1
+(1 row)
+
+SELECT val_part = '\x610062'::bytea AS value_round_trips,
+       length(val_part) AS value_length
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'GET',
+       '\x70353a62696e3a610062'::bytea);
+ value_round_trips | value_length 
+-------------------+--------------
+ t                 |            3
+(1 row)
+
+SELECT reply_type AS truncated_key_must_be_nil
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'GET', '\x70353a62696e3a61'::bytea);
+ truncated_key_must_be_nil 
+---------------------------
+ nil
+(1 row)
+
+-- Bytes that are not valid UTF-8 come back unchanged rather than mangled or
+-- rejected on the way through.
+SELECT reply_type FROM valkey_fdw_test_probe('p5_srv', 0, 'SET',
+       'p5:bin:utf8', '\xfffefd'::bytea);
+ reply_type 
+------------
+ status
+(1 row)
+
+SELECT val_part = '\xfffefd'::bytea AS invalid_utf8_round_trips,
+       num IS NULL AS num_is_null_for_a_string
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'GET', 'p5:bin:utf8');
+ invalid_utf8_round_trips | num_is_null_for_a_string 
+--------------------------+--------------------------
+ t                        | t
+(1 row)
+
+-- One megabyte, asserted by length and digest only. Projecting it would put a
+-- two-megabyte hex string into the expected file.
+SELECT reply_type FROM valkey_fdw_test_probe('p5_srv', 0, 'SET',
+       'p5:bin:onemb', decode(repeat('4142', 524288), 'hex'));
+ reply_type 
+------------
+ status
+(1 row)
+
+SELECT num AS onemb_strlen
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'STRLEN', 'p5:bin:onemb');
+ onemb_strlen 
+--------------
+      1048576
+(1 row)
+
+SELECT length(val_part) AS onemb_length, md5(val_part) AS onemb_md5
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'GET', 'p5:bin:onemb');
+ onemb_length |            onemb_md5             
+--------------+----------------------------------
+      1048576 | 58b0ac0465d0c8e6c3574acb88ee4ea5
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- 4. Element boundaries survive the bytes that break a text pipe.
+--
+-- A newline inside a list element renders a 2-element list identically to a
+-- 3-element one through a raw shell pipe; a TAB aborts COPY with "extra data
+-- after last expected column" and a NUL aborts it with an encoding error.
+-- LLEN is the server-computed half: it counts elements, not lines.
+-- ---------------------------------------------------------------------------
+-- convert_to rather than a bare literal: an unknown literal reaches bytea
+-- through byteain, which reads a backslash as the start of an escape, so
+-- E'a\\b' is rejected before it ever gets near Valkey. convert_to says "these
+-- text bytes" and means it.
+SELECT count(*) FROM valkey_fdw_test_probe('p5_srv', 0, 'DEL', 'p5:nl');
+ count 
+-------
+     1
+(1 row)
+
+SELECT num AS pushed FROM valkey_fdw_test_probe('p5_srv', 0, 'RPUSH', 'p5:nl',
+       convert_to(E'line1\nline2', 'UTF8'),
+       convert_to(E'a\tb', 'UTF8'),
+       convert_to(E'a\\b', 'UTF8'),
+       '\x610062'::bytea);
+ pushed 
+--------
+      4
+(1 row)
+
+SELECT num AS llen_must_be_4
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'LLEN', 'p5:nl');
+ llen_must_be_4 
+----------------
+              4
+(1 row)
+
+-- Rendered as hex, not as text: a raw newline in a psql cell wraps onto a
+-- second line and a raw TAB is indistinguishable from spaces, so the one
+-- property being asserted would be the hardest thing in the row to read. In
+-- order: 'line1\nline2', 'a\tb', 'a\b', 'a\0b'.
+SELECT ordinal, length(val_part) AS len, encode(val_part, 'hex') AS bytes
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'LRANGE', 'p5:nl', '0', '-1')
+ WHERE ordinal > 0 ORDER BY ordinal;
+ ordinal | len |         bytes          
+---------+-----+------------------------
+       1 |  11 | 6c696e65310a6c696e6532
+       2 |   3 | 610962
+       3 |   3 | 615c62
+       4 |   3 | 610062
+(4 rows)
+
+-- The header row of that same reply carries the element count, so the number
+-- of element rows is checkable against the reply itself and not only against
+-- LLEN.
+--
+-- `val_part IS NULL AS aggregate_has_no_body` was projected here too and is
+-- gone: libvalkey leaves reply->str NULL for every aggregate, so the probe has
+-- no way to populate it and the column could only ever read t. A row that
+-- cannot come out any other way is not an assertion.
+SELECT reply_type, num AS elements
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'LRANGE', 'p5:nl', '0', '-1')
+ WHERE ordinal = 0;
+ reply_type | elements 
+------------+----------
+ array      |        4
+(1 row)
+
+-- Lua's boolean conversion, which is NOT a RESP3 boolean.
+--
+-- These vectors were added to reach the VALKEY_REPLY_BOOL arm and do not: a
+-- stock Valkey converts Lua true to the integer 1 and Lua false to a nil
+-- whatever protocol the client negotiated, verified against the server rather
+-- than assumed. VALKEY_REPLY_BOOL therefore remains unreachable from this
+-- harness - it is recorded as uncovered, not counted as tested.
+--
+-- They are kept for what they do assert: two Lua returns that look alike in
+-- the script land as two different RESP types, and 'return false' is a second,
+-- independently produced nil.
+SELECT reply_type, num
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'EVAL', 'return true', '0');
+ reply_type | num 
+------------+-----
+ integer    |   1
+(1 row)
+
+SELECT reply_type, num
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'EVAL', 'return false', '0');
+ reply_type | num 
+------------+-----
+ nil        |    
+(1 row)
+
+SELECT count(*) AS rows_for_a_four_element_array
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'LRANGE', 'p5:nl', '0', '-1');
+ rows_for_a_four_element_array 
+-------------------------------
+                             5
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- 5. Ordering, and where it is and is not the semantics.
+--
+-- A list has an order and the probe must preserve it, so LRANGE is asserted on
+-- ordinal. A set has none, so SMEMBERS is asserted only after sorting on the
+-- extracted value - sorting it on ordinal would record whatever the server
+-- happened to hand back.
+-- ---------------------------------------------------------------------------
+SELECT count(*) FROM valkey_fdw_test_probe('p5_srv', 0, 'DEL', 'p5:l');
+ count 
+-------
+     1
+(1 row)
+
+SELECT num FROM valkey_fdw_test_probe('p5_srv', 0, 'RPUSH', 'p5:l',
+       'first', 'second', 'third');
+ num 
+-----
+   3
+(1 row)
+
+SELECT ordinal, convert_from(val_part, 'UTF8') AS element
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'LRANGE', 'p5:l', '0', '-1')
+ WHERE ordinal > 0 ORDER BY ordinal;
+ ordinal | element 
+---------+---------
+       1 | first
+       2 | second
+       3 | third
+(3 rows)
+
+SELECT count(*) FROM valkey_fdw_test_probe('p5_srv', 0, 'DEL', 'p5:t');
+ count 
+-------
+     1
+(1 row)
+
+SELECT num FROM valkey_fdw_test_probe('p5_srv', 0, 'SADD', 'p5:t',
+       'alpha', 'beta', 'gamma');
+ num 
+-----
+   3
+(1 row)
+
+SELECT convert_from(val_part, 'UTF8') AS member
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'SMEMBERS', 'p5:t')
+ WHERE ordinal > 0 ORDER BY member;
+ member 
+--------
+ alpha
+ beta
+ gamma
+(3 rows)
+
+SELECT num AS scard FROM valkey_fdw_test_probe('p5_srv', 0, 'SCARD', 'p5:t');
+ scard 
+-------
+     3
+(1 row)
+
+SELECT num AS sismember
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'SISMEMBER', 'p5:t', 'beta');
+ sismember 
+-----------
+         1
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- 6. Pairing: the RESP2/RESP3 normalisation.
+--
+-- Under _pairs an even-length aggregate becomes one row per pair, whatever
+-- shape it arrived in, and the header says 'map' with the PAIR count. Under
+-- the plain entry point the same reply is flat. Both are asserted, so the
+-- difference between them is recorded rather than assumed.
+--
+-- Caveat, and it is a real one: HELLO 3 always succeeds against the harness
+-- images, so vconn->resp3 is always true and the RESP2 half of this
+-- normalisation is never exercised here. The flat-array branch ships unproven.
+-- ---------------------------------------------------------------------------
+SELECT count(*) FROM valkey_fdw_test_probe('p5_srv', 0, 'DEL', 'p5:h');
+ count 
+-------
+     1
+(1 row)
+
+SELECT num AS fields_set FROM valkey_fdw_test_probe('p5_srv', 0, 'HSET',
+       'p5:h', 'f1', 'v1', 'f2', 'v2', 'f3', 'v3');
+ fields_set 
+------------
+          3
+(1 row)
+
+SELECT num AS hlen FROM valkey_fdw_test_probe('p5_srv', 0, 'HLEN', 'p5:h');
+ hlen 
+------
+    3
+(1 row)
+
+SELECT reply_type, num AS pairs
+  FROM valkey_fdw_test_probe_pairs('p5_srv', 0, 'HGETALL', 'p5:h')
+ WHERE ordinal = 0;
+ reply_type | pairs 
+------------+-------
+ map        |     3
+(1 row)
+
+SELECT count(*) AS paired_rows
+  FROM valkey_fdw_test_probe_pairs('p5_srv', 0, 'HGETALL', 'p5:h');
+ paired_rows 
+-------------
+           4
+(1 row)
+
+SELECT reply_type, convert_from(key_part, 'UTF8') AS field,
+       convert_from(val_part, 'UTF8') AS value
+  FROM valkey_fdw_test_probe_pairs('p5_srv', 0, 'HGETALL', 'p5:h')
+ WHERE ordinal > 0 ORDER BY field;
+ reply_type | field | value 
+------------+-------+-------
+ string     | f1    | v1
+ string     | f2    | v2
+ string     | f3    | v3
+(3 rows)
+
+SELECT reply_type, num AS elements
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'HGETALL', 'p5:h')
+ WHERE ordinal = 0;
+ reply_type | elements 
+------------+----------
+ map        |        6
+(1 row)
+
+SELECT count(*) AS flat_rows
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'HGETALL', 'p5:h');
+ flat_rows 
+-----------
+         7
+(1 row)
+
+SELECT convert_from(val_part, 'UTF8') AS element
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'HGETALL', 'p5:h')
+ WHERE ordinal > 0 ORDER BY element;
+ element 
+---------
+ f1
+ f2
+ f3
+ v1
+ v2
+ v3
+(6 rows)
+
+-- HGET of one field is a plain string, so a single-field assertion needs no
+-- pairing at all. This is the shape the hash RENAME proof uses.
+SELECT reply_type, convert_from(val_part, 'UTF8') AS value
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'HGET', 'p5:h', 'f2');
+ reply_type | value 
+------------+-------
+ string     | v2
+(1 row)
+
+-- Pairing an odd-length reply would silently drop the last element, so it is
+-- refused instead.
+SELECT p5_err($$valkey_fdw_test_probe_pairs('p5_srv', 0,
+              'LRANGE', 'p5:l', '0', '-1')$$) AS odd_reply_refused;
+ odd_reply_refused 
+-------------------
+ HV004
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- 7. Doubles.
+--
+-- A zset score is IEEE-754 binary64. ZSCORE is a bulk string under RESP2 and a
+-- double under RESP3, so an assertion that projected reply_type would record
+-- the protocol rather than the score. What is recorded here is which columns
+-- libvalkey actually fills for a double - the score assertions the dml suite
+-- will write depend on it.
+-- ---------------------------------------------------------------------------
+SELECT count(*) FROM valkey_fdw_test_probe('p5_srv', 0, 'DEL', 'p5:z');
+ count 
+-------
+     1
+(1 row)
+
+SELECT num AS added FROM valkey_fdw_test_probe('p5_srv', 0, 'ZADD', 'p5:z',
+       '1.5', 'a', '2.5', 'b');
+ added 
+-------
+     2
+(1 row)
+
+SELECT reply_type, dbl, encode(val_part, 'escape') AS rendered
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'ZSCORE', 'p5:z', 'a');
+ reply_type | dbl | rendered 
+------------+-----+----------
+ double     | 1.5 | 1.5
+(1 row)
+
+SELECT num AS zcard FROM valkey_fdw_test_probe('p5_srv', 0, 'ZCARD', 'p5:z');
+ zcard 
+-------
+     2
+(1 row)
+
+-- ZRANGE ... WITHSCORES is NOT a flat member/score array under RESP3. It comes
+-- back as an array of two-element [member, score] arrays, which runs straight
+-- into the one-level-deep rule: the element rows below report a nested array
+-- and its length, and carry no payload. Recorded rather than worked around.
+-- The consequence is a rule for every write suite that follows: assert zset
+-- scores with ZSCORE, one member at a time, which is exact and identical under
+-- both protocols - never by parsing a WITHSCORES reply whose SHAPE changes
+-- with the protocol.
+SELECT ordinal, reply_type, num, val_part
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'ZRANGE', 'p5:z',
+       '0', '-1', 'WITHSCORES')
+ ORDER BY ordinal;
+ ordinal | reply_type | num | val_part 
+---------+------------+-----+----------
+       0 | array      |   2 | 
+       1 | array      |   2 | 
+       2 | array      |   2 | 
+(3 rows)
+
+SELECT ordinal, reply_type, num, key_part, val_part
+  FROM valkey_fdw_test_probe_pairs('p5_srv', 0, 'ZRANGE', 'p5:z',
+       '0', '-1', 'WITHSCORES')
+ ORDER BY ordinal;
+ ordinal | reply_type | num | key_part | val_part 
+---------+------------+-----+----------+----------
+       0 | map        |   1 |          | 
+       1 | array      |   2 |          | 
+(2 rows)
+
+-- Members without their scores are flat, so ordering and membership are
+-- assertable directly, and each score is a separate exact question.
+SELECT ordinal, convert_from(val_part, 'UTF8') AS member
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'ZRANGE', 'p5:z', '0', '-1')
+ WHERE ordinal > 0 ORDER BY ordinal;
+ ordinal | member 
+---------+--------
+       1 | a
+       2 | b
+(2 rows)
+
+SELECT dbl AS score_of_b, convert_from(val_part, 'UTF8')::float8 AS same_as_float8
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'ZSCORE', 'p5:z', 'b');
+ score_of_b | same_as_float8 
+------------+----------------
+        2.5 |            2.5
+(1 row)
+
+SELECT reply_type AS score_of_a_missing_member
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'ZSCORE', 'p5:z', 'nosuchmember');
+ score_of_a_missing_member 
+---------------------------
+ nil
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- 8. Nesting stops at one level.
+--
+-- An element that is itself an aggregate reports its own type and element
+-- count and nothing else. Documented rather than fixed: anything needing depth
+-- gets a purpose-built entry point, which is what valkey_fdw_test_keys is.
+-- ---------------------------------------------------------------------------
+SELECT ordinal, reply_type, num, val_part
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'SCAN', '0', 'MATCH',
+       'p5:no-such-prefix:*', 'COUNT', '1000')
+ ORDER BY ordinal;
+ ordinal | reply_type | num | val_part 
+---------+------------+-----+----------
+       0 | array      |   2 | 
+       1 | string     |     | \x30
+       2 | array      |   0 | 
+(3 rows)
+
+-- ---------------------------------------------------------------------------
+-- 9. A Valkey error reply is DATA, and the statement does not raise.
+--
+-- A helper that raised on WRONGTYPE could not be used to assert that a key
+-- holds the wrong type, and the fault suites have to read the keyspace after a
+-- fault has fired. The SELECT 1 after each is the assertion that nothing was
+-- raised - without it the row above would be indistinguishable from output
+-- produced before an error.
+-- ---------------------------------------------------------------------------
+SELECT count(*) FROM valkey_fdw_test_probe('p5_srv', 0, 'DEL', 'p5:wrongtype');
+ count 
+-------
+     1
+(1 row)
+
+SELECT num FROM valkey_fdw_test_probe('p5_srv', 0, 'LPUSH', 'p5:wrongtype', 'x');
+ num 
+-----
+   1
+(1 row)
+
+SELECT reply_type,
+       convert_from(val_part, 'UTF8') LIKE 'WRONGTYPE%' AS says_wrongtype
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'GET', 'p5:wrongtype');
+ reply_type | says_wrongtype 
+------------+----------------
+ error      | t
+(1 row)
+
+SELECT 1 AS the_statement_above_did_not_raise;
+ the_statement_above_did_not_raise 
+-----------------------------------
+                                 1
+(1 row)
+
+SELECT reply_type,
+       convert_from(val_part, 'UTF8') LIKE 'ERR unknown command%' AS says_unknown
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'NOSUCHVERB', 'p5:x');
+ reply_type | says_unknown 
+------------+--------------
+ error      | t
+(1 row)
+
+SELECT 1 AS the_statement_above_did_not_raise_either;
+ the_statement_above_did_not_raise_either 
+------------------------------------------
+                                        1
+(1 row)
+
+-- The connection is still usable afterwards.
+SELECT reply_type, convert_from(val_part, 'UTF8') AS body
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'PING');
+ reply_type | body 
+------------+------
+ status     | PONG
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- 10. A connection or argument failure RAISES.
+--
+-- The distinction this file exists to keep: a Valkey error is a result, but a
+-- probe that never reached the server must not be able to report a clean
+-- keyspace. Each of these is checked through p5_err, which reports a row count
+-- when nothing was raised - so "returned zero rows" fails the vector instead of
+-- passing it.
+-- ---------------------------------------------------------------------------
+SELECT p5_err($$valkey_fdw_test_probe(NULL::text, 0, 'PING')$$) AS null_server;
+ null_server 
+-------------
+ 22004
+(1 row)
+
+SELECT p5_err($$valkey_fdw_test_probe('p5_srv', NULL::int, 'PING')$$) AS null_database;
+ null_database 
+---------------
+ 22004
+(1 row)
+
+SELECT p5_err($$valkey_fdw_test_probe('p5_srv', 0, VARIADIC NULL::bytea[])$$)
+    AS null_argument_array;
+ null_argument_array 
+---------------------
+ 22004
+(1 row)
+
+SELECT p5_err($$valkey_fdw_test_probe('p5_srv', 0, VARIADIC ARRAY[NULL::bytea])$$)
+    AS null_argument_element;
+ null_argument_element 
+-----------------------
+ 22004
+(1 row)
+
+SELECT p5_err($$valkey_fdw_test_probe('p5_srv', 0, VARIADIC ARRAY[]::bytea[])$$)
+    AS no_arguments;
+ no_arguments 
+--------------
+ 22023
+(1 row)
+
+SELECT p5_err($$valkey_fdw_test_probe('p5_srv', 99, 'PING')$$) AS database_out_of_range;
+ database_out_of_range 
+-----------------------
+ 22003
+(1 row)
+
+SELECT p5_err($$valkey_fdw_test_probe('p5_srv', -1, 'PING')$$) AS database_negative;
+ database_negative 
+-------------------
+ 22003
+(1 row)
+
+SELECT p5_err($$valkey_fdw_test_probe('p5_no_such_server', 0, 'PING')$$) AS unknown_server;
+ unknown_server 
+----------------
+ 42704
+(1 row)
+
+SELECT p5_err($$valkey_fdw_test_keys(NULL::text, 0, 'p5:')$$) AS keys_null_server;
+ keys_null_server 
+------------------
+ 22004
+(1 row)
+
+SELECT p5_err($$valkey_fdw_test_keys('p5_srv', 0, NULL::bytea)$$) AS keys_null_prefix;
+ keys_null_prefix 
+------------------
+ 22004
+(1 row)
+
+SELECT p5_err($$valkey_fdw_test_keys('p5_srv', 16, 'p5:')$$) AS keys_database_out_of_range;
+ keys_database_out_of_range 
+----------------------------
+ 22003
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- 11. The key dump.
+--
+-- One statement that is a complete description of a scoped keyspace: which
+-- keys are there and what Valkey type each one is. That is what a ROLLBACK
+-- gate compares - the sorted list before against the sorted list after - and
+-- why it is a set comparison and not a count. A count is accidentally
+-- satisfied when one key appears and another disappears, which is exactly the
+-- shape a half-applied flush has.
+-- ---------------------------------------------------------------------------
+SELECT count(*) FROM valkey_fdw_test_probe('p5_srv', 0, 'SET', 'p5:dump:str', 'v');
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM valkey_fdw_test_probe('p5_srv', 0, 'HSET', 'p5:dump:hash', 'f', 'v');
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM valkey_fdw_test_probe('p5_srv', 0, 'RPUSH', 'p5:dump:list', 'v');
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM valkey_fdw_test_probe('p5_srv', 0, 'SADD', 'p5:dump:set', 'v');
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM valkey_fdw_test_probe('p5_srv', 0, 'ZADD', 'p5:dump:zset', '1', 'v');
+ count 
+-------
+     1
+(1 row)
+
+-- Sorted in SQL on the extracted key. SCAN has no defined order, so a dump
+-- ordered by arrival would be recorded from luck.
+SELECT convert_from(key, 'UTF8') AS keyname, keytype
+  FROM valkey_fdw_test_keys('p5_srv', 0, 'p5:dump:') ORDER BY key;
+   keyname    | keytype 
+--------------+---------
+ p5:dump:hash | hash
+ p5:dump:list | list
+ p5:dump:set  | set
+ p5:dump:str  | string
+ p5:dump:zset | zset
+(5 rows)
+
+-- A prefix nothing matches is zero rows. That reads as zero rows because the
+-- count beside it is zero, not because the helper failed - and the count is
+-- the reason it is legible.
+SELECT count(*) AS keys_under_an_absent_prefix
+  FROM valkey_fdw_test_keys('p5_srv', 0, 'p5:no-such-prefix:');
+ keys_under_an_absent_prefix 
+-----------------------------
+                           0
+(1 row)
+
+-- A key whose name contains a NUL byte appears in the dump whole. encode
+-- rather than convert_from: the name is not valid text.
+SELECT encode(key, 'escape') AS keyname, keytype
+  FROM valkey_fdw_test_keys('p5_srv', 0, 'p5:bin:') ORDER BY key;
+    keyname    | keytype 
+---------------+---------
+ p5:bin:a\000b | string
+ p5:bin:onemb  | string
+ p5:bin:utf8   | string
+(3 rows)
+
+-- The prefix is a literal, not a glob. Every metacharacter the escaper knows
+-- about gets its own pair, because a vector for '*' alone leaves the rest of
+-- the escape set unfalsifiable: narrowing the escaper to `if (c == '*')` and
+-- running this file passed, which is how these four pairs came to exist.
+--
+-- Each pair is one key whose name really contains the metacharacter and one
+-- decoy the metacharacter would match if it were left live. The decoy is what
+-- makes the assertion bite - without it an unescaped MATCH still finds the
+-- real key and the count is unchanged.
+SELECT count(*) FROM valkey_fdw_test_probe('p5_srv', 0, 'SET', 'p5:g*lob:yes', '1');
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM valkey_fdw_test_probe('p5_srv', 0, 'SET', 'p5:gXlob:no', '1');
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM valkey_fdw_test_probe('p5_srv', 0, 'SET', 'p5:q?m:yes', '1');
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM valkey_fdw_test_probe('p5_srv', 0, 'SET', 'p5:qZm:no', '1');
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM valkey_fdw_test_probe('p5_srv', 0, 'SET', 'p5:c[ab]:yes', '1');
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM valkey_fdw_test_probe('p5_srv', 0, 'SET', 'p5:ca:no', '1');
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM valkey_fdw_test_probe('p5_srv', 0, 'SET', 'p5:bs\s:yes', '1');
+ERROR:  invalid input syntax for type bytea
+LINE 1: ...*) FROM valkey_fdw_test_probe('p5_srv', 0, 'SET', 'p5:bs\s:y...
+                                                             ^
+SELECT count(*) FROM valkey_fdw_test_probe('p5_srv', 0, 'SET', 'p5:bss:no', '1');
+ count 
+-------
+     1
+(1 row)
+
+SELECT convert_from(key, 'UTF8') AS keyname, keytype
+  FROM valkey_fdw_test_keys('p5_srv', 0, 'p5:g*lob:') ORDER BY key;
+   keyname    | keytype 
+--------------+---------
+ p5:g*lob:yes | string
+(1 row)
+
+SELECT convert_from(key, 'UTF8') AS keyname, keytype
+  FROM valkey_fdw_test_keys('p5_srv', 0, 'p5:q?m:') ORDER BY key;
+  keyname   | keytype 
+------------+---------
+ p5:q?m:yes | string
+(1 row)
+
+SELECT convert_from(key, 'UTF8') AS keyname, keytype
+  FROM valkey_fdw_test_keys('p5_srv', 0, 'p5:c[ab]:') ORDER BY key;
+   keyname    | keytype 
+--------------+---------
+ p5:c[ab]:yes | string
+(1 row)
+
+SELECT convert_from(key, 'UTF8') AS keyname, keytype
+  FROM valkey_fdw_test_keys('p5_srv', 0, 'p5:bs\s:') ORDER BY key;
+ERROR:  invalid input syntax for type bytea
+LINE 2:   FROM valkey_fdw_test_keys('p5_srv', 0, 'p5:bs\s:') ORDER B...
+                                                 ^
+-- A prefix that stops short of the metacharacter still sees both members of
+-- the pair, which is what says the four dumps above narrowed by MEANING the
+-- metacharacter literally rather than by failing to match anything at all.
+SELECT convert_from(key, 'UTF8') AS keyname, keytype
+  FROM valkey_fdw_test_keys('p5_srv', 0, 'p5:g') ORDER BY key;
+   keyname    | keytype 
+--------------+---------
+ p5:g*lob:yes | string
+ p5:gXlob:no  | string
+(2 rows)
+
+SELECT convert_from(key, 'UTF8') AS keyname, keytype
+  FROM valkey_fdw_test_keys('p5_srv', 0, 'p5:q') ORDER BY key;
+  keyname   | keytype 
+------------+---------
+ p5:q?m:yes | string
+ p5:qZm:no  | string
+(2 rows)
+
+SELECT convert_from(key, 'UTF8') AS keyname, keytype
+  FROM valkey_fdw_test_keys('p5_srv', 0, 'p5:c') ORDER BY key;
+   keyname    | keytype 
+--------------+---------
+ p5:c[ab]:yes | string
+ p5:ca:no     | string
+(2 rows)
+
+SELECT convert_from(key, 'UTF8') AS keyname, keytype
+  FROM valkey_fdw_test_keys('p5_srv', 0, 'p5:bs') ORDER BY key;
+  keyname  | keytype 
+-----------+---------
+ p5:bss:no | string
+(1 row)
+
+-- The dump is scoped, so it can be compared against itself across a change.
+-- This is the shape every write suite's gate will take.
+SELECT count(*) FROM valkey_fdw_test_probe('p5_srv', 0, 'DEL', 'p5:dump:list');
+ count 
+-------
+     1
+(1 row)
+
+SELECT convert_from(key, 'UTF8') AS keyname, keytype
+  FROM valkey_fdw_test_keys('p5_srv', 0, 'p5:dump:') ORDER BY key;
+   keyname    | keytype 
+--------------+---------
+ p5:dump:hash | hash
+ p5:dump:set  | set
+ p5:dump:str  | string
+ p5:dump:zset | zset
+(4 rows)
+
+-- ---------------------------------------------------------------------------
+-- 12. The dump stops rather than running away.
+--
+-- An unscoped prefix on a large keyspace would otherwise look like a flaky
+-- suite instead of the mistake it is.
+-- ---------------------------------------------------------------------------
+SELECT num AS seeded FROM valkey_fdw_test_probe('p5_srv', 0, 'EVAL',
+       'for i=1,10001 do server.call("SET", "p5:cap:"..i, "1") end return 1', '0');
+ seeded 
+--------
+      1
+(1 row)
+
+SELECT p5_err($$valkey_fdw_test_keys('p5_srv', 0, 'p5:cap:')$$) AS over_the_cap;
+ over_the_cap 
+--------------
+ 54000
+(1 row)
+
+SELECT num AS cleaned FROM valkey_fdw_test_probe('p5_srv', 0, 'EVAL',
+       'for i=1,10001 do server.call("DEL", "p5:cap:"..i) end return 1', '0');
+ cleaned 
+---------
+       1
+(1 row)
+
+SELECT count(*) AS cap_keys_left
+  FROM valkey_fdw_test_keys('p5_srv', 0, 'p5:cap:');
+ cap_keys_left 
+---------------
+             0
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- 13. The logical database reaches the server.
+--
+-- This is the first assertion in the tree that the `database` option does
+-- anything at all: no suite has ever put data on a non-zero logical database,
+-- and because vfdw_conn_open starts at -1 every scan issues SELECT 0, so a
+-- vfdw_conn_select_db that pinned everything to 0 would leave every suite
+-- green.
+--
+-- The assertion has to be ASYMMETRIC, and that is the whole trick. The probe
+-- calls vfdw_conn_select_db too, so writing and reading on database 3 would
+-- agree with itself even if both landed on database 0. What cannot be faked is
+-- reading database 0 and finding NOTHING there.
+-- ---------------------------------------------------------------------------
+SELECT reply_type, convert_from(val_part, 'UTF8') AS body
+  FROM valkey_fdw_test_probe('p5_srv', 3, 'SET', 'p5:db:k', 'v');
+ reply_type | body 
+------------+------
+ status     | OK
+(1 row)
+
+SELECT reply_type, convert_from(val_part, 'UTF8') AS body
+  FROM valkey_fdw_test_probe('p5_srv', 3, 'GET', 'p5:db:k');
+ reply_type | body 
+------------+------
+ string     | v
+(1 row)
+
+SELECT num AS strlen_on_db3
+  FROM valkey_fdw_test_probe('p5_srv', 3, 'STRLEN', 'p5:db:k');
+ strlen_on_db3 
+---------------
+             1
+(1 row)
+
+SELECT reply_type AS must_be_nil_on_db0
+  FROM valkey_fdw_test_probe('p5_srv', 0, 'GET', 'p5:db:k');
+ must_be_nil_on_db0 
+--------------------
+ nil
+(1 row)
+
+SELECT count(*) AS keys_on_db0
+  FROM valkey_fdw_test_keys('p5_srv', 0, 'p5:db:');
+ keys_on_db0 
+-------------
+           0
+(1 row)
+
+SELECT count(*) AS keys_on_db3
+  FROM valkey_fdw_test_keys('p5_srv', 3, 'p5:db:');
+ keys_on_db3 
+-------------
+           1
+(1 row)
+
+SELECT num AS deleted_from_db3
+  FROM valkey_fdw_test_probe('p5_srv', 3, 'DEL', 'p5:db:k');
+ deleted_from_db3 
+------------------
+                1
+(1 row)
+
+SELECT count(*) AS keys_on_db3_after
+  FROM valkey_fdw_test_keys('p5_srv', 3, 'p5:db:');
+ keys_on_db3_after 
+-------------------
+                 0
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- Cleanup. Scoped deletion, never FLUSHDB: this suite shares one Valkey with
+-- nine others and a flush here would make their results a function of when
+-- this file ran.
+-- ---------------------------------------------------------------------------
+DO $$
+DECLARE
+    k bytea;
+BEGIN
+    FOR k IN SELECT key FROM valkey_fdw_test_keys('p5_srv', 0, 'p5:') LOOP
+        PERFORM valkey_fdw_test_probe('p5_srv', 0, VARIADIC ARRAY['DEL'::bytea, k]);
+    END LOOP;
+END $$;
+SELECT count(*) AS keys_left FROM valkey_fdw_test_keys('p5_srv', 0, 'p5:');
+ keys_left 
+-----------
+         0
+(1 row)
+
+DROP FUNCTION p5_err(text);
+DROP USER MAPPING FOR CURRENT_USER SERVER p5_srv;
+DROP SERVER p5_srv;
+-- ---------------------------------------------------------------------------
+-- The aggregate arity guard, which nothing on the wire can reach.
+--
+-- libvalkey's reader never hands up a short aggregate: a frame declaring more
+-- elements than it carries is incomplete, so the reader waits for the rest
+-- and a closing connection yields EOF rather than a truncated array. The
+-- fault proxy cannot fabricate one for the same reason.
+--
+-- The guard is therefore defence against a libvalkey whose framing changes,
+-- not against a server - which is worth keeping and worth executing. A
+-- hand-built reply is the only thing that executes it.
+-- ---------------------------------------------------------------------------
+SELECT valkey_fdw_test_probe_child_guard();
+ERROR:  a Valkey aggregate reply is missing an element it declared

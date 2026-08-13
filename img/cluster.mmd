@@ -1,0 +1,6 @@
+flowchart LR
+    M["slot map<br/>CLUSTER SHARDS"] --> R{"route by<br/>CRC16(key) mod 16384"}
+    R --> P1[("primary A<br/>slots 0-5460")]
+    R --> P2[("primary B<br/>5461-10922")]
+    R --> P3[("primary C<br/>10923-16383")]
+    P1 -. "MOVED" .-> M

@@ -1,0 +1,151 @@
+# A PostgreSQL built with --enable-cassert, for the memory checks the
+# packaged server cannot give.
+#
+# WHY THIS EXISTS, AND WHY ASAN IS NOT THE ANSWER.
+#
+# The obvious cheaper route - LD_PRELOAD libasan into the packaged postmaster -
+# was tried and fails twice over. It hangs at startup (ASan's interceptors do
+# not survive PostgreSQL's fork and shared-memory setup), and even if it ran it
+# would not see the bugs that matter here: PostgreSQL allocates through
+# palloc/AllocSet, which carves chunks out of large malloc'd blocks, so a
+# use-after-free of context memory happens INSIDE a region ASan considers live.
+# Our whole risk class is exactly that shape - the ledger points into the write
+# buffer and the overlay points into both.
+#
+# What does see it is the server's own instrumentation, which is compile-time:
+#
+#   CLOBBER_FREED_MEMORY     fills freed palloc memory with 0x7F, so a
+#                            dangling read gets garbage rather than the value
+#                            that happened to still be there
+#   MEMORY_CONTEXT_CHECKING  sentinel bytes past each chunk, checked on free
+#   Assert()                 every invariant the server states about itself
+#
+# All three arrive with --enable-cassert, and none of them is in a PGDG build,
+# which is a production build by design. Hence: build one.
+#
+# This image is NOT the default. It is slower - cassert costs perhaps 20-30% -
+# and its purpose is to be run deliberately, not on every commit.
+#
+# The OS user is named vfdw, matching docker/Dockerfile.build. It shows up in
+# DROP CASCADE messages ("user mapping for vfdw"), so a different name here
+# would diff every suite that drops a server - noise that would bury the
+# assertion failures this image exists to surface.
+#
+#   docker build -f docker/Dockerfile.cassert \
+#       --build-arg PG_MAJOR=17 --build-arg UID=$(id -u) --build-arg GID=$(id -g) \
+#       -t valkey_fdw/cassert:pg17 .
+
+FROM debian:bookworm-slim
+
+ARG PG_MAJOR=17
+ARG PG_VERSION=17.5
+ARG LIBVALKEY_REF=0.5.0
+ARG UID=1000
+ARG GID=1000
+
+ENV DEBIAN_FRONTEND=noninteractive
+# Mirrors docker/Dockerfile.build exactly. The entrypoint is shared, and it
+# reads all four under `set -u` - a missing one is an unbound-variable abort
+# before anything runs.
+#
+# LANG matters as much as any of them: initdb takes the cluster encoding from
+# the locale, and without this it picks SQL_ASCII. The suites then diff on
+# every message that names an encoding, and the collation tests fail outright
+# because a non-deterministic collation needs a real one.
+ENV PATH=/usr/local/pgsql/bin:$PATH \
+    PGDATA=/pgdata/data \
+    PGPORT=5432 \
+    PGHOST=/tmp \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        build-essential clang cmake git curl ca-certificates pkg-config \
+        libssl-dev libreadline-dev zlib1g-dev libicu-dev bison flex \
+        libipc-run-perl libtest-simple-perl \
+        netcat-openbsd python3 procps \
+        libxml2-dev libxslt1-dev uuid-dev; \
+    rm -rf /var/lib/apt/lists/*
+
+# PostgreSQL from source. --enable-cassert is the whole point; --enable-debug
+# and -O1 keep the backtraces readable without making the suite crawl.
+#
+# --with-icu is not optional here even though nothing in the FDW calls ICU:
+# collation.sql builds a non-deterministic collation, which is ICU-only, and
+# a build without it fails that suite for a reason that has nothing to do
+# with valkey_fdw. An image whose failures are its own configure flags
+# teaches its reader to ignore failures.
+RUN set -eux; \
+    curl -fsSL "https://ftp.postgresql.org/pub/source/v${PG_VERSION}/postgresql-${PG_VERSION}.tar.bz2" \
+        -o /tmp/pg.tar.bz2; \
+    mkdir -p /tmp/pgsrc; \
+    tar -xjf /tmp/pg.tar.bz2 -C /tmp/pgsrc --strip-components=1; \
+    cd /tmp/pgsrc; \
+    ./configure \
+        --prefix=/usr/local/pgsql \
+        --enable-cassert \
+        --enable-debug \
+        --enable-tap-tests \
+        --with-openssl \
+        --with-icu \
+        CFLAGS="-O1 -g -fno-omit-frame-pointer"; \
+    make -j"$(nproc)" world-bin >/dev/null; \
+    make install-world-bin >/dev/null; \
+    cd /; rm -rf /tmp/pgsrc /tmp/pg.tar.bz2
+
+# libvalkey, pinned exactly as the default image pins it.
+RUN set -eux; \
+    git clone --depth 1 --branch "${LIBVALKEY_REF}" \
+        https://github.com/valkey-io/libvalkey.git /tmp/libvalkey; \
+    cmake -S /tmp/libvalkey -B /tmp/libvalkey/build \
+        -DCMAKE_BUILD_TYPE=Release -DENABLE_TLS=ON -DDISABLE_TESTS=ON >/dev/null; \
+    cmake --build /tmp/libvalkey/build -j"$(nproc)" >/dev/null; \
+    cmake --install /tmp/libvalkey/build >/dev/null; \
+    ldconfig; \
+    rm -rf /tmp/libvalkey
+
+# Symlinked into a directory a login shell always has on PATH. run_in_build
+# uses `bash -lc`, which sources /etc/profile and rebuilds PATH - so the ENV
+# above survives for the entrypoint but not for the make that follows it. The
+# default image never hit this because its binaries are already on the
+# profile's PATH.
+RUN set -eux; \
+    for b in pg_config pg_ctl initdb psql postgres pg_isolation_regress; do \
+        p=$(find /usr/local/pgsql -name "$b" -type f -perm -u+x | head -1); \
+        [ -n "$p" ] && ln -sf "$p" "/usr/local/bin/$b" || true; \
+    done
+
+RUN set -eux; \
+    groupadd -g "${GID}" vfdw || true; \
+    useradd -m -u "${UID}" -g "${GID}" -s /bin/bash vfdw || true; \
+    mkdir -p /pgdata /work; \
+    chown -R "${UID}:${GID}" /pgdata /work /usr/local/pgsql
+
+# redis-tools, for the fixtures that shell out to valkey-cli. Deliberately
+# the LAST apt layer rather than folded into the first: adding a package to
+# the layer above would invalidate the PostgreSQL source build behind it,
+# which is the expensive part of this image.
+#
+# Same package the default image uses, and for the same reason recorded
+# there - bookworm has no valkey-tools, and the wire protocol these fixtures
+# speak is the part the two implementations share.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends redis-tools; \
+    rm -rf /var/lib/apt/lists/*; \
+    ln -sf /usr/bin/redis-cli /usr/local/bin/valkey-cli
+
+COPY docker/build-entrypoint.sh /usr/local/bin/entrypoint
+RUN chmod +x /usr/local/bin/entrypoint
+
+USER "${UID}:${GID}"
+WORKDIR /work
+ENTRYPOINT ["/usr/local/bin/entrypoint"]
+CMD ["bash"]
+
+# Stamped so the harness can tell whether this image still matches the files
+# it was built from. Last, so it invalidates no layer above it.
+ARG VFDW_SRC_SHA=unstamped
+LABEL vfdw.src_sha=$VFDW_SRC_SHA

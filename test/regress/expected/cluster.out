@@ -1,0 +1,783 @@
+-- Slot discovery: which node owns which of the 16384 hash slots.
+--
+-- Phase 4 slice 1. Nothing routes yet - the scan and write paths still refuse
+-- a cluster - so what is asserted here is the map itself and the arithmetic
+-- under it.
+--
+-- ROUTING HAS NO OUTPUT OF ITS OWN, which is what makes this suite easy to
+-- get wrong. A correctly routed command and a misrouted one both come back
+-- with an answer; the misrouted one comes back with someone else's. So the
+-- assertions below are built so that a wrong map produces an ERROR rather
+-- than a plausible row: the server says MOVED when asked about a key it does
+-- not own, and that is the only witness here that does not come from us.
+CREATE SERVER cl FOREIGN DATA WRAPPER valkey_fdw
+    OPTIONS (host 'valkey', port '6379', cluster 'true');
+CREATE USER MAPPING FOR CURRENT_USER SERVER cl;
+-- Node names carry the container's IP, which Docker reassigns on every
+-- topology restart, so the chatter is suppressed here and only counts are
+-- ever recorded.
+SET client_min_messages = warning;
+-- ---------------------------------------------------------------------------
+-- The FIRST map call in this backend has to load one.
+--
+-- Nothing above has asked for the map, so the cache entry for this (server,
+-- user) is being created by this call and the load is what fills it. A
+-- covered map here is the load having run, rather than an entry mistaken for
+-- one that was already loaded.
+--
+-- IT EXERCISES THAT PATH, IT DOES NOT PROVE IT. An entry whose fields were
+-- never initialised holds whatever its allocation last held, and on this path
+-- those bytes are zero - so this stays green whether the entry is initialised
+-- or not, and no expected output could make it do otherwise. What makes the
+-- class unrepeatable is the HASH_ENTER rule in scripts/lint.sh, which is
+-- mechanical and cannot be quietly satisfied by a zeroed heap.
+-- ---------------------------------------------------------------------------
+SELECT sum(slot_end - slot_start + 1) = 16384 AS first_map_call_covers_the_space
+FROM valkey_fdw_test_cluster_map('cl');
+ first_map_call_covers_the_space 
+---------------------------------
+ t
+(1 row)
+
+CREATE FUNCTION cl_node_server(h text, p int) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE n text := format('cl_node_%s_%s', replace(h, '.', '_'), p);
+BEGIN
+    EXECUTE format('CREATE SERVER IF NOT EXISTS %I FOREIGN DATA WRAPPER '
+                   'valkey_fdw OPTIONS (host %L, port %L)', n, h, p::text);
+    EXECUTE format('CREATE USER MAPPING IF NOT EXISTS FOR CURRENT_USER '
+                   'SERVER %I', n);
+    RETURN n;
+END $$;
+-- A CLUSTER IS NOT CLEARED BY FLUSHALL ON ONE NODE, and the harness sends it
+-- to one. So this file cleared nothing between runs, the keyspace
+-- accumulated, and the recorded expected output baked in a key that a
+-- PREVIOUS run had left behind - the count was right only for the second run
+-- onward. Clearing every primary here is what makes the suite depend on
+-- nothing but itself.
+SELECT count(*) AS primaries_cleared FROM (
+    SELECT valkey_fdw_test_probe(cl_node_server(host, port), 0, 'FLUSHALL')
+    FROM (SELECT DISTINCT host, port FROM valkey_fdw_test_cluster_map('cl')) n
+) f;
+ primaries_cleared 
+-------------------
+                 3
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- The map covers the space.
+--
+-- A cluster with a gap is a cluster that answers CLUSTERDOWN for some keys,
+-- so the covered count is the first thing worth knowing. It is asserted as a
+-- total rather than printed as ranges: the range boundaries depend on how
+-- valkey-cli chose to divide the slots and would make this file a change
+-- detector for a decision that is not ours.
+-- ---------------------------------------------------------------------------
+SELECT sum(slot_end - slot_start + 1) AS slots_covered,
+       count(*)                       AS ranges,
+       count(DISTINCT (host, port))   AS primaries
+FROM valkey_fdw_test_cluster_map('cl');
+ slots_covered | ranges | primaries 
+---------------+--------+-----------
+         16384 |      3 |         3
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- Our slot arithmetic agrees with the server's.
+--
+-- vfdw_val_slot is already pinned against the published CRC-16 check value,
+-- which fixes the polynomial and the three other parameters. What that cannot
+-- catch is a disagreement about what gets HASHED - the hash-tag rule, and
+-- whether the tag is taken from the first '{' to the first following '}'. So
+-- the comparison is against CLUSTER KEYSLOT, computed by the server on the
+-- same bytes.
+--
+-- The keys include an untagged one, two sharing a tag, an empty tag (which
+-- hashes the whole key, tag included), and a NUL, because a key is bytes.
+-- ---------------------------------------------------------------------------
+CREATE TEMP TABLE cl_keys(k bytea);
+INSERT INTO cl_keys VALUES
+    ('plain'), ('{tag}a'), ('{tag}b'), ('{}empty'), ('a{}b'),
+    ('x'), ('user:1000:profile'), (E'nul\\000key'::bytea), ('{a}{b}c');
+SELECT count(*) AS keys_where_we_disagree_with_the_server
+FROM cl_keys
+WHERE valkey_fdw_test_keyslot(k)
+      <> (SELECT num FROM valkey_fdw_test_probe('cl', 0, 'CLUSTER',
+                                                'KEYSLOT', k));
+ keys_where_we_disagree_with_the_server 
+----------------------------------------
+                                      0
+(1 row)
+
+-- Non-vacuous: the comparison above ran against every row.
+SELECT count(*) AS keys_compared FROM cl_keys;
+ keys_compared 
+---------------
+             9
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- Keys sharing a hash tag share a slot, and therefore a node.
+--
+-- This is the property the whole cluster design rests on, and it is what a
+-- user will be told to use when a cross-slot transaction is refused. If it
+-- did not hold, that advice would be wrong.
+-- ---------------------------------------------------------------------------
+SELECT count(DISTINCT slot) AS slots_for_one_tag,
+       count(DISTINCT (host, port)) AS nodes_for_one_tag
+FROM (SELECT (valkey_fdw_test_cluster_route('cl', k)).*
+      FROM (VALUES ('{tag}a'::bytea), ('{tag}b'), ('{tag}c'),
+                   ('{tag}'), ('prefix{tag}suffix')) v(k)) r;
+ slots_for_one_tag | nodes_for_one_tag 
+-------------------+-------------------
+                 1 |                 1
+(1 row)
+
+-- And different tags do NOT all land on one node, or the assertion above
+-- would hold trivially on a one-node cluster and prove nothing.
+SELECT count(DISTINCT (host, port)) > 1 AS tags_spread_across_nodes
+FROM (SELECT (valkey_fdw_test_cluster_route('cl', ('{t' || i || '}k')::bytea)).*
+      FROM generate_series(1, 50) i) r;
+ tags_spread_across_nodes 
+--------------------------
+ t
+(1 row)
+
+-- Every key we route has an owner: no slot in a healthy cluster is unclaimed.
+SELECT count(*) AS keys_with_no_owner
+FROM (SELECT (valkey_fdw_test_cluster_route('cl', k)).* FROM cl_keys) r
+WHERE host IS NULL;
+ keys_with_no_owner 
+--------------------
+                  0
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- THE ASSERTION THAT IS NOT OURS: the routed node accepts the key.
+--
+-- Everything above compares our map against our arithmetic, or against a
+-- single server command. This writes each key AT THE NODE WE ROUTED IT TO,
+-- through a server built from the map's own answer. A node that does not own
+-- the slot replies MOVED, which arrives as an error and fails this suite.
+--
+-- So a map that is subtly wrong - an off-by-one range boundary, endpoint and
+-- port taken from different nodes of a shard, a replica mistaken for a
+-- primary - cannot pass here, and those are exactly the mistakes that a
+-- comparison against our own arithmetic would wave through.
+-- ---------------------------------------------------------------------------
+CREATE FUNCTION cl_write_at_routed_node(key bytea) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+    r record;
+    n bigint;
+BEGIN
+    SELECT * INTO r FROM valkey_fdw_test_cluster_route('cl', key);
+    IF r.host IS NULL THEN
+        RETURN 'no owner';
+    END IF;
+
+    -- A server per node, reached directly and NOT in cluster mode: the point
+    -- is to talk to that one node and see whether it accepts the key, which
+    -- is precisely what a cluster-mode client would hide by following the
+    -- redirect.
+    EXECUTE format(
+        'CREATE SERVER IF NOT EXISTS cl_node_%s_%s FOREIGN DATA WRAPPER valkey_fdw '
+        'OPTIONS (host %L, port %L)',
+        replace(r.host, '.', '_'), r.port, r.host, r.port::text);
+    EXECUTE format(
+        'CREATE USER MAPPING IF NOT EXISTS FOR CURRENT_USER SERVER cl_node_%s_%s',
+        replace(r.host, '.', '_'), r.port);
+
+    EXECUTE format('SELECT valkey_fdw_test_poke(%L, %L::bytea, %L::bytea)',
+                   format('cl_node_%s_%s', replace(r.host, '.', '_'), r.port),
+                   key, 'v')
+        INTO n;
+    RETURN 'accepted';
+END $$;
+SELECT count(*) FILTER (WHERE v = 'accepted') AS accepted_by_the_routed_node,
+       count(*) FILTER (WHERE v <> 'accepted') AS not_accepted
+FROM (SELECT cl_write_at_routed_node(k) AS v FROM cl_keys) w;
+ accepted_by_the_routed_node | not_accepted 
+-----------------------------+--------------
+                           9 |            0
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- Slice 2: a pooled connection per node.
+--
+-- THE ID IS THE ASSERTION, not the reachability. A pool that ignored the node
+-- it was asked for and handed back the seed connection every time would
+-- report every primary reachable while only ever talking to one server - and
+-- three "reachable" rows would look exactly like success. CLUSTER MYID is
+-- what the node says about ITSELF, so three distinct ids are three distinct
+-- peers and no amount of pooling confusion can fabricate them.
+-- ---------------------------------------------------------------------------
+SELECT count(*)                  AS nodes_reached,
+       count(*) FILTER (WHERE reachable) AS reachable,
+       count(DISTINCT myself)    AS distinct_node_ids
+FROM valkey_fdw_test_cluster_nodes('cl');
+ nodes_reached | reachable | distinct_node_ids 
+---------------+-----------+-------------------
+             3 |         3 |                 3
+(1 row)
+
+-- Each id belongs to the node that reported it: asking a node for its own id
+-- twice must not answer with its neighbour's.
+SELECT count(*) AS nodes_whose_id_changed_between_calls
+FROM valkey_fdw_test_cluster_nodes('cl') a
+JOIN valkey_fdw_test_cluster_nodes('cl') b USING (host, port)
+WHERE a.myself <> b.myself;
+ nodes_whose_id_changed_between_calls 
+--------------------------------------
+                                    0
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- The per-node connections are POOLED, not reopened.
+--
+-- Reconnecting per statement is what this wrapper's pool exists to avoid,
+-- and a cluster multiplies the cost by the number of primaries.
+-- opened_total counts connect() calls since backend start, so a second pass
+-- over the same nodes must add none.
+-- ---------------------------------------------------------------------------
+SELECT count(*) > 0 AS warmed FROM valkey_fdw_test_cluster_nodes('cl');
+ warmed 
+--------
+ t
+(1 row)
+
+SELECT opened_total AS cl_opened FROM valkey_fdw_test_pool_stats() \gset
+SELECT count(*) > 0 AS second_pass FROM valkey_fdw_test_cluster_nodes('cl');
+ second_pass 
+-------------
+ t
+(1 row)
+
+SELECT opened_total - :cl_opened AS connects_added_by_a_second_pass
+FROM valkey_fdw_test_pool_stats();
+ connects_added_by_a_second_pass 
+---------------------------------
+                               0
+(1 row)
+
+-- And nothing is left leased: every node connection was given back.
+SELECT leased AS leased_after_visiting_every_node
+FROM valkey_fdw_test_pool_stats();
+ leased_after_visiting_every_node 
+----------------------------------
+                                0
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- Slice 3: A SCAN VISITS EVERY PRIMARY.
+--
+-- SCAN is per node, so a scan that stops when its cursor reaches 0 returns
+-- whichever share of the keyspace it happened to start on - roughly a third
+-- here, with no error and no clue. That is invariant I5 in its cluster form:
+-- an exhausted node is not an exhausted scan, and it is the single most
+-- dangerous bug available in this slice because the wrong answer is entirely
+-- plausible.
+--
+-- The keys below carry sixty different hash tags so they scatter across all
+-- three primaries. Both halves are asserted: that they really are scattered,
+-- which is what makes the test non-vacuous, and that one scan returns every
+-- one of them.
+-- ---------------------------------------------------------------------------
+CREATE FOREIGN TABLE cl_t (k text OPTIONS (key 'true'), v text)
+    SERVER cl OPTIONS (tabletype 'string', keyprefix 'cl:');
+-- Seeded at each key's own node, because a node refuses a key it does not own.
+SELECT count(*) FILTER (WHERE v = 'accepted') AS seeded
+FROM (SELECT cl_write_at_routed_node(('cl:{t' || i || '}k')::bytea) AS v
+      FROM generate_series(1, 60) i) w;
+ seeded 
+--------
+     60
+(1 row)
+
+-- NON-VACUOUS: the fixtures really do span more than one primary. On a
+-- one-node cluster everything below would pass without fanning out at all.
+SELECT count(DISTINCT (host, port)) AS primaries_holding_fixtures
+FROM (SELECT (valkey_fdw_test_cluster_route('cl', ('cl:{t' || i || '}k')::bytea)).*
+      FROM generate_series(1, 60) i) r;
+ primaries_holding_fixtures 
+----------------------------
+                          3
+(1 row)
+
+-- THE ASSERTION. Sixty seeded, sixty returned. A scan that ended at the first
+-- exhausted cursor returns about twenty.
+SELECT count(*) AS rows_from_one_scan FROM cl_t;
+ rows_from_one_scan 
+--------------------
+                 60
+(1 row)
+
+-- Every individual key, not merely the right count: a fan-out that visited
+-- one node three times would also count sixty.
+SELECT count(*) AS seeded_keys_missing_from_the_scan
+FROM generate_series(1, 60) i
+WHERE NOT EXISTS (SELECT 1 FROM cl_t WHERE k = 'cl:{t' || i || '}k');
+ seeded_keys_missing_from_the_scan 
+-----------------------------------
+                                 0
+(1 row)
+
+-- Which access path a keyed qual actually takes. Printed rather than assumed:
+-- the first version of the assertion below was green with the node
+-- partitioning INVERTED, which can only mean it never reached that code.
+EXPLAIN (COSTS OFF) SELECT v FROM cl_t WHERE k = 'cl:{t7}k';
+            QUERY PLAN            
+----------------------------------
+ Foreign Scan on cl_t
+   Filter: (k = 'cl:{t7}k'::text)
+   Valkey Strategy: Key Lookup
+   Valkey Keys: 1
+(4 rows)
+
+-- A keyed lookup finds its key wherever it lives. The plan names the keys, so
+-- this takes the other page loop - the one where a node owning none of them
+-- must advance rather than end the scan.
+--
+-- THE KEYS MUST BE LITERAL. Written as 'cl:{t' || i || '}k' over a series,
+-- they are computed per row, cannot be pushed down at plan time, and the
+-- query silently takes the keyspace fan-out instead - which is why the first
+-- version of this assertion stayed green with the node partitioning inverted.
+-- It was testing the path above twice over.
+SELECT count(*) AS keyed_lookups_that_found_their_key FROM cl_t
+WHERE k IN ('cl:{t1}k', 'cl:{t2}k', 'cl:{t3}k', 'cl:{t5}k', 'cl:{t8}k',
+            'cl:{t13}k', 'cl:{t21}k', 'cl:{t34}k', 'cl:{t55}k');
+ keyed_lookups_that_found_their_key 
+------------------------------------
+                                  9
+(1 row)
+
+-- Non-vacuous in the same way as above: those nine literals really do live on
+-- more than one primary, so a keyed lookup that only ever asked the node it
+-- started on could not find them all.
+SELECT count(DISTINCT (host, port)) AS primaries_holding_those_nine
+FROM (SELECT (valkey_fdw_test_cluster_route('cl', k)).*
+      FROM (VALUES ('cl:{t1}k'::bytea), ('cl:{t2}k'), ('cl:{t3}k'),
+                   ('cl:{t5}k'), ('cl:{t8}k'), ('cl:{t13}k'),
+                   ('cl:{t21}k'), ('cl:{t34}k'), ('cl:{t55}k')) v(k)) r;
+ primaries_holding_those_nine 
+------------------------------
+                            3
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- Slice 4: a slot that MOVES under a running map.
+--
+-- A redirect arrives as an ordinary ERROR reply, and the scan's rule for an
+-- error on a value fetch was "the key vanished or holds another type - skip
+-- it". That is right for WRONGTYPE and catastrophic for MOVED: the row is
+-- not absent, it is elsewhere, so skipping it LOSES DATA AND REPORTS
+-- NOTHING. This is the only place in the suite where that can be shown, and
+-- it needs a genuine migration - no proxy or fixture can fake ownership.
+--
+-- The slot is migrated for real and then migrated back, so the topology this
+-- file starts from is the topology it leaves behind.
+-- ---------------------------------------------------------------------------
+-- Move one slot from its current owner to another primary, keys and all.
+--
+-- The full four-step dance rather than a shortcut: IMPORTING on the
+-- destination and MIGRATING on the source open the window in which the source
+-- answers ASK for keys it has already handed over, and only SETSLOT ... NODE
+-- on both makes the ownership - and therefore the MOVED - permanent.
+CREATE FUNCTION cl_migrate_slot(slot int, from_h text, from_p int,
+                                to_h text, to_p int,
+                                k_probe bytea) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    src text := cl_node_server(from_h, from_p);
+    dst text := cl_node_server(to_h, to_p);
+    -- bytea, not text: the probe is variadic bytea, and a text argument
+    -- neither resolves nor survives - val_part rendered into text would be
+    -- its hex escape rather than the node id.
+    src_id bytea;
+    dst_id bytea;
+    k bytea;
+    lagging int;
+BEGIN
+    SELECT val_part INTO src_id
+      FROM valkey_fdw_test_probe(src, 0, 'CLUSTER', 'MYID');
+    SELECT val_part INTO dst_id
+      FROM valkey_fdw_test_probe(dst, 0, 'CLUSTER', 'MYID');
+
+    PERFORM valkey_fdw_test_probe(dst, 0, 'CLUSTER', 'SETSLOT',
+                                  slot::text::bytea, 'IMPORTING', src_id);
+    PERFORM valkey_fdw_test_probe(src, 0, 'CLUSTER', 'SETSLOT',
+                                  slot::text::bytea, 'MIGRATING', dst_id);
+
+    -- coalesce because a scalar reply and an ARRAY ELEMENT do not land in
+    -- the same column: GETKEYSINSLOT answers with an array, and reading only
+    -- val_part yields NULLs that the probe then refuses as arguments.
+    FOR k IN SELECT coalesce(key_part, val_part)
+             FROM valkey_fdw_test_probe(
+                 src, 0, 'CLUSTER', 'GETKEYSINSLOT',
+                 slot::text::bytea, '1000')
+             -- An aggregate reply describes ITSELF in a row before its
+             -- elements, and that row carries no bytes. Taken as a key it is
+             -- a NULL argument, which the probe rightly refuses.
+             WHERE coalesce(key_part, val_part) IS NOT NULL
+    LOOP
+        PERFORM valkey_fdw_test_probe(src, 0, 'MIGRATE', to_h::bytea,
+                                      to_p::text::bytea, k, '0', '5000');
+    END LOOP;
+
+    PERFORM valkey_fdw_test_probe(dst, 0, 'CLUSTER', 'SETSLOT',
+                                  slot::text::bytea, 'NODE', dst_id);
+    PERFORM valkey_fdw_test_probe(src, 0, 'CLUSTER', 'SETSLOT',
+                                  slot::text::bytea, 'NODE', dst_id);
+
+    -- A MIGRATION IS NOT A SINGLE EVENT. SETSLOT tells two nodes; every other
+    -- primary learns by gossip, and the node this suite's map is reloaded FROM
+    -- is not necessarily either of them. Until it has learned, a refreshed map
+    -- names the old owner again, so a scan chasing the redirect spends its
+    -- whole budget on a cluster that is merely converging and gives up.
+    --
+    -- That is a real failure and the wrapper now reports it rather than
+    -- returning a short result, which is exactly why this fixture must stop
+    -- producing it by accident: without the wait the keyed lookup below failed
+    -- on about one cluster formation in six, and the suite was a coin toss
+    -- that occasionally told the truth.
+    --
+    -- EVERY PRIMARY, not just the seed. The retry pass reloads the map
+    -- through the scan's own connection, and by then the fan-out has attached
+    -- that connection to whichever node it was last asking - so the reload can
+    -- come from any primary in the cluster, and one that has not yet learned
+    -- hands back a map naming the old owner. Waiting on the seed alone left
+    -- the race exactly where it was, which one run in five demonstrated.
+    --
+    -- An error reply arrives as data from this probe, which is what makes the
+    -- MOVED readable at all. A node that owns the slot answers with the value
+    -- instead, and that is equally converged.
+    FOR i IN 1..200 LOOP
+        SELECT count(*) INTO lagging
+        FROM (SELECT DISTINCT host, port
+              FROM valkey_fdw_test_cluster_map('cl')) n
+        WHERE (SELECT convert_from(val_part, 'UTF8')
+               FROM valkey_fdw_test_probe(cl_node_server(n.host, n.port), 0,
+                                          'GET', k_probe)
+               LIMIT 1) LIKE 'MOVED%'
+          AND strpos((SELECT convert_from(val_part, 'UTF8')
+                      FROM valkey_fdw_test_probe(cl_node_server(n.host, n.port), 0,
+                                                 'GET', k_probe)
+                      LIMIT 1),
+                     from_h || ':' || from_p::text) > 0;
+
+        EXIT WHEN lagging = 0;
+        PERFORM pg_sleep(0.05);
+    END LOOP;
+END $$;
+-- Open a migration window and move one key through it, WITHOUT handing over
+-- the slot. The source keeps the slot and answers ASK for the key it no
+-- longer holds, which is the state a client cannot resolve by refreshing.
+CREATE FUNCTION cl_hold_open_ask(slot int, from_h text, from_p int,
+                                 to_h text, to_p int,
+                                 k_probe bytea) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+    src text := cl_node_server(from_h, from_p);
+    dst text := cl_node_server(to_h, to_p);
+    src_id bytea;
+    dst_id bytea;
+BEGIN
+    SELECT val_part INTO src_id FROM valkey_fdw_test_probe(src, 0, 'CLUSTER', 'MYID');
+    SELECT val_part INTO dst_id FROM valkey_fdw_test_probe(dst, 0, 'CLUSTER', 'MYID');
+
+    PERFORM valkey_fdw_test_probe(dst, 0, 'CLUSTER', 'SETSLOT',
+                                  slot::text::bytea, 'IMPORTING', src_id);
+    PERFORM valkey_fdw_test_probe(src, 0, 'CLUSTER', 'SETSLOT',
+                                  slot::text::bytea, 'MIGRATING', dst_id);
+    PERFORM valkey_fdw_test_probe(src, 0, 'MIGRATE', to_h::bytea,
+                                  to_p::text::bytea, k_probe, '0', '5000');
+    RETURN 'open';
+END $$;
+-- Closing the window means putting the KEY back too, not just clearing the
+-- flags. STABLE leaves ownership where it started, so a key still sitting on
+-- the importing node is one no owner accounts for: the fan-out would find it
+-- by SCAN on a node whose slot map says it belongs elsewhere, and every later
+-- count in this file would be off by one for a reason nothing states.
+CREATE FUNCTION cl_close_ask(slot int, from_h text, from_p int,
+                             to_h text, to_p int,
+                             k_probe bytea) RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM valkey_fdw_test_probe(cl_node_server(to_h, to_p), 0, 'MIGRATE',
+                                  from_h::bytea, from_p::text::bytea,
+                                  k_probe, '0', '5000');
+    PERFORM valkey_fdw_test_probe(cl_node_server(from_h, from_p), 0,
+                                  'CLUSTER', 'SETSLOT',
+                                  slot::text::bytea, 'STABLE');
+    PERFORM valkey_fdw_test_probe(cl_node_server(to_h, to_p), 0,
+                                  'CLUSTER', 'SETSLOT',
+                                  slot::text::bytea, 'STABLE');
+    RETURN 'closed';
+END $$;
+-- The key to move, and where it lives before and after.
+SELECT cl_write_at_routed_node('cl:{mig}k'::bytea) AS seeded_the_mover;
+ seeded_the_mover 
+------------------
+ accepted
+(1 row)
+
+SELECT slot AS mig_slot, host AS mig_from_h, port AS mig_from_p
+FROM valkey_fdw_test_cluster_route('cl', 'cl:{mig}k') \gset
+-- Some other primary; which one does not matter, only that it is not the
+-- current owner.
+SELECT host AS mig_to_h, port AS mig_to_p
+FROM valkey_fdw_test_cluster_map('cl')
+WHERE (host, port) <> (:'mig_from_h', :mig_from_p)
+LIMIT 1 \gset
+SELECT cl_migrate_slot(:mig_slot, :'mig_from_h', :mig_from_p,
+                       :'mig_to_h', :mig_to_p, 'cl:{mig}k');
+ cl_migrate_slot 
+-----------------
+ 
+(1 row)
+
+-- OUR MAP IS NOW STALE, and deliberately not refreshed: it still names the
+-- old owner. That is invariant I8 - the map is a cache and the server is the
+-- authority - and it is the state a real resharding puts every client into.
+SELECT host = :'mig_from_h' AND port = :mig_from_p AS map_still_says_the_old_owner
+FROM valkey_fdw_test_cluster_route('cl', 'cl:{mig}k');
+ map_still_says_the_old_owner 
+------------------------------
+ t
+(1 row)
+
+-- THE ASSERTION. The key is found anyway: the redirect is noticed, the map is
+-- refreshed, and the key is fetched from its new owner. Before redirects were
+-- separated from skippable errors this returned ZERO ROWS and no error.
+SELECT count(*) AS migrated_key_still_found
+FROM cl_t WHERE k = 'cl:{mig}k';
+ migrated_key_still_found 
+--------------------------
+                        1
+(1 row)
+
+-- And the map has caught up on its own, without anyone asking it to.
+SELECT host = :'mig_to_h' AND port = :mig_to_p AS map_caught_up
+FROM valkey_fdw_test_cluster_route('cl', 'cl:{mig}k');
+ map_caught_up 
+---------------
+ t
+(1 row)
+
+-- A full scan still returns everything, including the key that moved.
+SELECT count(*) AS rows_after_the_migration FROM cl_t;
+ rows_after_the_migration 
+--------------------------
+                       61
+(1 row)
+
+-- Put the slot back, so this file leaves the cluster as it found it.
+SELECT cl_migrate_slot(:mig_slot, :'mig_to_h', :mig_to_p,
+                       :'mig_from_h', :mig_from_p, 'cl:{mig}k');
+ cl_migrate_slot 
+-----------------
+ 
+(1 row)
+
+-- THE KEYED LOOKUP IS REPEATED AFTER MIGRATING BACK, and that is not
+-- symmetry for its own sake. Routing off the live map mid-pass duplicates a
+-- row only when the NEW owner comes after the old one in the node list: the
+-- key matches the stale owner, is redirected, the map refreshes, and a later
+-- node then claims it again in the same pass. With the owners swapped the
+-- reverse migration has the opposite ordering, so between the two of them one
+-- must be the vulnerable direction whichever way the server lists its shards.
+-- Asserted once only, this was green with the snapshot removed.
+SELECT count(*) AS migrated_key_found_once_after_moving_back
+FROM cl_t WHERE k = 'cl:{mig}k';
+ migrated_key_found_once_after_moving_back 
+-------------------------------------------
+                                         1
+(1 row)
+
+SELECT count(*) AS rows_after_migrating_back FROM cl_t;
+ rows_after_migrating_back 
+---------------------------
+                        61
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- A REDIRECT THAT NEVER RESOLVES IS AN ERROR, NOT AN EMPTY ANSWER.
+--
+-- The chase is bounded, because two nodes mid-migration can point at each
+-- other and an unbounded one is a hang rather than a diagnosis. What the
+-- bound must not do is end the scan quietly: the keys still owed a fetch are
+-- rows the query asked for, and returning without them and without a word is
+-- invariant I5 run backwards - the same H2 shape as a truncating cursor,
+-- reached through the slot map.
+--
+-- It is reachable on purpose here rather than left to a resharding window. A
+-- slot left MIGRATING with the key already moved is a legitimate, stable
+-- cluster state: the source owns the slot, does not hold the key, and answers
+-- ASK for it forever. ASK deliberately does NOT refresh the map - one key
+-- having moved says nothing about ownership - so every pass routes to the
+-- same node and gets the same answer, and the budget runs out every time.
+-- ---------------------------------------------------------------------------
+SELECT slot AS ask_slot, host AS ask_from_h, port AS ask_from_p
+FROM valkey_fdw_test_cluster_route('cl', 'cl:{ask}k') \gset
+SELECT host AS ask_to_h, port AS ask_to_p
+FROM valkey_fdw_test_cluster_map('cl')
+WHERE (host, port) <> (:'ask_from_h', :ask_from_p)
+LIMIT 1 \gset
+SELECT cl_write_at_routed_node('cl:{ask}k'::bytea) AS seeded_the_asker;
+ seeded_the_asker 
+------------------
+ accepted
+(1 row)
+
+-- Open the window and move the key, but never SETSLOT ... NODE. Ownership
+-- stays where it was; only this one key is elsewhere.
+SELECT cl_hold_open_ask(:ask_slot, :'ask_from_h', :ask_from_p,
+                        :'ask_to_h', :ask_to_p, 'cl:{ask}k') AS window_open;
+ window_open 
+-------------
+ open
+(1 row)
+
+SELECT count(*) FROM cl_t WHERE k = 'cl:{ask}k';
+ERROR:  gave up following Valkey Cluster redirects for 1 key(s)
+DETAIL:  The slot map was refreshed and the same keys were redirected again on every attempt, which is what a cluster still agreeing about a slot looks like from one client.
+HINT:  Retry the statement. If it persists, the cluster is not converging: check CLUSTER INFO on every primary.
+\echo unresolved redirect sqlstate: :SQLSTATE
+unresolved redirect sqlstate: 40001
+-- A key in another slot is still readable, so what failed was the chase for
+-- this one and not the scan as a machine.
+--
+-- A KEYED lookup, deliberately: a full scan visits every primary and would
+-- meet the unresolvable key itself, so it raises too. That is right - a scan
+-- that cannot fetch a row it discovered must not report the others as if they
+-- were all of them - but it makes a full scan the wrong instrument for asking
+-- whether anything else still works.
+SELECT count(*) AS other_key_still_readable FROM cl_t WHERE k = 'cl:{mig}k';
+ other_key_still_readable 
+--------------------------
+                        1
+(1 row)
+
+-- Close the window so the file leaves the cluster as it found it.
+SELECT cl_close_ask(:ask_slot, :'ask_from_h', :ask_from_p,
+                    :'ask_to_h', :ask_to_p, 'cl:{ask}k') AS window_closed;
+ window_closed 
+---------------
+ closed
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- Slice 5: WRITES, and the guarantee that could not survive a cluster.
+--
+-- A transaction's writes are applied by ONE Lua program on ONE connection at
+-- pre-commit, so Valkey applies all of them or none. A cluster breaks the
+-- premise: a single EVAL may only touch keys in one hash slot. So a
+-- cross-slot transaction cannot be one program.
+--
+-- THE CHOICE IS TO REFUSE rather than to split it across nodes. Splitting
+-- makes partial application a normal outcome - the one thing the write path
+-- works hardest to prevent - and a user who has not thought about slots
+-- should not discover that in production. The refusal is actionable, which is
+-- what makes it a design rather than a limitation: hash tags put related keys
+-- in one slot by construction.
+-- ---------------------------------------------------------------------------
+-- Single-slot writes work, and go to the node that owns the slot.
+BEGIN;
+INSERT INTO cl_t VALUES ('cl:{w}a', 'one');
+INSERT INTO cl_t VALUES ('cl:{w}b', 'two');
+COMMIT;
+SELECT count(*) AS single_slot_write_applied
+FROM cl_t WHERE k IN ('cl:{w}a', 'cl:{w}b');
+ single_slot_write_applied 
+---------------------------
+                         2
+(1 row)
+
+-- Those two really are one slot, so the pass above is not accidental.
+SELECT count(DISTINCT slot) AS slots_written_by_that_transaction
+FROM (SELECT (valkey_fdw_test_cluster_route('cl', k)).*
+      FROM (VALUES ('cl:{w}a'::bytea), ('cl:{w}b')) v(k)) r;
+ slots_written_by_that_transaction 
+-----------------------------------
+                                 1
+(1 row)
+
+-- A cross-slot transaction is refused, and the message says what to do.
+BEGIN;
+INSERT INTO cl_t VALUES ('cl:{p}a', 'one');
+INSERT INTO cl_t VALUES ('cl:{q}b', 'two');
+COMMIT;
+ERROR:  a transaction writing this Valkey Cluster spans more than one hash slot
+DETAIL:  Key (cl:{q}b) is in slot 11958, but this transaction already writes (cl:{p}a) in slot 16023.
+HINT:  A write is applied by one script on one node, so every key it touches must share a slot. Put related keys in the same slot with a hash tag - "{tenant}:orders" and "{tenant}:items" hash only the braced part - or write them in separate transactions.
+CONTEXT:  valkey_fdw pre-commit flush; no changes were applied in Valkey.
+\echo crossslot sqlstate: :SQLSTATE
+crossslot sqlstate: 0A000
+-- REFUSED WHOLE. Not "the first key landed and the second did not" - that is
+-- the partial application this refusal exists to prevent, and it is the only
+-- assertion here that would catch a check placed after the first write.
+SELECT count(*) AS keys_left_behind_by_the_refused_transaction
+FROM cl_t WHERE k IN ('cl:{p}a', 'cl:{q}b');
+ keys_left_behind_by_the_refused_transaction 
+---------------------------------------------
+                                           0
+(1 row)
+
+-- The two really are in different slots.
+SELECT count(DISTINCT slot) AS slots_that_transaction_would_have_spanned
+FROM (SELECT (valkey_fdw_test_cluster_route('cl', k)).*
+      FROM (VALUES ('cl:{p}a'::bytea), ('cl:{q}b')) v(k)) r;
+ slots_that_transaction_would_have_spanned 
+-------------------------------------------
+                                         2
+(1 row)
+
+-- The session is usable afterwards: a refusal is not a broken connection.
+BEGIN;
+INSERT INTO cl_t VALUES ('cl:{w}c', 'three');
+COMMIT;
+SELECT count(*) AS write_after_a_refusal FROM cl_t WHERE k = 'cl:{w}c';
+ write_after_a_refusal 
+-----------------------
+                     1
+(1 row)
+
+-- A DELETE is a write too, and takes the same route.
+BEGIN;
+DELETE FROM cl_t WHERE k = 'cl:{w}c';
+COMMIT;
+SELECT count(*) AS deleted FROM cl_t WHERE k = 'cl:{w}c';
+ deleted 
+---------
+       0
+(1 row)
+
+-- ROLLBACK still discards, on a cluster as anywhere.
+BEGIN;
+INSERT INTO cl_t VALUES ('cl:{w}d', 'four');
+ROLLBACK;
+SELECT count(*) AS rolled_back FROM cl_t WHERE k = 'cl:{w}d';
+ rolled_back 
+-------------
+           0
+(1 row)
+
+DROP FOREIGN TABLE cl_t;
+-- The per-node servers are named after addresses this suite does not choose,
+-- so they are dropped by pattern rather than by name.
+DO $$
+DECLARE s text;
+BEGIN
+    FOR s IN SELECT srvname FROM pg_foreign_server WHERE srvname LIKE 'cl\_node\_%'
+    LOOP
+        EXECUTE format('DROP SERVER %I CASCADE', s);
+    END LOOP;
+END $$;
+RESET client_min_messages;
+DROP FUNCTION cl_write_at_routed_node(bytea);
+DROP FUNCTION cl_migrate_slot(int, text, int, text, int, bytea);
+DROP FUNCTION cl_hold_open_ask(int, text, int, text, int, bytea);
+DROP FUNCTION cl_close_ask(int, text, int, text, int, bytea);
+DROP FUNCTION cl_node_server(text, int);
+DROP USER MAPPING FOR CURRENT_USER SERVER cl;
+DROP SERVER cl;
