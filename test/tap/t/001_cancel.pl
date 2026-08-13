@@ -313,6 +313,23 @@ my $cancel_other = q{
 # seconds" is true of a probe that ignored the cancel and simply ran fast, so
 # the uncancelled duration is measured first and the cancelled one must be a
 # fraction of it. That is the difference between interrupted and merely quick.
+#
+# TWO THINGS THE RELATIVE FORM STILL HAS TO GET RIGHT, and both concern the
+# pause before the signal rather than the probe.
+#
+# The pause is not part of what is measured. The probe is deliberately left to
+# run for a moment first, so timing from before that pause gives every
+# cancelled run a floor of the pause itself: the comparison then fails on any
+# machine fast enough to finish the whole probe in twice it, whatever the
+# wrapper did. What is timed here is the interval from the signal, which is
+# the only part the cancel is answerable for.
+#
+# The pause also has to leave work undone. One that consumes most of a fast
+# machine's run leaves so little afterwards that a probe ignoring the signal
+# finishes inside the same bound as one honouring it, and the assertion holds
+# either way while proving nothing. So it is a fraction of the measured full
+# run rather than a constant, floored only to be sure the probe has reached
+# the element loop at all.
 # ---------------------------------------------------------------------------
 {
     $node->safe_psql('postgres', q{
@@ -333,18 +350,22 @@ my $cancel_other = q{
     my $bg = $node->background_psql('postgres', on_error_stop => 0);
     $bg->query_safe("SELECT 1");
 
-    my $t1 = time();
-    $bg->query_until(qr/FIRED/, "\\echo FIRED\n$probe;\n");
-    select(undef, undef, undef, 0.3);
-    $node->safe_psql('postgres', $cancel_other);
+    my $settle = $full / 4;
+    $settle = 0.05 if $settle < 0.05;
 
+    $bg->query_until(qr/FIRED/, "\\echo FIRED\n$probe;\n");
+    select(undef, undef, undef, $settle);
+
+    my $t1 = time();
+    $node->safe_psql('postgres', $cancel_other);
     my $out = $bg->query("SELECT 'awake'");
-    my $cancelled = time() - $t1;
+    my $after_signal = time() - $t1;
 
     like($out, qr/awake/, 'session recovered after cancelling a probe');
-    cmp_ok($cancelled, '<', $full / 2,
-        "probe was interrupted rather than run to completion "
-        . "(${cancelled}s cancelled vs ${full}s full)");
+    cmp_ok($after_signal, '<', $full / 2,
+        "probe abandoned its remaining work when signalled "
+        . "(${after_signal}s after the signal, ${full}s uncancelled, "
+        . "signalled ${settle}s in)");
 
     $bg->quit;
     $node->safe_psql('postgres',

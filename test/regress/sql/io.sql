@@ -250,8 +250,22 @@ DROP FUNCTION io_reply_sqlstate(text, bytea);
 -- pipeline two orders of magnitude past the earlier ones completes, rather
 -- than ending at the command deadline.
 -- ---------------------------------------------------------------------------
-SET statement_timeout = '60s';
+-- Both deadlines have to move, and only one of them is PostgreSQL's.
+--
+-- statement_timeout bounds the statement; command_timeout_ms bounds the wait
+-- for one Valkey reply, and it is the one this vector is written against - so
+-- leaving it at its 30s default asserts the opposite of what the paragraph
+-- above claims, and does it only on machines slow enough to notice. Under the
+-- coverage build every command carries instrumentation, which is exactly such
+-- a machine.
+--
+-- The number is a ceiling and not a budget: nothing here is timing anything,
+-- and a run that needs two minutes has still proved that the pipeline drains
+-- rather than deadlocks.
+ALTER SERVER io_srv OPTIONS (ADD command_timeout_ms '300000');
+SET statement_timeout = '600s';
 SELECT valkey_fdw_test_pipeline('io_srv', 200000) = 200000 AS large_pipeline_completed;
+ALTER SERVER io_srv OPTIONS (DROP command_timeout_ms);
 RESET statement_timeout;
 
 DROP SERVER io_srv CASCADE;
