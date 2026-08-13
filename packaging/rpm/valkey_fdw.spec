@@ -75,8 +75,26 @@ cmake -S _libvalkey -B _libvalkey/build \
 cmake --build _libvalkey/build -j%{?_smp_build_ncpus}%{!?_smp_build_ncpus:4}
 cmake --install _libvalkey/build
 
+# with_llvm=no, and it is not a performance decision.
+#
+# PGXS emits an LLVM bitcode file beside every object when the server was
+# built --with-llvm, then links them with llvm-lto from the versioned path
+# that server was configured against - here /usr/lib64/llvm21/bin. Which LLVM
+# that is belongs to whoever built the PostgreSQL packages, and the matching
+# toolchain is not in any repository this image enables: postgresql17-llvmjit
+# on the same repo asks for libLLVM-17 and libLLVM.so.18.1, so the versions do
+# not even agree with each other. Emitting bitcode therefore fails at install
+# with a missing binary, a hundred lines after the last thing resembling a
+# compiler error, and it does so on a machine where nothing in this repository
+# changed.
+#
+# What is given up is JIT inlining of this module's functions into compiled
+# expressions. For a wrapper whose every interesting operation is a network
+# round trip, that is close to nothing. The Debian targets keep emitting it,
+# because there the toolchain is packaged and consistent.
 make %{?_smp_mflags} USE_PGXS=1 PG_CONFIG=%{pgpath}/bin/pg_config \
-     VALKEY_VENDORED=1 LIBVALKEY_DIR=%{_builddir}/libvalkey-prefix
+     VALKEY_VENDORED=1 LIBVALKEY_DIR=%{_builddir}/libvalkey-prefix \
+     with_llvm=no
 
 %install
 # check-rpaths counts the runpath PGXS bakes in as invalid, on EL 10 only.
@@ -93,7 +111,7 @@ make %{?_smp_mflags} USE_PGXS=1 PG_CONFIG=%{pgpath}/bin/pg_config \
 # symlinked path - and this package would still fail on them.
 export QA_RPATHS=$(( 0x0002 ))
 
-make install USE_PGXS=1 PG_CONFIG=%{pgpath}/bin/pg_config \
+make install with_llvm=no USE_PGXS=1 PG_CONFIG=%{pgpath}/bin/pg_config \
      VALKEY_VENDORED=1 LIBVALKEY_DIR=%{_builddir}/libvalkey-prefix \
      DESTDIR=%{buildroot}
 
@@ -118,11 +136,6 @@ rm -f %{buildroot}%{pgpath}/share/extension/valkey_fdw_test.control \
 %license LICENSE-libvalkey
 %doc README.md
 %{pgpath}/lib/valkey_fdw.so
-# LLVM bitcode for JIT inlining. PGXS emits it whenever the server was built
-# with --with-llvm, which every PGDG build is, and rpm fails on anything left
-# unpackaged - so it is listed rather than deleted. The Debian side picks it
-# up automatically.
-%{pgpath}/lib/bitcode/valkey_fdw*
 # One extension, named exactly. The glob in valkey_fdw--*.sql ranges over
 # VERSIONS and not over extension names, so this pair matches the wrapper and
 # every future upgrade script of its own without also matching valkey_fdw_test

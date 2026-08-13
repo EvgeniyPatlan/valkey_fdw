@@ -20,8 +20,18 @@ RUN set -eux; \
     # "PKG: unbound variable" - which is what actually failed here twice
     # while two rounds of repository guessing went looking for a dnf problem.
     if command -v dnf >/dev/null; then PKG=dnf; else PKG=yum; fi; \
+    # clang is named rather than inherited. PGXS emits LLVM bitcode beside
+    # every object whenever the server was built --with-llvm, which every
+    # PGDG build is, and it invokes /usr/bin/clang to do it - so a toolchain
+    # without clang fails at the first .bc with "No such file or directory"
+    # and an exit status of 127, a hundred lines after the last thing that
+    # looked like a compiler problem. It used to arrive as a dependency of
+    # the PostgreSQL development package and stopped, which turned a green
+    # matrix red with nothing in this repository having changed. A build
+    # input this repository depends on is named here or it is not depended
+    # on at all.
     $PKG install -y --allowerasing \
-        gcc gcc-c++ make cmake git tar rpm-build openssl-devel \
+        gcc gcc-c++ clang make cmake git tar rpm-build openssl-devel \
         redhat-rpm-config findutils which dnf-plugins-core || true; \
     if command -v amazon-linux-extras >/dev/null 2>&1 || grep -qi amazon /etc/os-release; then \
         $PKG install -y "postgresql${PG_MAJOR}-devel" "postgresql${PG_MAJOR}-server"; \
