@@ -41,8 +41,8 @@ including against a cluster. Vector search does not.
 | Writes | `INSERT`, `UPDATE`, `DELETE`, `COPY FROM` — one atomic unit per transaction |
 | Transport | TLS with hostname verification, ACL auth, RESP3 with a tested RESP2 fallback |
 | Cluster | slot discovery, per-node pooling, fan-out scans, `MOVED`/`ASK`, single-slot writes |
-| Accepted, then refused | `tabletype 'json'`, `legacy_value 'true'`, `ttl` columns and `distance` columns. The validator takes all four so a table can be defined ahead of the feature; the first query against such a table raises `0A000` |
-| Declared, not routed | `prefer_replica` marks a server a replica and refuses writes through it. It sends no read anywhere else. `cluster_nodes` is accepted and read by nothing — discovery asks the server the mapping already names |
+| Accepted, then refused | `legacy_value 'true'`, `ttl` columns and `distance` columns. The validator takes all three so a table can be defined ahead of the feature; the first query against such a table raises `0A000` |
+| Declared, not routed | `prefer_replica` marks a server a replica and refuses writes through it. It sends no read anywhere else |
 
 Three qualifications, stated once here rather than repeated below.
 
@@ -58,7 +58,7 @@ a query you may not run.** `search_index` and `index_type` stop one step short
 of that: they are accepted, they raise nothing, and nothing consults them — no
 qual reaches the index, and a table carrying one cannot be written. Between
 those two and a refused `distance` column, vector similarity search is absent
-rather than partial. No date is attached to it or to the other three.
+rather than partial. No date is attached to it or to the other two.
 
 **Every claim of working behaviour above is a suite rather than a sentence.**
 `harness.sh ci` runs those suites across three PostgreSQL majors, two Valkey
@@ -86,6 +86,23 @@ one round trip each, so network latency is paid per page instead of per row
 ![Read path sequence: the executor asks for a tuple; valkey_fdw issues SCAN with a cursor, MATCH prefix and COUNT, receives a cursor and up to n keys, then fetches those values in one pipelined batch bounded by pipeline_batch; each key is checked against the overlay before its tuple is returned. Cursor 0 ends the traversal, and on a cluster only after every primary has been visited.](img/read-path.png)
 
 <!-- Diagram source: img/read-path.mmd. Regenerate with ./scripts/diagrams.sh -->
+
+**A scan can return the same key twice, and this wrapper does not remove the
+second one.** `SCAN`'s contract is that a key present for the whole traversal
+is returned *at least* once, not exactly once: the cursor is a position in the
+server's own hash table rather than a snapshot of the keyspace, so a keyspace
+that grows or empties enough for the server to resize that table while the
+cursor is open can hand back a key it has already handed back. A scan keeps no
+set of the keys it has emitted, so what arrives twice is **two identical rows**
+— same key, same values.
+
+This is what `SCAN` is, rather than a deficiency being worked on. Filtering it
+here would mean a per-scan set of every key seen, unbounded in the size of the
+keyspace, to correct something a query can say for itself with `SELECT
+DISTINCT` or a `GROUP BY`. A `keyset` table traverses its set with `SSCAN` and
+has the same property. The reads that never traverse cannot duplicate at all:
+`WHERE key = 'literal'` is a single fetch, and a `singleton_key` table is one
+key.
 
 ### The write path
 
@@ -330,16 +347,31 @@ facts about the keyspace rather than about the statement: a key that already
 exists where one is being created (`23505`), and a key holding a different
 Valkey type than its table declares (`42804`).
 
-Four shapes are refused in both directions rather than only on write, at the
-first plan over the table and at `0A000`: `tabletype 'json'`, `legacy_value
-'true'`, a `ttl` column and a `distance` column. Those are the unimplemented
-shapes described under *Usage*, and the refusal is what stands in for them.
+Three shapes are refused in both directions rather than only on write, at the
+first plan over the table and at `0A000`: `legacy_value 'true'`, a `ttl` column
+and a `distance` column. Those are the unimplemented shapes described under
+*Usage*, and the refusal is what stands in for them.
 
 ## Requirements
 
 - PostgreSQL 16, 17 or 18
 - [libvalkey](https://github.com/valkey-io/libvalkey) 0.5.0+
-- Valkey 8.1+
+- Valkey 8.1+ **to write**. Reading uses ordinary commands, so a table can be
+  read from any server this client can speak to. Writing is one Lua program
+  applied with `EVALSHA`, so it needs a Valkey with `EVAL` available to it — a
+  managed tier that withholds scripting cannot run the write path however
+  faithfully it answers `GET`. Such a server is refused for writes up front
+  rather than left to fail at `COMMIT`, which is where a transaction that had
+  accepted every `INSERT` given to it would otherwise report a scripting error
+  and apply nothing.
+
+  Establishing that costs one `SCRIPT LOAD` when a connection is opened, on
+  every connection including one that only ever reads. A server that answers it
+  with an error is read-only from then on and nothing further is sent; the cost
+  is one round trip per pooled connection, not per statement. On a cluster the
+  answer is taken from the node the write is planned against, so a cluster whose
+  nodes disagree about scripting can still meet the refusal at `COMMIT` rather
+  than at `INSERT`
 - [valkey-search](https://github.com/valkey-io/valkey-search), only to run the
   recorded `vsearch` spike, which measures what that module answers. No query
   is pushed down to it
@@ -388,16 +420,16 @@ CREATE FOREIGN TABLE leaderboard (
   OPTIONS (tabletype 'zset', singleton_key 'scores:global');
 ```
 
-Four things in the option tables below may be written into a table definition
+Three things in the option tables below may be written into a table definition
 and cannot yet be queried. A legacy `(key text, value text[])` shape — one
 array column holding whatever the key contains, whatever its type — is planned
 under `legacy_value 'true'`, so that a table already written that way can be
-pointed here without being redefined column by column. `tabletype 'json'`, a
-`ttl` column and a `distance` column stand in the same place. **None of the
-four is implemented**: declaring one is accepted, and the first plan over it
-raises `0A000`, in either direction. They are accepted by the validator so that
-a table definition can be written ahead of the feature, which is the only
-reason they appear in the option tables at all.
+pointed here without being redefined column by column. A `ttl` column and a
+`distance` column stand in the same place. **None of the three is
+implemented**: declaring one is accepted, and the first plan over it raises
+`0A000`, in either direction. They are accepted by the validator so that a
+table definition can be written ahead of the feature, which is the only reason
+they appear in the option tables at all.
 
 `search_index` and `index_type` fail differently: they are accepted and simply
 not consulted. No qual reaches the index, and a write through a table carrying
@@ -425,7 +457,6 @@ rather than only in the error text.
 | `port` | integer | `6379` | Valkey TCP port | no |
 | `unix_socket_path` | string | — | Unix socket path; overrides host and port | no |
 | `cluster` | boolean | `false` | Treat the server as a Valkey Cluster | no |
-| `cluster_nodes` | string | — | Accepted and unused; discovery asks the configured server | no |
 | `prefer_replica` | boolean | `false` | Treat the server as a replica: writes through it are refused, no read is routed | no |
 | `tls` | boolean | `false` | Use TLS for the connection | no |
 | `tls_ca_file` | path | — | CA certificate bundle (absolute) | yes |
@@ -501,7 +532,7 @@ it on is not.
 | Option | Type | Default | Description | Superuser |
 |---|---|---|---|---|
 | `database` | integer | `0` | Logical database; not valid in cluster mode | no |
-| `tabletype` | enum | `string` | `string`, `hash`, `list`, `set`, `zset`, `json`; `json` is accepted and refused at plan time | no |
+| `tabletype` | enum | `string` | `string`, `hash`, `list`, `set` or `zset` | no |
 | `keyprefix` | string | — | Literal key prefix scoping the table | no |
 | `keyset` | string | — | Set holding the table's key names | no |
 | `singleton_key` | string | — | Draw all rows from this single key | no |
@@ -514,7 +545,7 @@ it on is not.
 | Option | Type | Default | Description | Superuser |
 |---|---|---|---|---|
 | `key` | boolean | `false` | Column holds the Valkey key name | no |
-| `field` | string | — | Hash field name, or JSON path | no |
+| `field` | string | — | Hash field name | no |
 | `member` | boolean | `false` | Column holds the list/set/zset member | no |
 | `score` | boolean | `false` | Column holds the zset score | no |
 | `ttl` | boolean | `false` | Column holds the paired field's time to live; accepted and refused at plan time | no |

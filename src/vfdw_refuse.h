@@ -42,6 +42,15 @@ extern void vfdw_refuse_on_conflict(const ModifyTable *plan);
 extern void vfdw_refuse_prefer_replica(const ForeignServer *server);
 
 /*
+ * A server whose refusal of the write program was recorded when the connection
+ * was opened. reason is the server's own bytes and is not NUL-terminated, so
+ * its length comes with it (I3); the definition says why the whole write path
+ * turns on one SCRIPT LOAD and why a read is left alone.
+ */
+extern void vfdw_refuse_no_write_program(const ForeignServer *server,
+										 const char *reason, size_t reasonlen);
+
+/*
  * A modify callback reached with no state. Unreachable: BeginForeignModify
  * sets one for plain DML, and BeginForeignInsert for COPY FROM and tuple
  * routing. It stays because the alternative to raising here is dereferencing

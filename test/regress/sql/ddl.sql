@@ -82,7 +82,7 @@ DROP SERVER vk;
 --
 -- The callback must never raise and never build the table map: the rewriter
 -- calls it for every foreign table it touches and information_schema.tables
--- calls it for every relation, so a map built here would refuse a json or
+-- calls it for every relation, so a map built here would refuse a
 -- legacy_value table and break an unrelated query rather than a write.
 -- ---------------------------------------------------------------------------
 CREATE SERVER w_srv FOREIGN DATA WRAPPER valkey_fdw
@@ -94,8 +94,6 @@ CREATE FOREIGN TABLE w_list (k text, m text OPTIONS (member 'true'))
     SERVER w_srv OPTIONS (tabletype 'list');
 CREATE FOREIGN TABLE w_readonly (k text, v text) SERVER w_srv
     OPTIONS (readonly 'true');
-CREATE FOREIGN TABLE w_json (k text, a text OPTIONS (field '$.a'))
-    SERVER w_srv OPTIONS (tabletype 'json');
 CREATE FOREIGN TABLE w_legacy (k text, v text[]) SERVER w_srv
     OPTIONS (tabletype 'hash', legacy_value 'true');
 
@@ -120,8 +118,8 @@ FROM pg_class c
 WHERE c.relname LIKE 'w\_%'
 ORDER BY c.relname;
 
--- information_schema asks the same question for every relation, including the
--- two whose reader is not implemented. This must simply answer.
+-- information_schema asks the same question for every relation, including
+-- those whose reader is not implemented. This must simply answer.
 SELECT table_name, is_insertable_into
 FROM information_schema.tables
 WHERE table_name LIKE 'w\_%'
@@ -131,7 +129,6 @@ ORDER BY table_name;
 INSERT INTO w_string VALUES ('k', 'v');
 UPDATE w_list SET m = 'x';
 INSERT INTO w_readonly VALUES ('k', 'v');
-INSERT INTO w_json VALUES ('k', 'v');
 
 -- Each refusal must say why THIS table is refused. The reason used to be one
 -- hardcoded errdetail, so a string table blocked for carrying a search index
@@ -154,5 +151,78 @@ SELECT c.relname,
 FROM pg_class c
 WHERE c.relname IN ('w_search', 'w_ttl')
 ORDER BY c.relname;
+
+-- ---------------------------------------------------------------------------
+-- Accepted, then refused.
+--
+-- Five options validate at DDL and then do not do what they name:
+-- legacy_value, a ttl column, a distance column, search_index and index_type.
+-- The validator takes them so that a table definition can be written ahead of
+-- the feature, and that is only an honest bargain while the refusal is exact
+-- and something holds it still. Unasserted, a refusal is free to become a
+-- crash, or to start returning rows nobody stored - and the definition would
+-- go on being accepted either way, which is what makes the promise the
+-- dangerous half.
+--
+-- Here rather than in options.sql: options.sql exercises the validator alone,
+-- creates no foreign table and builds no map, while every answer below is a
+-- plan-time answer about a table that already exists.
+-- ---------------------------------------------------------------------------
+CREATE FOREIGN TABLE w_distance (
+    k text,
+    v text,
+    d double precision OPTIONS (distance 'true')
+) SERVER w_srv OPTIONS (search_index 'idx');
+
+-- The read direction. Each message names the column or the shape that is
+-- waiting, not the table type, because that is the line the user has to
+-- delete to make the query run.
+SELECT * FROM w_legacy;
+SELECT * FROM w_ttl;
+SELECT * FROM w_distance;
+
+-- The write direction reaches the same refusal, from PlanForeignModify, which
+-- builds the map before it asks whether the table is writable. That order is
+-- what keeps an unimplemented shape from being turned away with a message
+-- about writes: compare this with the INSERT into w_search above.
+INSERT INTO w_legacy VALUES ('k', ARRAY['v']);
+
+-- search_index and index_type stop one step short of the other three: they
+-- raise nothing, and nothing consults them. So the boundary to hold still is
+-- the opposite one - that a table carrying either is answered by the ordinary
+-- key path, unchanged.
+--
+-- Seeded, and asserted on the rows that come back. An earlier form of this
+-- pointed both tables at a prefix matching nothing and asserted the empty
+-- answer, which cannot fail for the reason that matters: a search path that
+-- had started intercepting these tables and returning nothing produces
+-- exactly that empty answer. What distinguishes the two is a row being there
+-- to lose.
+SELECT valkey_fdw_test_poke('w_srv', 'ddl:inert:s1'::bytea, 'sv'::bytea)
+    AS seeded_string;
+SELECT valkey_fdw_test_probe('w_srv', 0, 'HSET', 'ddl:inert:h1', 'f', 'fv')
+    IS NOT NULL AS seeded_hash;
+
+CREATE FOREIGN TABLE w_search_read (k text, v text) SERVER w_srv
+    OPTIONS (search_index 'idx', keyprefix 'ddl:inert:');
+CREATE FOREIGN TABLE w_index_type (
+    k text,
+    f text OPTIONS (field 'f', index_type 'tag')
+) SERVER w_srv OPTIONS (tabletype 'hash', keyprefix 'ddl:inert:');
+
+SELECT k, v FROM w_search_read ORDER BY k;
+SELECT k, f FROM w_index_type ORDER BY k;
+
+-- And the masks agree with all of that: nothing refused at the first plan is
+-- advertised as writable, while a column carrying index_type is inert enough
+-- that it changes no answer here either.
+SELECT c.relname,
+       pg_relation_is_updatable(c.oid, false) AS mask
+FROM pg_class c
+WHERE c.relname IN ('w_distance', 'w_index_type', 'w_search_read')
+ORDER BY c.relname;
+
+SELECT valkey_fdw_test_probe('w_srv', 0, 'DEL', 'ddl:inert:s1', 'ddl:inert:h1')
+    IS NOT NULL AS cleaned;
 
 DROP SERVER w_srv CASCADE;

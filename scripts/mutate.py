@@ -47,6 +47,14 @@ import sys
 # never applying the mutation, which is the same silent failure this script
 # exists to catch, one level up.
 MUTATIONS = [
+    # A server that will not load the write program can be read from and not
+    # written to, and the refusal belongs at the statement rather than at the
+    # commit. Ungated, the write is accepted, buffered, and dies in the flush.
+    ("A8-noscript", "src/vfdw_modify.c",
+     "\tif (refusal != NULL)",
+     "\tif (false && refusal != NULL)",
+     "acl", "acl"),
+
     # The privilege model. Resolving a server by name is a catalogue lookup and
     # not an authorisation, so without the check any role holding a mapping
     # reaches a keyspace it was never granted a table on.

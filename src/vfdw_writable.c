@@ -139,11 +139,11 @@ vfdw_map_write_block(Oid relid, const VfdwWritability *w, const char **hint)
 		*hint = "Remove OPTIONS (readonly 'true') to allow writes.";
 		return "The table is declared read-only.";
 	}
-	if (w->legacy || strcmp(w->tabletype, "json") == 0)
+	if (w->legacy)
 	{
 		*hint = "See the README for the shapes that are.";
-		return "Neither legacy_value nor tabletype \"json\" is implemented, "
-			"so this table has no reader and no writer.";
+		return "legacy_value is not implemented, so this table has no reader "
+			"and no writer.";
 	}
 	if (w->search_index)
 	{

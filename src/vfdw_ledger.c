@@ -408,7 +408,7 @@ vfdw_ledger_check_duplicate(VfdwKeyPlan *plan, const VfdwWriteOp *op,
 		return;
 	if (plan->state == VFDW_KEY_DELETED)
 		return;
-	if (plan->ttype != VFDW_TABLE_STRING && plan->ttype != VFDW_TABLE_JSON)
+	if (plan->ttype != VFDW_TABLE_STRING)
 		return;
 
 	vfdw_refuse_duplicate_key(rel, op->key, op->keylen);
@@ -463,7 +463,6 @@ vfdw_ledger_fold_key_delete(VfdwKeyPlan *plan, const VfdwWriteOp *op)
 	if (op->kind != VFDW_OP_DELETE)
 		return false;
 	if (op->tabletype != VFDW_TABLE_STRING &&
-		op->tabletype != VFDW_TABLE_JSON &&
 		op->tabletype != VFDW_TABLE_HASH)
 		return false;
 
@@ -495,7 +494,6 @@ vfdw_ledger_note(const VfdwWriteOp *op, Relation rel)
 	switch (op->tabletype)
 	{
 		case VFDW_TABLE_STRING:
-		case VFDW_TABLE_JSON:
 			if (op->has_value)
 				vfdw_ledger_act1(plan, VFDW_ACT_SET, op->value, op->valuelen);
 			break;

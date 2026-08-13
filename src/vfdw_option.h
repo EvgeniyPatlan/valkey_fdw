@@ -133,7 +133,6 @@ typedef struct VfdwServerOptions
 	int			port;
 	const char *unix_socket_path;
 	bool		cluster;
-	const char *cluster_nodes;
 	bool		prefer_replica;
 	bool		tls;
 	const char *tls_ca_file;

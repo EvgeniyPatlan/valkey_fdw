@@ -26,6 +26,13 @@
 /* Longest node endpoint the map may hand back; DNS caps a name at 253. */
 #define VFDW_MAX_NODE_HOST 256
 
+/*
+ * How much of a refused SCRIPT LOAD is kept. A NOPERM naming a user and a
+ * command fits several times over, and the far end chose these bytes: what
+ * does not fit is dropped rather than believed.
+ */
+#define VFDW_MAX_WRITE_REFUSAL 256
+
 typedef struct VfdwConnKey
 {
 	Oid			serverid;
@@ -90,6 +97,25 @@ struct VfdwConn
 
 	/* Whether this connection has been sent our Lua program (S6). */
 	bool		script_loaded;
+
+	/*
+	 * Whether this server would TAKE the program, and its own words when it
+	 * would not.
+	 *
+	 * Both are written by every vfdw_conn_open and read only through a
+	 * connection that is open, so unlike script_loaded there is nothing here a
+	 * brand-new entry can read uninitialised: the verdict is a property of a
+	 * socket that exists, and vfdw_conn_close drops it with the socket.
+	 *
+	 * The reason is the server's own bytes, kept raw and length-counted (I3)
+	 * in an array rather than behind a pointer for node_host's reason: a hash
+	 * entry outlives every context they could have been palloc'd in. The
+	 * encoding check they need before they may be reported belongs at the
+	 * report (I2), where there is a context to palloc the checked copy in.
+	 */
+	bool		write_refused;
+	int			write_refusal_len;
+	char		write_refusal[VFDW_MAX_WRITE_REFUSAL];
 
 	/*
 	 * Which subtransaction took the lease, so an aborting one can release what

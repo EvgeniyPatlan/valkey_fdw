@@ -240,6 +240,83 @@ DROP FOREIGN TABLE bigt_wide;
 DROP SERVER scan_srv_wide CASCADE;
 NOTICE:  drop cascades to user mapping for vfdw on server scan_srv_wide
 -- ---------------------------------------------------------------------------
+-- The keyspace resized under an open cursor.
+--
+-- SCAN's contract is at-least-once, not exactly-once: the cursor is a position
+-- in the server's hash table rather than a snapshot, so a table resized while
+-- the cursor is open can hand back a key it has already handed back. A reader
+-- is told that. What it must never be told is a key that was there the whole
+-- time and did not come back at all.
+--
+-- So the assertion is the DISTINCT count, and deliberately not the row count.
+-- A row count would be asserting that the server does not duplicate, which is
+-- the opposite of what SCAN promises, and it would go red or green according
+-- to a keyspace layout no fixture controls.
+--
+-- The churn is what makes this able to fail at all. Ten thousand keys arriving
+-- and leaving under an open cursor resize the keyspace in both directions, and
+-- because they fall outside the table's MATCH they also make most pages come
+-- back EMPTY with a non-zero cursor - the state I5 keeps separate from "the
+-- scan is finished", and one a fixture whose every page is full never reaches.
+-- ---------------------------------------------------------------------------
+SELECT vk('FLUSHDB');
+ vk 
+----
+ 
+(1 row)
+
+DO $$
+BEGIN
+    PERFORM * FROM valkey_fdw_test_probe('scan_srv', 0, 'EVAL',
+        'for i=1,600 do server.call("SET", "dup:"..i, i) end return 1', '0');
+END $$;
+CREATE FOREIGN TABLE dupt (k text, v text) SERVER scan_srv
+    OPTIONS (keyprefix 'dup:');
+-- One churn per hundred rows, alternating, so the resizes land at several
+-- cursor positions instead of at the single one a fixture happened to pick;
+-- which of them a server turns into a duplicate is the server's business.
+-- The counter is a sequence because it is read from inside a qual, and a
+-- counter in a table would have this statement updating a row it is also
+-- reading - a different test, and a flakier one.
+CREATE TEMP SEQUENCE churn_seq;
+CREATE FUNCTION churn(k text) RETURNS boolean
+LANGUAGE plpgsql VOLATILE AS $$
+DECLARE
+    n bigint := nextval('churn_seq');
+BEGIN
+    IF n % 100 <> 1 THEN
+        RETURN true;
+    END IF;
+
+    -- Through the probe rather than the shell helper: vk() reports ok for a
+    -- command the server rejected, so a typo in the Lua below would leave the
+    -- keyspace unresized and this whole case asserting nothing.
+    IF (n / 100) % 2 = 0 THEN
+        PERFORM * FROM valkey_fdw_test_probe('scan_srv', 0, 'EVAL',
+            'for i=1,10000 do server.call("SET", "pad:"..i, "1") end return 1',
+            '0');
+    ELSE
+        PERFORM * FROM valkey_fdw_test_probe('scan_srv', 0, 'EVAL',
+            'for i=1,10000 do server.call("DEL", "pad:"..i) end return 1',
+            '0');
+    END IF;
+
+    RETURN true;
+END $$;
+-- The pairing is checked in the same pass and survives a duplicate, because a
+-- key returned twice brings its own value twice. A row carrying another key's
+-- value is a crossed reply stream, which is a different defect and would pass
+-- a count of any kind.
+SELECT count(DISTINCT k) AS keys_present_throughout,
+       count(*) FILTER (WHERE v <> substr(k, 5)) AS mispaired
+  FROM dupt WHERE churn(k);
+ keys_present_throughout | mispaired 
+-------------------------+-----------
+                     600 |         0
+(1 row)
+
+DROP FOREIGN TABLE dupt;
+-- ---------------------------------------------------------------------------
 -- Rescan.
 --
 -- With materialisation off the inner side is re-executed for every outer
@@ -1620,3 +1697,7 @@ DROP FUNCTION vk(text);
 DROP FUNCTION valkey_stat(text, text);
 DROP FUNCTION explain_valkey(text);
 DROP FUNCTION plan_rows(text);
+-- churn is a suite-local helper and pg_regress shares one database across
+-- files, so leaving it defined leaks a name into every suite that runs after
+-- this one.
+DROP FUNCTION churn(text);

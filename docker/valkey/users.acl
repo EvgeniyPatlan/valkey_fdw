@@ -1,18 +1,30 @@
 # ACL users for the acl topology.
 #
-# Three identities with deliberately different reach, so the tests can tell a
-# wrong password apart from an insufficient permission apart from success.
+# Four identities with deliberately different reach, so the tests can tell a
+# wrong password apart from an insufficient permission apart from a server
+# that can be read and not written apart from success.
 
 # Full access, used by fixture setup.
 user fdw_admin on >admin_pw ~* &* +@all
 
 # The identity the FDW normally connects as: read and write on the test
-# keyspace only.
-user fdw_app on >app_pw ~vfdw:* ~test:* +@read +@write +@keyspace +@connection -@dangerous
+# keyspace only. Writing means running one Lua program, so @scripting is part
+# of "write" here rather than a power of its own - and it comes after the
+# subtraction, because a category removed later would take the write path away
+# and leave an identity whose name says it can write and cannot.
+user fdw_app on >app_pw ~vfdw:* ~test:* +@read +@write +@keyspace +@connection -@dangerous +@scripting
 
 # Can authenticate but is denied everything interesting, so an authorisation
 # failure is distinguishable from an authentication failure.
 user fdw_noperm on >noperm_pw resetkeys +@connection
+
+# Everything on the test keyspace EXCEPT the scripting commands, which is a
+# server this wrapper can read and cannot write: the whole write path is one
+# Lua program loaded and invoked as a script. Granted @all first so that the
+# single subtraction is the only thing this identity lacks - a refusal it
+# produces can be about nothing else, with no proxy in front of the server
+# and nothing timing-dependent about it.
+user fdw_noscript on >noscript_pw ~vfdw:* ~test:* +@all -@scripting -@dangerous
 
 # Default user is disabled: any connection that fails to AUTH must fail
 # loudly rather than silently falling back to unrestricted access.

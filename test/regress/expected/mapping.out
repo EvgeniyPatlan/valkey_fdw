@@ -184,7 +184,7 @@ CREATE FOREIGN TABLE map_field_on_set (
 ) SERVER map_srv OPTIONS (tabletype 'set');
 EXPLAIN (COSTS OFF) SELECT * FROM map_field_on_set;
 ERROR:  column "f" cannot be used with tabletype "set"
-DETAIL:  field columns require tabletype 'hash' or 'json'.
+DETAIL:  field columns require tabletype 'hash'.
 -- The three key-discovery strategies are alternatives. Documenting that and
 -- then accepting the combination anyway means silently ignoring one.
 --
@@ -238,10 +238,6 @@ CREATE FOREIGN TABLE map_legacy (k text, v text[]) SERVER map_srv
     OPTIONS (tabletype 'hash', legacy_value 'true');
 EXPLAIN (COSTS OFF) SELECT * FROM map_legacy;
 ERROR:  legacy_value tables are not implemented yet
-CREATE FOREIGN TABLE map_json (k text, a text OPTIONS (field '$.a'))
-    SERVER map_srv OPTIONS (tabletype 'json');
-EXPLAIN (COSTS OFF) SELECT * FROM map_json;
-ERROR:  tabletype "json" is not implemented yet
 CREATE FOREIGN TABLE map_ttl (
     k text,
     f text      OPTIONS (field 'f'),
@@ -256,7 +252,7 @@ CREATE FOREIGN TABLE map_distance (
 EXPLAIN (COSTS OFF) SELECT * FROM map_distance;
 ERROR:  column "d" reads distance, which is not implemented yet
 DROP SERVER map_srv CASCADE;
-NOTICE:  drop cascades to 24 other objects
+NOTICE:  drop cascades to 23 other objects
 DETAIL:  drop cascades to user mapping for vfdw on server map_srv
 drop cascades to foreign table map_key_only
 drop cascades to foreign table map_two
@@ -278,6 +274,5 @@ drop cascades to foreign table map_field_on_set
 drop cascades to foreign table map_alter_conflict
 drop cascades to foreign table map_legacy_wide
 drop cascades to foreign table map_legacy
-drop cascades to foreign table map_json
 drop cascades to foreign table map_ttl
 drop cascades to foreign table map_distance

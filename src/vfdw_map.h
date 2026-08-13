@@ -41,8 +41,7 @@ typedef enum VfdwTableType
 	VFDW_TABLE_HASH,
 	VFDW_TABLE_LIST,
 	VFDW_TABLE_SET,
-	VFDW_TABLE_ZSET,
-	VFDW_TABLE_JSON
+	VFDW_TABLE_ZSET
 } VfdwTableType;
 
 typedef enum VfdwColKind
@@ -50,7 +49,7 @@ typedef enum VfdwColKind
 	VFDW_COL_DROPPED = 0,		/* attisdropped; never filled */
 	VFDW_COL_KEY,				/* the Valkey key name */
 	VFDW_COL_VALUE,				/* the whole value, for a string table */
-	VFDW_COL_FIELD,				/* one hash field, or a JSON path */
+	VFDW_COL_FIELD,				/* one hash field, named by the field option */
 	VFDW_COL_MEMBER,			/* a list, set or zset member */
 	VFDW_COL_SCORE,				/* a zset score */
 	VFDW_COL_TTL,				/* time to live of the paired field */

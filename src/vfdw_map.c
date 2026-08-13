@@ -26,13 +26,19 @@
 #include "utils/syscache.h"
 
 static const char *const vfdw_tabletype_names[] = {
-	"string", "hash", "list", "set", "zset", "json"
+	"string", "hash", "list", "set", "zset"
 };
 
+/*
+ * The bound is this array's own length rather than the last member of the
+ * enum. The two are edited for different reasons and at different times, and
+ * an enum that gains a member before the names do would index past the end of
+ * the array and hand an error message whatever bytes follow it.
+ */
 const char *
 vfdw_tabletype_name(VfdwTableType type)
 {
-	if (type < 0 || type > VFDW_TABLE_JSON)
+	if (type < 0 || type >= (int) lengthof(vfdw_tabletype_names))
 		return "unknown";
 	return vfdw_tabletype_names[type];
 }
@@ -75,11 +81,14 @@ vfdw_tabletype_supplies(VfdwTableType type)
 			return "a key and one member";
 		case VFDW_TABLE_ZSET:
 			return "a key, a member and a score";
-		case VFDW_TABLE_JSON:
-			return "a key and named paths";
-		default:
-			return "a key";
 	}
+
+	/*
+	 * No default arm, for the reason vfdw_rowid_shape gives: a table type
+	 * added to the enum and not to this switch is a compiler warning here and
+	 * a wrong sentence in a user's error message otherwise.
+	 */
+	return "a key";
 }
 
 /*
@@ -431,9 +440,8 @@ vfdw_map_check_types(VfdwTableMap *map, TupleDesc tupdesc)
 		switch (col->kind)
 		{
 			case VFDW_COL_FIELD:
-				if (map->tabletype != VFDW_TABLE_HASH &&
-					map->tabletype != VFDW_TABLE_JSON)
-					why = "field columns require tabletype 'hash' or 'json'";
+				if (map->tabletype != VFDW_TABLE_HASH)
+					why = "field columns require tabletype 'hash'";
 				map->nfields++;
 				break;
 			case VFDW_COL_SCORE:
@@ -488,11 +496,6 @@ static void
 vfdw_map_check_implemented(VfdwTableMap *map, TupleDesc tupdesc)
 {
 	int			i;
-
-	if (map->tabletype == VFDW_TABLE_JSON)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("tabletype \"json\" is not implemented yet")));
 
 	if (map->legacy_value)
 		ereport(ERROR,

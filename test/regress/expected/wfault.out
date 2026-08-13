@@ -206,8 +206,12 @@ SELECT fault_arm('arm delay 8000 EVALSHA') AS armed;
 BEGIN;
 INSERT INTO wf VALUES ('wf:slow', 'x');
 COMMIT;
+ERROR:  the outcome of the Valkey write is unknown
+DETAIL:  timed out communicating with Valkey
+HINT:  The transaction has been rolled back in PostgreSQL. The write applied in full, applied not at all, or - if a precondition was incomplete - applied in part. Inspect the affected keys.
+CONTEXT:  valkey_fdw pre-commit flush; the Valkey write may or may not have been applied.
 \echo slow sqlstate: :SQLSTATE
-slow sqlstate: 00000
+slow sqlstate: 08007
 SELECT fault_arm('clear') AS cleared_rules;
  cleared_rules 
 ---------------
@@ -275,7 +279,7 @@ ORDER BY k;
  wf:garbage | f
  wf:load    | t
  wf:shape   | f
- wf:slow    | t
+ wf:slow    | f
 (5 rows)
 
 -- And they ARE visible to a later SELECT, because a later SELECT reads
@@ -288,7 +292,7 @@ SELECT count(*) AS rows_visible_after_rollback
 FROM wf WHERE k IN ('wf:drop','wf:garbage','wf:shape','wf:slow','wf:load');
  rows_visible_after_rollback 
 -----------------------------
-                           3
+                           2
 (1 row)
 
 -- The writes that were meant to succeed did.

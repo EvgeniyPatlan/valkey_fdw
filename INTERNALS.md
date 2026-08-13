@@ -513,7 +513,7 @@ The build runs in a fixed order, and the order carries meaning:
 |---|---|---|
 | `VFDW_COL_KEY` | the Valkey key name of the row | at most one per table |
 | `VFDW_COL_VALUE` | the whole string value | `tabletype 'string'` |
-| `VFDW_COL_FIELD` | one hash field, or a JSON path, named by `field` | `tabletype 'hash'` or `'json'` |
+| `VFDW_COL_FIELD` | one hash field, named by `field` | `tabletype 'hash'` |
 | `VFDW_COL_MEMBER` | a list, set or zset member | `tabletype 'list'`, `'set'` or `'zset'` |
 | `VFDW_COL_SCORE` | the zset score | `tabletype 'zset'` |
 | `VFDW_COL_TTL` | time to live of the field it names | `tabletype 'hash'`, and the column must also carry `field` |
@@ -521,7 +521,7 @@ The build runs in a fixed order, and the order carries meaning:
 | `VFDW_COL_LEGACY_VALUE` | the legacy `value text[]` column | `legacy_value 'true'` |
 | `VFDW_COL_DROPPED` | nothing; `attisdropped`, or provisionally "unclaimed" during the build | — |
 
-`vfdw_row_fill_column` (`src/vfdw_row.c:237`) fills key, value, field, member and score today; ttl and distance are refused at plan time by `vfdw_map_check_implemented`, as are `tabletype 'json'` and `legacy_value` tables. Refusing rather than returning NULL is a policy the project applies everywhere: a plausible empty result is the failure mode it exists to avoid.
+`vfdw_row_fill_column` (`src/vfdw_row.c:237`) fills key, value, field, member and score today; ttl and distance are refused at plan time by `vfdw_map_check_implemented`, as are `legacy_value` tables. Refusing rather than returning NULL is a policy the project applies everywhere: a plausible empty result is the failure mode it exists to avoid.
 
 **One column, one source.** `vfdw_map_check_single_source` (`:89`) counts the claims a column makes and refuses more than one, because silently preferring one over another makes a typo look as though it worked. The single exception is encoded in the count itself: `field` does not count as a claim when `ttl` is set, since a ttl column is required to name the field whose expiry it reports.
 
@@ -557,7 +557,7 @@ Documenting the exclusivity and then not enforcing it — the branch meant to ch
 `vfdw_map_read_writability` (`:53`) collects the table options it needs into a small struct; anything unrecognised is treated as a table this wrapper will not write to, which is the safe answer. `vfdw_map_write_block` (`:134`) returns the first reason the table accepts no write at all, or NULL:
 
 - `readonly 'true'`;
-- `legacy_value`, or `tabletype 'json'` — no reader and no writer;
+- `legacy_value` — no reader and no writer;
 - a `search_index`, which routes the table to the unimplemented search phase;
 - more than one key-discovery option, so no key can be resolved for a row;
 - a column reading `ttl` or `distance` (`vfdw_map_has_unimplemented_column`, `:95`). This one walks `ATTNUM` in the syscache directly rather than through the relcache, because it must not open a relation and must not raise; attnums are contiguous, so the first miss is the end. Before it existed, writability was decided from table options alone and a hash table with a ttl column was advertised through `information_schema` as fully writable while it could not even be `SELECT`ed.
@@ -568,7 +568,7 @@ The reason travels back with the mask through the `detail`/`hint` out-parameters
 
 ### Row identity per table shape
 
-`vfdw_rowid_shape` (`src/vfdw_rowid.c:39`) is the identity table below expressed as code, and it is exhaustive over `VfdwTableType` — `VFDW_TABLE_JSON` reaches an `elog` because `vfdw_map_check_implemented` already refused it, and a `default` arm would let the next table type added to the enum inherit whatever rule happened to be last.
+`vfdw_rowid_shape` (`src/vfdw_rowid.c:39`) is the identity table below expressed as code, and it is exhaustive over `VfdwTableType` with no `default` arm — one would let the next table type added to the enum inherit whatever rule happened to be written last, silently, where a missing arm is a compiler warning.
 
 | Shape | Identity | Junk injected |
 |---|---|---|

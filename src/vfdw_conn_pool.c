@@ -55,6 +55,9 @@ vfdw_conn_init_entry(VfdwConn *vconn)
 	 * server has never seen.
 	 */
 	vconn->script_loaded = false;
+	vconn->write_refused = false;
+	vconn->write_refusal_len = 0;
+	vconn->write_refusal[0] = '\0';
 	vconn->node_host[0] = '\0';
 	vconn->node_port = 0;
 }

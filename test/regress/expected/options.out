@@ -9,7 +9,7 @@ ORDER BY context;
    context    | options 
 --------------+---------
  column       |       7
- server       |      21
+ server       |      20
  table        |       8
  user_mapping |       3
 (4 rows)
@@ -30,7 +30,6 @@ ORDER BY context, name;
  column       | score               | boolean | false         | f         | f
  column       | ttl                 | boolean | false         | f         | f
  server       | cluster             | boolean | false         | f         | f
- server       | cluster_nodes       | string  |               | f         | f
  server       | command_timeout_ms  | integer | 30000         | f         | f
  server       | connect_timeout_ms  | integer | 5000          | f         | f
  server       | host                | string  | 127.0.0.1     | f         | f
@@ -61,7 +60,7 @@ ORDER BY context, name;
  user_mapping | password            | string  |               | t         | f
  user_mapping | password_required   | boolean | true          | f         | t
  user_mapping | username            | string  |               | f         | f
-(39 rows)
+(38 rows)
 
 -- Anything credential-bearing must be marked sensitive so it is redacted
 -- from error text and EXPLAIN.
@@ -106,7 +105,6 @@ INSERT INTO option_manifest VALUES
     ('column',       'score',               'true'),
     ('column',       'ttl',                 'true'),
     ('server',       'cluster',             'true'),
-    ('server',       'cluster_nodes',       '127.0.0.1:6379'),
     ('server',       'command_timeout_ms',  '1000'),
     ('server',       'connect_timeout_ms',  '1000'),
     ('server',       'host',                'valkey'),
@@ -188,14 +186,14 @@ BEGIN
     RAISE NOTICE 'every option named in this file is accepted by the validator (% of them)',
                  tested;
 END $$;
-NOTICE:  every option named in this file is accepted by the validator (38 of them)
+NOTICE:  every option named in this file is accepted by the validator (37 of them)
 DROP TABLE option_manifest;
 -- The count is printed separately so that an option added without a validator
 -- branch, or removed, is a diff here as well as in the inventory above.
 SELECT count(*) AS options_total FROM valkey_fdw_options();
  options_total 
 ---------------
-            39
+            38
 (1 row)
 
 -- ---------------------------------------------------------------------------
@@ -270,7 +268,7 @@ HINT:  Value was: ""
 -- Unknown option, with a hint listing what is actually valid here.
 CREATE SERVER bad_unknown FOREIGN DATA WRAPPER valkey_fdw OPTIONS (hostname 'x');
 ERROR:  invalid option "hostname"
-HINT:  Valid options in this context are: host, port, unix_socket_path, cluster, cluster_nodes, prefer_replica, tls, tls_ca_file, tls_cert_file, tls_key_file, tls_sni, tls_verify, connect_timeout_ms, command_timeout_ms, pipeline_batch, scan_count, max_reply_elements, reader_buffer_bytes, write_max_ops, write_max_bytes, write_retry_count
+HINT:  Valid options in this context are: host, port, unix_socket_path, cluster, prefer_replica, tls, tls_ca_file, tls_cert_file, tls_key_file, tls_sni, tls_verify, connect_timeout_ms, command_timeout_ms, pipeline_batch, scan_count, max_reply_elements, reader_buffer_bytes, write_max_ops, write_max_bytes, write_retry_count
 -- Enum and boolean values outside their domains.
 CREATE SERVER bad_enum FOREIGN DATA WRAPPER valkey_fdw OPTIONS (tls_verify 'maybe');
 ERROR:  invalid value for option "tls_verify"
@@ -283,7 +281,7 @@ HINT:  Value was: "perhaps"
 -- Option valid on another catalog must not be accepted here.
 CREATE SERVER bad_context FOREIGN DATA WRAPPER valkey_fdw OPTIONS (tabletype 'hash');
 ERROR:  invalid option "tabletype"
-HINT:  Valid options in this context are: host, port, unix_socket_path, cluster, cluster_nodes, prefer_replica, tls, tls_ca_file, tls_cert_file, tls_key_file, tls_sni, tls_verify, connect_timeout_ms, command_timeout_ms, pipeline_batch, scan_count, max_reply_elements, reader_buffer_bytes, write_max_ops, write_max_bytes, write_retry_count
+HINT:  Valid options in this context are: host, port, unix_socket_path, cluster, prefer_replica, tls, tls_ca_file, tls_cert_file, tls_key_file, tls_sni, tls_verify, connect_timeout_ms, command_timeout_ms, pipeline_batch, scan_count, max_reply_elements, reader_buffer_bytes, write_max_ops, write_max_bytes, write_retry_count
 -- A relative path resolves against the server's working directory, not the
 -- user's, so it is rejected at DDL time rather than failing much later at
 -- connection time.

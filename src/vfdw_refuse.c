@@ -72,6 +72,50 @@ vfdw_refuse_on_conflict(const ModifyTable *plan)
 			 errhint("Handle unique_violation instead.")));
 }
 
+/*
+ * A server this wrapper cannot write to, refused at the first write statement.
+ *
+ * A transaction's writes are applied by one Lua program invoked with EVALSHA,
+ * and its write verbs are server.pcall calls (W1). `server` is a Lua global
+ * that not every implementation of this protocol has, and a managed tier can
+ * withhold EVAL entirely - so a target that is not a Valkey, or is one whose
+ * user lacks the scripting commands, connects, negotiates RESP3 and READS
+ * CORRECTLY. Without this gate it then fails at the first COMMIT, with a Lua
+ * error about a nil global, at the moment the user has already been told the
+ * transaction is being applied. That is the least diagnosable place a failure
+ * can land, so the refusal belongs at the statement, before anything is
+ * buffered, which is the whole reason the question is asked at connection
+ * time rather than left to the flush to discover.
+ *
+ * Reads are deliberately untouched. They use no scripting at all, so a
+ * read-only deployment against such a server keeps working.
+ *
+ * feature_not_supported rather than insufficient_privilege, whatever the
+ * server's own reason turns out to be: a denied ACL, an absent EVAL and a
+ * foreign implementation are one fact to a client - this deployment can be
+ * read from and not written to - and no retry or reconnection changes it.
+ * The reason is the server's own bytes, so it carries its length (I3) and
+ * goes through vfdw_safe_text and a "%s" (I2).
+ */
+void
+vfdw_refuse_no_write_program(const ForeignServer *server, const char *reason,
+							 size_t reasonlen)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot write through a Valkey server that will not load "
+					"the write program"),
+			 errdetail("Server \"%s\" refused SCRIPT LOAD when the connection "
+					   "was opened: %s", server->servername,
+					   reasonlen > 0 ? vfdw_safe_text(reason, reasonlen)
+					   : "(no message)"),
+			 errhint("A transaction's writes are applied by one server-side "
+					 "program, so a server that will not load it can be read "
+					 "from but not written to. Grant the scripting commands "
+					 "to this user, or point the foreign server at a Valkey "
+					 "that offers them.")));
+}
+
 void
 vfdw_refuse_prefer_replica(const ForeignServer *server)
 {

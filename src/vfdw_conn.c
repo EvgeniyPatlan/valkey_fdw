@@ -26,6 +26,7 @@
 
 #include "vfdw_error.h"
 #include "vfdw_io.h"
+#include "vfdw_script.h"
 #include "vfdw_tls.h"
 #include "vfdw_xact.h"
 
@@ -51,8 +52,10 @@ vfdw_conn_close(VfdwConn *vconn)
 	vconn->resp3 = false;
 	vconn->database = -1;
 
-	/* A new server has never seen our script, whatever the old one had. */
+	/* A new server has never seen our script, nor said if it will take it. */
 	vconn->script_loaded = false;
+	vconn->write_refused = false;
+	vconn->write_refusal_len = 0;
 }
 
 static void
@@ -340,6 +343,46 @@ vfdw_conn_negotiate_resp3(VfdwConn *vconn)
 	freeReplyObject(reply);
 }
 
+/*
+ * Ask, once per connection, whether this server will take the write program.
+ *
+ * Why it is a SCRIPT LOAD of the real program, and why a refusal is recorded
+ * rather than raised, is given over vfdw_conn_write_refusal. Only which
+ * refusals count as a verdict is decided here: LOADING and BUSY mean "not
+ * yet", so they leave the connection eligible to write and the flush's own
+ * load meets them again. The strlen is of our own literal, not Valkey's (I3).
+ */
+static void
+vfdw_conn_probe_script(VfdwConn *vconn)
+{
+	TimestampTz deadline = vfdw_io_deadline(vconn->opts.command_timeout_ms);
+	const char *argv[] = {"SCRIPT", "LOAD", vfdw_script_text()};
+	const size_t arglens[] = {6, 4, strlen(argv[2])};
+	valkeyReply *reply;
+
+	if (valkeyAppendCommandArgv(vconn->conn, 3, argv, arglens) != VALKEY_OK)
+		vfdw_error_from_context(vconn->conn,
+								"could not load the Valkey write program");
+
+	vfdw_io_flush(vconn->conn, deadline);
+	reply = vfdw_io_get_reply(vconn->conn, deadline);
+
+	vconn->script_loaded = !vfdw_reply_is_error(reply);
+	vconn->write_refused = !vconn->script_loaded &&
+		!vfdw_reply_has_prefix(reply, "LOADING") &&
+		!vfdw_reply_has_prefix(reply, "BUSY");
+	vconn->write_refusal_len = 0;
+	if (vconn->write_refused && reply->str != NULL)
+	{
+		vconn->write_refusal_len = (int) Min((size_t) reply->len,
+											 sizeof(vconn->write_refusal));
+		memcpy(vconn->write_refusal, reply->str,
+			   (size_t) vconn->write_refusal_len);
+	}
+
+	freeReplyObject(reply);
+}
+
 void
 vfdw_conn_select_db(VfdwConn *vconn, int database)
 {
@@ -437,6 +480,7 @@ vfdw_conn_open(VfdwConn *vconn, const VfdwUserOptions *user)
 
 	vfdw_conn_authenticate(vconn, user);
 	vfdw_conn_negotiate_resp3(vconn);
+	vfdw_conn_probe_script(vconn);
 
 	vconn->in_conversation = false;
 }
@@ -716,6 +760,15 @@ void
 vfdw_conn_set_script_loaded(VfdwConn *vconn, bool loaded)
 {
 	vconn->script_loaded = loaded;
+}
+
+const char *
+vfdw_conn_write_refusal(const VfdwConn *vconn, size_t *len)
+{
+	if (!vconn->write_refused)
+		return NULL;
+	*len = (size_t) vconn->write_refusal_len;
+	return vconn->write_refusal;
 }
 
 /*

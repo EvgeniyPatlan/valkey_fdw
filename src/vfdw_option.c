@@ -31,7 +31,7 @@
 
 
 static const char *const vfdw_tabletype_values[] = {
-	"string", "hash", "list", "set", "zset", "json", NULL
+	"string", "hash", "list", "set", "zset", NULL
 };
 
 static const char *const vfdw_tlsverify_values[] = {
@@ -61,24 +61,7 @@ const VfdwOptionDef vfdw_options[] = {
 	{"cluster", ForeignServerRelationId, VFDW_OPT_BOOL, 0, 0, NULL,
 		"false", false, VFDW_OPTPRIV_NONE, "Treat the server as a Valkey Cluster"},
 	/*
-	 * NOTHING READS THIS. The validator accepts it and vfdw_read_server_options
-	 * stores it, and that is the whole of its life: discovery asks the server
-	 * the mapping already names, over the connection it already holds, and
-	 * CLUSTER SHARDS comes back naming every primary. A seed list has nothing
-	 * left to seed.
-	 *
-	 * prefer_replica below keeps its place because it earns one - it declares
-	 * a server read-only and that declaration is enforced. This earns nothing
-	 * of the kind. The only argument for it is that withdrawing a name the
-	 * validator has already accepted breaks the DDL of everyone who wrote it,
-	 * and that is a reason to leave the name alone, not a reason to go on
-	 * promising discovery from a seed list. So the promise goes, the name
-	 * stays, and the description states what an accepted value does: nothing.
-	 */
-	{"cluster_nodes", ForeignServerRelationId, VFDW_OPT_STRING, 0, 0, NULL,
-		NULL, false, VFDW_OPTPRIV_NONE, "Accepted and unused: discovery asks the configured server"},
-	/*
-	 * ROUTING IS NOT IMPLEMENTED, and the description above is worded so that
+	 * ROUTING IS NOT IMPLEMENTED, and the description below is worded so that
 	 * nobody has to read this comment to find that out. Reads go wherever the
 	 * server's own host and port, or the slot map, already point; nothing on
 	 * the read path consults this flag. An option whose published description
@@ -215,6 +198,28 @@ const VfdwOptionDef vfdw_options[] = {
 		NULL, false, VFDW_OPTPRIV_NONE, "Name of a set holding the table's key names"},
 	{"singleton_key", ForeignTableRelationId, VFDW_OPT_STRING, 0, 0, NULL,
 		NULL, false, VFDW_OPTPRIV_NONE, "Draw all rows from this single key"},
+	/*
+	 * ACCEPTED AND REFUSED, WHICH IS A POSITION RATHER THAN AN OVERSIGHT.
+	 *
+	 * search_index and legacy_value here, and ttl, distance and index_type in
+	 * the column group below, all validate and then do not do what they name:
+	 * the first plan over a legacy_value, ttl or distance table raises 0A000,
+	 * and the two search options are simply never consulted - the ordinary key
+	 * path answers, no qual reaches an index. They are accepted so that a
+	 * table definition can be written ahead of the feature.
+	 *
+	 * The rule that keeps this from being a broken promise: an option may be
+	 * accepted and refused only where a suite asserts the exact refusal and
+	 * the README says what it is waiting for. Both halves carry weight. An
+	 * unasserted refusal is free to decay into a crash or - worse, because it
+	 * looks like an answer - a plausible empty result, with nothing going red;
+	 * and a refusal stated nowhere is indistinguishable from the outside from
+	 * an option somebody forgot to finish. test/regress/sql/ddl.sql holds all
+	 * five: the three refusals to their exact message, and the two search
+	 * options to the unchanged answer the key path gives with them set. An
+	 * option whose boundary cannot be spelled out there does not belong in
+	 * this table.
+	 */
 	{"search_index", ForeignTableRelationId, VFDW_OPT_STRING, 0, 0, NULL,
 		NULL, false, VFDW_OPTPRIV_NONE, "valkey-search index backing this table"},
 	{"legacy_value", ForeignTableRelationId, VFDW_OPT_BOOL, 0, 0, NULL,
@@ -226,7 +231,7 @@ const VfdwOptionDef vfdw_options[] = {
 	{"key", AttributeRelationId, VFDW_OPT_BOOL, 0, 0, NULL,
 		"false", false, VFDW_OPTPRIV_NONE, "This column holds the Valkey key name"},
 	{"field", AttributeRelationId, VFDW_OPT_STRING, 0, 0, NULL,
-		NULL, false, VFDW_OPTPRIV_NONE, "Hash field name, or JSON path"},
+		NULL, false, VFDW_OPTPRIV_NONE, "Hash field name"},
 	{"member", AttributeRelationId, VFDW_OPT_BOOL, 0, 0, NULL,
 		"false", false, VFDW_OPTPRIV_NONE, "This column holds the list, set or zset member"},
 	{"score", AttributeRelationId, VFDW_OPT_BOOL, 0, 0, NULL,
@@ -528,8 +533,6 @@ vfdw_apply_server_option(const VfdwOptionDef *def, char *value,
 		out->unix_socket_path = value;
 	else if (strcmp(def->name, "cluster") == 0)
 		out->cluster = vfdw_parse_bool(def, value);
-	else if (strcmp(def->name, "cluster_nodes") == 0)
-		out->cluster_nodes = value;
 	else if (strcmp(def->name, "prefer_replica") == 0)
 		out->prefer_replica = vfdw_parse_bool(def, value);
 	else if (strcmp(def->name, "tls") == 0)

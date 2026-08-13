@@ -37,10 +37,10 @@
  *										key junk is wanted; the collection
  *										types still want their member
  *
- * Exhaustive over VfdwTableType. VFDW_TABLE_JSON reaches an internal error
- * because vfdw_map_check_implemented refused it at plan time; a default arm
+ * Exhaustive over VfdwTableType, and deliberately without a default arm: one
  * would let the next table type added to the enum acquire whatever identity
- * rule happened to be last.
+ * rule happened to be written last, silently. A missing arm is a compiler
+ * warning; a wrong identity is a row updated in the wrong place.
  */
 void
 vfdw_rowid_shape(const VfdwTableMap *map, CmdType operation, VfdwRowId *out)
@@ -64,10 +64,6 @@ vfdw_rowid_shape(const VfdwTableMap *map, CmdType operation, VfdwRowId *out)
 		case VFDW_TABLE_ZSET:
 			out->want_key = !singleton;
 			out->want_member = true;
-			break;
-
-		case VFDW_TABLE_JSON:
-			elog(ERROR, "valkey_fdw: tabletype \"json\" has no write identity");
 			break;
 	}
 

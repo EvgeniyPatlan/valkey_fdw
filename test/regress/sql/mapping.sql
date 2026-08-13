@@ -175,10 +175,6 @@ CREATE FOREIGN TABLE map_legacy (k text, v text[]) SERVER map_srv
     OPTIONS (tabletype 'hash', legacy_value 'true');
 EXPLAIN (COSTS OFF) SELECT * FROM map_legacy;
 
-CREATE FOREIGN TABLE map_json (k text, a text OPTIONS (field '$.a'))
-    SERVER map_srv OPTIONS (tabletype 'json');
-EXPLAIN (COSTS OFF) SELECT * FROM map_json;
-
 CREATE FOREIGN TABLE map_ttl (
     k text,
     f text      OPTIONS (field 'f'),

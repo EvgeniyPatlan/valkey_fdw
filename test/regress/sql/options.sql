@@ -54,7 +54,6 @@ INSERT INTO option_manifest VALUES
     ('column',       'score',               'true'),
     ('column',       'ttl',                 'true'),
     ('server',       'cluster',             'true'),
-    ('server',       'cluster_nodes',       '127.0.0.1:6379'),
     ('server',       'command_timeout_ms',  '1000'),
     ('server',       'connect_timeout_ms',  '1000'),
     ('server',       'host',                'valkey'),

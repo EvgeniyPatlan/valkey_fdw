@@ -192,6 +192,12 @@ vfdw_modify_attr_bitmap(List *attnos)
  * actually used, so a plan cached before an ALTER SERVER cannot disagree with
  * them. Binding after the refusal, rather than before, keeps a refused
  * statement from leaving a unit bound behind it.
+ *
+ * The same is true of the verdict this acquisition carries: whether the server
+ * will run the write program at all was settled when the connection was
+ * opened, and this is the first moment of the write at which it can be
+ * reported. Reported here rather than at the flush, because by the flush the
+ * user has been told their transaction is being applied.
  */
 void
 vfdw_modify_connect(VfdwModifyState *st, Relation rel)
@@ -207,9 +213,15 @@ vfdw_modify_connect(VfdwModifyState *st, Relation rel)
 	 */
 	VfdwConn   *vconn = vfdw_get_connection_cluster(server, user);
 	const VfdwServerOptions *opts = vfdw_conn_options(vconn);
+	const char *refusal;
+	size_t		refusallen = 0;
 
 	if (opts->prefer_replica)
 		vfdw_refuse_prefer_replica(server);
+
+	refusal = vfdw_conn_write_refusal(vconn, &refusallen);
+	if (refusal != NULL)
+		vfdw_refuse_no_write_program(server, refusal, refusallen);
 
 	vfdw_wbuf_bind(rel, table->serverid, user->umid, GetUserId(),
 				   st->map->database, opts->write_max_ops,

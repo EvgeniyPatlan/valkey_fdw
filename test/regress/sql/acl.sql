@@ -93,6 +93,53 @@ DROP FOREIGN TABLE noperm_t;
 DROP USER MAPPING FOR CURRENT_USER SERVER acl_srv;
 
 -- ---------------------------------------------------------------------------
+-- A server that can be read and cannot be written.
+--
+-- Every write this wrapper performs is one Lua program, loaded when the
+-- connection is opened and invoked once at COMMIT. fdw_noscript is denied the
+-- scripting commands and nothing else, so the SELECT below is served exactly
+-- as fdw_app's was and the INSERT cannot be served at all.
+--
+-- The refusal has to land on the INSERT rather than on the COMMIT, and that
+-- is the whole reason the question is asked when the connection is opened: at
+-- COMMIT the user has already been told the transaction is being applied, and
+-- a script error naming a missing global is the least diagnosable place this
+-- can end up.
+-- ---------------------------------------------------------------------------
+CREATE USER MAPPING FOR CURRENT_USER SERVER acl_srv
+    OPTIONS (username 'fdw_noscript', password 'noscript_pw');
+
+CREATE FOREIGN TABLE noscript_t (k text OPTIONS (key 'true'), v text)
+    SERVER acl_srv OPTIONS (tabletype 'string', keyprefix 'vfdw:');
+
+SELECT k, v FROM noscript_t ORDER BY k;
+
+-- The refusal names the command that was tried and carries the server's own
+-- reason for refusing it: "the write program could not be loaded" on its own
+-- leaves the operator with nothing to grant.
+INSERT INTO noscript_t VALUES ('vfdw:c', 'gamma');
+
+-- The code a client branches on is feature_not_supported, not the 42501 a
+-- denied SCAN reports below: this deployment can be read from, so "you may
+-- not read that key" and "this server cannot be written to at all" are
+-- different answers, and a caller retrying on one must not retry on both.
+DO $$
+BEGIN
+    INSERT INTO noscript_t VALUES ('vfdw:c', 'gamma');
+    RAISE NOTICE 'the write was not refused';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'write refused: %', SQLSTATE;
+END $$;
+
+-- Nothing was sent, so the key does not exist and the connection the SELECT
+-- used is still good to read through.
+SELECT count(*) AS rows_still_readable FROM noscript_t;
+
+DROP FOREIGN TABLE noscript_t;
+
+DROP USER MAPPING FOR CURRENT_USER SERVER acl_srv;
+
+-- ---------------------------------------------------------------------------
 -- A non-superuser may not connect without a password.
 --
 -- postgres_fdw's rule, and the reason for it: the server would otherwise

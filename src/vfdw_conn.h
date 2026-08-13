@@ -157,4 +157,30 @@ extern Oid	vfdw_conn_userid(const VfdwConn *vconn);
 extern bool vfdw_conn_script_loaded(const VfdwConn *vconn);
 extern void vfdw_conn_set_script_loaded(VfdwConn *vconn, bool loaded);
 
+/*
+ * Why the write path cannot use this connection, or NULL when it can.
+ *
+ * The whole write path is one Lua program, so what a connection has to be
+ * asked is whether this server will run that program - and the way to ask is
+ * to try to load it. A version string would answer a different question: a
+ * server that refuses the program cannot run the write path whatever it calls
+ * itself, and one that accepts it can. So the verdict is the reply to a
+ * SCRIPT LOAD of the real thing, taken when the connection is opened, and the
+ * bytes here are the server's own words when it said no.
+ *
+ * That load is the one the flush would otherwise send rather than a second
+ * mechanism: a connection that took the program is recorded as having it, so
+ * the steady state of a flush is still a bare EVALSHA, and the flush keeps a
+ * load of its own for the NOSCRIPT of a server that forgot a program it had.
+ *
+ * Those bytes are not NUL-terminated and are not known to be valid in the
+ * database encoding, so the length travels with them (I3) and the reporting
+ * site runs them through vfdw_safe_text (I2).
+ *
+ * A refusal does not stop a read, and that asymmetry is the point: the read
+ * path uses no scripting at all, so a deployment that only reads from a
+ * server without it is a legitimate thing to run.
+ */
+extern const char *vfdw_conn_write_refusal(const VfdwConn *vconn, size_t *len);
+
 #endif							/* VFDW_CONN_H */
