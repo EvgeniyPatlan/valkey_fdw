@@ -63,7 +63,7 @@ jobs:
       fail-fast: false
       matrix:
         pg: [16, 17, 18]
-        valkey: ["8.1.9", "9.0.5"]
+        valkey: ["8.1.9", "9.0.5", "9.1.1"]
     steps:
       - uses: actions/checkout@v5
 
@@ -149,17 +149,21 @@ jobs:
       - name: Every closed row still fails when its defect is reintroduced
         run: ./scripts/harness.sh mutate --pg 17
 
-  # Two-session properties, which no pg_regress file can reach: concurrent
-  # writers, and a query cancelled from elsewhere.
+  # Concurrent writers - who wins, and what the loser sees. No pg_regress file
+  # can reach this: it needs two sessions held open against each other.
+  #
+  # The other two-session property, a query cancelled from elsewhere, is not
+  # here any more. It is part of `test` on the default topology, so the matrix
+  # above runs it on every PostgreSQL major and every Valkey version rather
+  # than once on one pair.
   concurrency:
-    name: isolation + tap
+    name: isolation
     runs-on: ubuntu-latest
     needs: lint
     steps:
       - uses: actions/checkout@v5
       - run: ./scripts/harness.sh images --pg 17 --valkey 9.0.5
       - run: ./scripts/harness.sh isolation --pg 17
-      - run: ./scripts/harness.sh tap --pg 17
 
   # CLOBBER_FREED_MEMORY, MEMORY_CONTEXT_CHECKING and every Assert().
   #

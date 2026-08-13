@@ -44,7 +44,7 @@ VALKEY_IMAGE_PREFIX=valkey_fdw/valkey
 
 # PG majors and Valkey versions the ci subcommand sweeps.
 CI_PG_MAJORS=(16 17 18)
-CI_VALKEY_VERSIONS=(8.1.9 9.0.5)
+CI_VALKEY_VERSIONS=(8.1.9 9.0.5 9.1.1)
 
 STATE_DIR="$REPO_ROOT/.harness"
 mkdir -p "$STATE_DIR"
@@ -685,6 +685,47 @@ cmd_bench() {
     "
 }
 
+#
+# The in-container half of a TAP run, shared by `test` and by `tap`.
+#
+# One text, because the two callers must not be able to drift into running
+# different things: `tap` is how the properties are exercised on their own
+# while a cancel path is being worked on, and `test` is what decides whether
+# the tree is green. If those diverged, the second would stop being an answer
+# about the first.
+#
+# The caller has already built and installed. Nothing here starts a server:
+# PostgreSQL::Test::Cluster builds its own, which is the whole reason these
+# live outside pg_regress.
+#
+tap_fragment() {
+    cat <<'TAPSH'
+
+        echo '--- tap ---'
+
+        # A previous run's data directory bails the whole file out before the
+        # first assertion, so it goes before anything else.
+        rm -rf test/tap/tmp_check test/tap/log tmp_check
+
+        n=$(ls test/tap/t/*.pl 2>/dev/null | wc -l)
+        if [ "$n" -eq 0 ]; then
+            echo 'no TAP tests found in test/tap/t' >&2
+            exit 1
+        fi
+        echo "running $n TAP file(s)"
+
+        # REGRESS and ISOLATION emptied so installcheck runs the TAP tests
+        # alone. prove exits 0 when it finds nothing, so the count above is
+        # what makes an empty run a failure rather than a silent pass.
+        if ! make installcheck TAP_TESTS=1 REGRESS='' ISOLATION=''; then
+            for f in tmp_check/log/*; do
+                echo "--- $f ---"; tail -40 "$f"
+            done 2>/dev/null || true
+            exit 1
+        fi
+TAPSH
+}
+
 cmd_tap() {
     if [[ "$TOPOLOGY" != "standalone" ]]; then
         die "tap runs on the standalone topology only (got: $TOPOLOGY)"
@@ -702,27 +743,7 @@ cmd_tap() {
         set -e
         make -j\$(nproc)
         make install
-
-        # A previous run's data directory bails the whole file out before the
-        # first assertion, so it goes before anything else.
-        rm -rf test/tap/tmp_check test/tap/log tmp_check
-
-        n=\$(ls test/tap/t/*.pl 2>/dev/null | wc -l)
-        if [ \"\$n\" -eq 0 ]; then
-            echo 'no TAP tests found in test/tap/t' >&2
-            exit 1
-        fi
-        echo \"running \$n TAP file(s)\"
-
-        # REGRESS and ISOLATION emptied so installcheck runs the TAP tests
-        # alone. prove exits 0 when it finds nothing, so the count above is
-        # what makes an empty run a failure rather than a silent pass.
-        if ! make installcheck TAP_TESTS=1 REGRESS='' ISOLATION=''; then
-            for f in tmp_check/log/*; do
-                echo \"--- \$f ---\"; tail -40 \"\$f\"
-            done 2>/dev/null || true
-            exit 1
-        fi
+$(tap_fragment)
     "
 
     say "tap tests passed (pg${PG_MAJOR})"
@@ -768,9 +789,46 @@ cmd_test() {
     reset_valkey
     maybe_clean
 
+    #
+    # Whether the caller named a suite, asked BEFORE the default is filled in.
+    #
+    # `test --suite scan` is someone iterating on one file, and dragging a
+    # two-session cancel proof through every such run would make the fast loop
+    # slow enough to be worked around. The TAP tests therefore join a full run
+    # and not a targeted one.
+    #
+    local explicit_suite=0
+    [[ -n "$SUITE" ]] && explicit_suite=1
+
     local regress_arg=""
     [[ -z "$SUITE" ]] && SUITE="$(suites_for_topology "$topo")"
     [[ -n "$SUITE" ]] && regress_arg="REGRESS='${SUITE}'"
+
+    #
+    # The TAP tests are part of a full standalone run.
+    #
+    # They prove what no pg_regress file can: a query cancelled from another
+    # session, which needs two sessions and a server this harness starts and
+    # stops itself. Leaving them to a subcommand of their own meant `test`
+    # could be green while they were not, and they went unrun long enough for
+    # one of them to stop being able to pass at all - so "green locally" and
+    # "green in CI" were only ever the same statement for whoever remembered
+    # the second command.
+    #
+    # Standalone only, and said out loud everywhere else. The properties are
+    # about interrupt handling rather than transport, so tls, acl, fault,
+    # cluster and search have nothing to add - but a run that quietly covers
+    # less than the last one is how a suite stops being noticed, so the
+    # topologies that skip them say so.
+    #
+    local tap_part=""
+    if (( explicit_suite )); then
+        :
+    elif [[ "$topo" == "standalone" ]]; then
+        tap_part="$(tap_fragment)"
+    else
+        say "tap tests not run on '${topo}': they assert interrupt handling, which is transport-independent - run them on standalone"
+    fi
 
     ensure_vendored_libvalkey
 
@@ -788,6 +846,7 @@ cmd_test() {
         fi
         echo '--- unit ---'
         bash test/unit/run.sh
+${tap_part}
     "
 
     say "all suites passed (pg${PG_MAJOR}, valkey ${VALKEY_VERSION}, ${topo})"

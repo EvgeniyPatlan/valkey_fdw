@@ -180,9 +180,9 @@ arbitrary host and port out of a production catalogue.
 
 | Target | What it covers |
 |---|---|
-| `test` | 16 suites on the default topology; 9 more across `tls`, `acl`, `fault`, `cluster`, `search` |
-| `isolation` | two concurrent writers — who wins, and what the loser sees |
-| `tap` | a query cancelled from another session |
+| `test` | 16 suites on the default topology, plus the TAP tests; 9 more suites across `tls`, `acl`, `fault`, `cluster`, `search` |
+| `tap` | the TAP tests alone — a query cancelled from another session. Part of a full `test` on the default topology; this runs them by themselves |
+| `isolation` | two concurrent writers — who wins, and what the loser sees. Not part of `test` |
 | `test --cassert` | the whole suite under `CLOBBER_FREED_MEMORY` and `MEMORY_CONTEXT_CHECKING` |
 | `test --vendored` | linked against a pinned static libvalkey instead of the system one |
 | `mutate` | re-runs the defect behind each closed register entry and requires the suite to go red |
@@ -356,7 +356,7 @@ All builds run in containers. There is no supported host build.
 ./scripts/harness.sh down
 ```
 
-Useful flags: `--pg 16|17|18`, `--valkey 8.1.9|9.0.5`,
+Useful flags: `--pg 16|17|18`, `--valkey 8.1.9|9.0.5|9.1.1`,
 `--topology standalone|tls|acl|cluster|search`, `--sanitize address,undefined`,
 `--coverage`, `--vendored`.
 
