@@ -166,7 +166,10 @@ jobs:
                 dnf install -y -q dnf-plugins-core >/dev/null 2>&1
                 el=$(rpm -E %rhel)
                 dnf install -y -q "https://download.postgresql.org/pub/repos/yum/reporpms/EL-${el}-x86_64/pgdg-redhat-repo-latest.noarch.rpm" >/dev/null 2>&1
-                dnf -qy module disable postgresql >/dev/null 2>&1
+                # EL 10 dropped modularity, so this returns 1 there and
+                # aborts under set -e. It is a no-op where it fails,
+                # exactly as the build image already treats it.
+                dnf -qy module disable postgresql >/dev/null 2>&1 || true
                 dnf install -y "/d/${PKG}"
                 echo "installed; dependencies satisfied"
               '
