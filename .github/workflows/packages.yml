@@ -1,0 +1,135 @@
+name: Packages
+
+# Separate from CI, because it answers a different question.
+#
+# CI asks whether the code is correct. This asks whether the thing a user
+# installs is the thing this repository describes - which is not the same
+# question and does not have the same failure modes. A spec file can be wrong
+# in ways no suite can see: a licence that does not travel with the binary it
+# covers, a file left in the buildroot, a glob that quietly widens to catch
+# something the tree says must not ship.
+#
+# It runs on the same events as CI rather than only on a tag. Packaging breaks
+# from ordinary edits - a new source file, a renamed script, an added extension
+# - and finding that out at release time means finding it out under pressure.
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      pg:
+        description: PostgreSQL major to build against
+        type: choice
+        options: ["17", "16", "18"]
+        default: "17"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # Every target in the matrix, on one PostgreSQL major.
+    #
+    # Not the full target x major cross product: the packaging is what is
+    # under test here and it is shared across majors, so a second major
+    # multiplies the runtime while asking almost the same question. The
+    # workflow_dispatch input is how the other two get exercised deliberately.
+    name: ${{ matrix.target }} / pg${{ inputs.pg || '17' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - el-8
+          - el-9
+          - el-10
+          - amazon-2023
+          - debian-12
+          - debian-13
+          - ubuntu-24.04
+          - ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build the package
+        run: ./scripts/package.sh --pg ${{ inputs.pg || '17' }} --target ${{ matrix.target }}
+
+      # The build succeeding says the spec parses and the files exist. It says
+      # nothing about WHICH files, and three of the decisions this repository
+      # makes about its packages are invisible to a build that works:
+      #
+      #   the diagnostic extension is deliberately absent, because it carries
+      #   entry points that dial a host and port given as arguments;
+      #
+      #   libvalkey is linked statically, so its licence has to travel with
+      #   the binary that contains it;
+      #
+      #   the wrapper's own extension has to actually be there, which is the
+      #   assertion that would catch an exclusion written one glob too wide.
+      #
+      # A build alone would let any of the three silently reverse.
+      - name: The package contains what the tree says it contains
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          fail=0
+          check() {  # check <description> <condition-already-evaluated>
+            if [ "$2" = yes ]; then
+              printf 'ok    %s\n' "$1"
+            else
+              printf 'NOT OK %s\n' "$1" >&2
+              fail=1
+            fi
+          }
+
+          case "${{ matrix.target }}" in
+            el-*|amazon-*) family=rpm ;;
+            *)             family=deb ;;
+          esac
+
+          if [ "$family" = rpm ]; then
+            pkg=(dist/${{ matrix.target }}/*/*.rpm)
+            [ ${#pkg[@]} -eq 1 ] || { echo "expected one rpm, found ${#pkg[@]}" >&2; exit 1; }
+            # Listed from inside the image that built it, so no rpm tooling is
+            # assumed on the runner.
+            listing=$(docker run --rm -v "$PWD/dist:/d:ro" \
+                        valkey_fdw/pkg-${{ matrix.target }}:pg${{ inputs.pg || '17' }} \
+                        rpm -qlp "/d/${pkg[0]#dist/}")
+            licence='LICENSE-libvalkey'
+          else
+            pkg=(dist/${{ matrix.target }}/*/*.deb)
+            main=""
+            for p in "${pkg[@]}"; do case "$p" in *dbgsym*) ;; *) main="$p" ;; esac; done
+            [ -n "$main" ] || { echo "no non-dbgsym deb found" >&2; exit 1; }
+            listing=$(dpkg-deb -c "$main" | awk '{print $NF}')
+            licence='/copyright'
+          fi
+
+          echo "$listing"
+          echo '---'
+
+          grep -q 'extension/valkey_fdw\.control'   <<<"$listing" && a=yes || a=no
+          grep -q 'extension/valkey_fdw--.*\.sql'   <<<"$listing" && b=yes || b=no
+          grep -q 'valkey_fdw_test'                 <<<"$listing" && c=yes || c=no
+          grep -q "$licence"                        <<<"$listing" && d=yes || d=no
+
+          check 'the wrapper extension ships'                 "$a"
+          check 'its SQL script ships'                        "$b"
+          check 'the diagnostic extension does NOT ship'      "$([ "$c" = yes ] && echo no || echo yes)"
+          check 'the libvalkey licence travels with it'       "$d"
+
+          exit $fail
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}-pg${{ inputs.pg || '17' }}
+          path: dist/**
+          if-no-files-found: error
+          retention-days: 14

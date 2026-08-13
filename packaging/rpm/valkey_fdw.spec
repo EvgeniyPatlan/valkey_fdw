@@ -105,8 +105,13 @@ rm -f %{buildroot}%{pgpath}/share/extension/valkey_fdw_test.control \
 # One extension, named exactly. The glob in valkey_fdw--*.sql ranges over
 # VERSIONS and not over extension names, so this pair matches the wrapper and
 # every future upgrade script of its own without also matching valkey_fdw_test
-# - which %install has already removed from the buildroot, and which rpm would
-# otherwise fail the build over as an unpackaged file.
+# - which %%install has already removed from the buildroot, and which rpm would
+# otherwise fail the build over as an unpackaged file. Doubled because rpm
+# expands macros inside comments too, and %%install is one: written singly it
+# is replaced by its own definition and the spec acquires a second install
+# section, which fails the build a hundred lines from the comment that caused
+# it. %%files and %%build are not macros and pass either way, which is why the
+# one at the top of this file is left as it is.
 %{pgpath}/share/extension/valkey_fdw.control
 %{pgpath}/share/extension/valkey_fdw--*.sql
 
