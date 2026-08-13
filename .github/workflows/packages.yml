@@ -137,6 +137,59 @@ jobs:
 
           exit $fail
 
+      # Contents are not installability. The assertions above read a file
+      # list out of an archive, which says nothing about whether the package
+      # can be put on a machine: a binary that ended up linked against a
+      # library the target does not have produces a perfect file list and an
+      # unsatisfiable dependency. That happened - a working tree carrying
+      # objects from another build had them packaged instead of the ones this
+      # spec builds, and the result required two sonames no EL box has.
+      - name: The package installs
+        run: |
+          set -euo pipefail
+          case "${{ matrix.target }}" in
+            el-8)        img=oraclelinux:8 ;;
+            el-9)        img=oraclelinux:9 ;;
+            el-10)       img=oraclelinux:10 ;;
+            debian-12)   img=debian:12 ;;
+            debian-13)   img=debian:13 ;;
+            ubuntu-24.04) img=ubuntu:24.04 ;;
+            ubuntu-26.04) img=ubuntu:26.04 ;;
+            *) echo "no verification image for ${{ matrix.target }}" >&2; exit 1 ;;
+          esac
+
+          case "${{ matrix.target }}" in
+            el-*)
+              pkg=$(ls dist/${{ matrix.target }}/*/*.rpm)
+              docker run --rm -v "$PWD/dist:/d:ro" -e "PKG=${pkg#dist/}" "$img" bash -lc '
+                set -e
+                dnf install -y -q dnf-plugins-core >/dev/null 2>&1
+                el=$(rpm -E %rhel)
+                dnf install -y -q "https://download.postgresql.org/pub/repos/yum/reporpms/EL-${el}-x86_64/pgdg-redhat-repo-latest.noarch.rpm" >/dev/null 2>&1
+                dnf -qy module disable postgresql >/dev/null 2>&1
+                dnf install -y "/d/${PKG}"
+                echo "installed; dependencies satisfied"
+              '
+              ;;
+            *)
+              pkg=$(ls dist/${{ matrix.target }}/*/*.deb | grep -v dbgsym | head -1)
+              docker run --rm -v "$PWD/dist:/d:ro" -e "PKG=${pkg#dist/}" "$img" bash -lc '
+                set -e
+                export DEBIAN_FRONTEND=noninteractive
+                apt-get update -qq
+                apt-get install -y -qq curl ca-certificates gnupg lsb-release >/dev/null
+                install -d /usr/share/postgresql-common/pgdg
+                curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+                  -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+                echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+                  > /etc/apt/sources.list.d/pgdg.list
+                apt-get update -qq
+                apt-get install -y "/d/${PKG}"
+                echo "installed; dependencies satisfied"
+              '
+              ;;
+          esac
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}-pg${{ matrix.pg }}

@@ -111,6 +111,23 @@ build_one() {
                 mkdir -p /root/rpmbuild/{SOURCES,SPECS} /build/$name
                 cp -a /src/. /build/$name/
                 rm -rf /build/$name/dist /build/$name/.git
+                # The source copy is a WORKING TREE, not a clean checkout.
+                #
+                # The harness builds through a bind mount, so src/*.o and
+                # valkey_fdw.so outlive its container and sit in the directory
+                # this copies. make then finds every object newer than its
+                # source, compiles nothing, and the package ships the library
+                # the HARNESS built - a Debian binary linked against a shared
+                # libvalkey, inside an EL package that then requires two
+                # sonames the target does not have. It installs nowhere.
+                #
+                # Invisible in CI, which checks out clean, and reproducible on
+                # any machine where the suites have been run. Whatever the
+                # package contains has to be built here.
+                for pat in '*.o' '*.bc' '*.d' '*.so' '*.gcno' '*.gcda'; do
+                    find /build -type f -name "$pat" -delete
+                done
+                rm -rf /build/*/.harness
                 tar -C /build -czf /root/rpmbuild/SOURCES/$name.tar.gz $name
                 cp /src/packaging/rpm/valkey_fdw.spec /root/rpmbuild/SPECS/
                 rpmbuild -bb /root/rpmbuild/SPECS/valkey_fdw.spec \
@@ -127,6 +144,23 @@ build_one() {
                 mkdir -p /build/src
                 cp -a /src/. /build/src/
                 rm -rf /build/src/dist /build/src/.git
+                # The source copy is a WORKING TREE, not a clean checkout.
+                #
+                # The harness builds through a bind mount, so src/*.o and
+                # valkey_fdw.so outlive its container and sit in the directory
+                # this copies. make then finds every object newer than its
+                # source, compiles nothing, and the package ships the library
+                # the HARNESS built - a Debian binary linked against a shared
+                # libvalkey, inside an EL package that then requires two
+                # sonames the target does not have. It installs nowhere.
+                #
+                # Invisible in CI, which checks out clean, and reproducible on
+                # any machine where the suites have been run. Whatever the
+                # package contains has to be built here.
+                for pat in '*.o' '*.bc' '*.d' '*.so' '*.gcno' '*.gcda'; do
+                    find /build -type f -name "$pat" -delete
+                done
+                rm -rf /build/*/.harness
                 cd /build/src
                 cp -a packaging/deb/debian debian
                 # The binary package name carries the major, so the control
