@@ -18,12 +18,6 @@ on:
     branches: [master, main]
   pull_request:
   workflow_dispatch:
-    inputs:
-      pg:
-        description: PostgreSQL major to build against
-        type: choice
-        options: ["17", "16", "18"]
-        default: "17"
 
 permissions:
   contents: read
@@ -34,22 +28,38 @@ concurrency:
 
 jobs:
   build:
-    # Every target in the matrix, on one PostgreSQL major.
+    # Every target against every supported PostgreSQL major.
     #
-    # Not the full target x major cross product: the packaging is what is
-    # under test here and it is shared across majors, so a second major
-    # multiplies the runtime while asking almost the same question. The
-    # workflow_dispatch input is how the other two get exercised deliberately.
-    name: ${{ matrix.target }} / pg${{ inputs.pg || '17' }}
+    # The packaging is mostly shared across majors, so most of these cells ask
+    # a similar question - but not the same one. Each major has its own PGDG
+    # package set, its own server-dev headers, and on the RPM side its own
+    # answer to whether the repository carries that major for that EL release
+    # at all. Those are exactly the differences a smaller matrix would find at
+    # release time instead.
+    name: ${{ matrix.target }} / pg${{ matrix.pg }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
+        pg: ["16", "17", "18"]
+        # amazon-2023 is absent, and not because of the majors it carries.
+        #
+        # It ships 15 through 18, so the driver's assumption that only some
+        # majors are buildable there is not what stops it. Two other things
+        # do, and neither is a version question. Its development package is
+        # named postgresql<n>-server-devel where every other target in this
+        # list calls it postgresql<n>-devel, so the image installs a package
+        # that does not exist. And its PostgreSQL lives at /usr/lib64/pgsql
+        # rather than the /usr/pgsql-<n> the spec names, so even with the
+        # right package the build would look for pgxs where there is none.
+        #
+        # Listing it here would mean three cells that cannot go green, which
+        # teaches a reader to ignore this workflow. It stays a target of
+        # scripts/package.sh, where it is a request someone makes on purpose.
         target:
           - el-8
           - el-9
           - el-10
-          - amazon-2023
           - debian-12
           - debian-13
           - ubuntu-24.04
@@ -58,7 +68,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Build the package
-        run: ./scripts/package.sh --pg ${{ inputs.pg || '17' }} --target ${{ matrix.target }}
+        run: ./scripts/package.sh --pg ${{ matrix.pg }} --target ${{ matrix.target }}
 
       # The build succeeding says the spec parses and the files exist. It says
       # nothing about WHICH files, and three of the decisions this repository
@@ -100,7 +110,7 @@ jobs:
             # Listed from inside the image that built it, so no rpm tooling is
             # assumed on the runner.
             listing=$(docker run --rm -v "$PWD/dist:/d:ro" \
-                        valkey_fdw/pkg-${{ matrix.target }}:pg${{ inputs.pg || '17' }} \
+                        valkey_fdw/pkg-${{ matrix.target }}:pg${{ matrix.pg }} \
                         rpm -qlp "/d/${pkg[0]#dist/}")
             licence='LICENSE-libvalkey'
           else
@@ -129,7 +139,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.target }}-pg${{ inputs.pg || '17' }}
+          name: ${{ matrix.target }}-pg${{ matrix.pg }}
           path: dist/**
           if-no-files-found: error
           retention-days: 14

@@ -21,9 +21,15 @@ override_dh_auto_build:
 	rm -rf _libvalkey
 	git clone --depth 1 --branch $(LIBVALKEY_REF) \
 	    https://github.com/valkey-io/libvalkey.git _libvalkey
+#	CMAKE_INSTALL_LIBDIR is set rather than left to GNUInstallDirs, which
+#	answers lib here and lib64 on a 64-bit RPM distribution. The Makefile
+#	names lib, so the default happens to be right on this half of the target
+#	matrix - and stating it is what keeps the two halves building the same
+#	way rather than one of them relying on a default it never chose.
 	cmake -S _libvalkey -B _libvalkey/build \
 	      -DCMAKE_BUILD_TYPE=Release -DENABLE_TLS=ON -DDISABLE_TESTS=ON \
 	      -DBUILD_SHARED_LIBS=OFF -DCMAKE_INSTALL_PREFIX=$(PREFIX) \
+	      -DCMAKE_INSTALL_LIBDIR=lib \
 	      -DCMAKE_POSITION_INDEPENDENT_CODE=ON
 	cmake --build _libvalkey/build -j$(shell nproc)
 	cmake --install _libvalkey/build

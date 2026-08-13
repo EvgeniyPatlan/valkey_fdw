@@ -60,10 +60,17 @@ full or not at all.
 # version in the binary the version this suite tests against.
 git clone --depth 1 --branch %{libvalkey_ref} \
     https://github.com/valkey-io/libvalkey.git _libvalkey
+# CMAKE_INSTALL_LIBDIR is set rather than left to GNUInstallDirs, which
+# answers lib64 on a 64-bit RPM distribution and lib on a Debian one. The
+# Makefile names lib, so the default is right on one half of the target matrix
+# and wrong on the other - and wrong in a way that compiles: the headers are
+# found under include, every object builds, and only the link fails, naming an
+# archive that was installed one directory away.
 cmake -S _libvalkey -B _libvalkey/build \
       -DCMAKE_BUILD_TYPE=Release -DENABLE_TLS=ON -DDISABLE_TESTS=ON \
       -DBUILD_SHARED_LIBS=OFF \
       -DCMAKE_INSTALL_PREFIX=%{_builddir}/libvalkey-prefix \
+      -DCMAKE_INSTALL_LIBDIR=lib \
       -DCMAKE_POSITION_INDEPENDENT_CODE=ON
 cmake --build _libvalkey/build -j%{?_smp_build_ncpus}%{!?_smp_build_ncpus:4}
 cmake --install _libvalkey/build
