@@ -104,9 +104,21 @@ MUTATIONS = [
 
     # Owed a retry pass and out of budget is not the same answer as having
     # nothing left to chase; collapsing them drops the keys in silence.
+    #
+    # THE EDIT RESTORES THE COLLAPSE, and deliberately not by disabling the
+    # guard. `if (false && ...)` removes the only exit from the chase, and the
+    # fixture this runs against holds an ASK window open and never resolves it,
+    # so the mutant does not fail the suite - it spins in the retry pass until
+    # something outside kills it. A mutation that hangs proves nothing about
+    # the assertion and stalls every mutation after it, which is what a run of
+    # the whole set did here three times before this was understood.
+    #
+    # Returning false is the defect as it actually shipped: the scan reports
+    # itself finished while keys it was owed are still unfetched, the keyed
+    # lookup answers 0 rows, and cluster's recorded sqlstate changes.
     ("A7-redirect", "src/vfdw_scan_cluster.c",
      "\tif (state->redirect_passes <= 0)",
-     "\tif (false && state->redirect_passes <= 0)",
+     "\tif (state->redirect_passes <= 0)\n\t\treturn false;\n\tif (false)",
      "cluster", "cluster"),
 
     # The RESP2 halves of the row decoder. HELLO 3 succeeds against every
@@ -236,11 +248,25 @@ MUTATIONS = [
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+# Long enough for a cold topology - a cluster formation plus a build is minutes
+# - and short enough that a mutant which does not terminate is reported in one
+# sitting rather than stalling the run behind it.
+SUITE_TIMEOUT = 900
+
+
 def run_suite(pg, topology, suite):
-    r = subprocess.run(
-        ["./scripts/harness.sh", "test", "--pg", str(pg),
-         "--topology", topology, "--suite", suite],
-        cwd=HERE, capture_output=True, text=True)
+    # A mutation can remove a loop's only exit, and then the suite neither
+    # passes nor fails: it runs until something kills it. Unbounded, that is
+    # indistinguishable from slow, and every mutation queued after it is never
+    # reached - so the set reports nothing at all rather than reporting a
+    # problem. Bounded, it becomes a verdict of its own.
+    try:
+        r = subprocess.run(
+            ["./scripts/harness.sh", "test", "--pg", str(pg),
+             "--topology", topology, "--suite", suite],
+            cwd=HERE, capture_output=True, text=True, timeout=SUITE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return "TIMED-OUT"
     out = r.stdout + r.stderr
     # A build failure is not a caught mutation. An earlier runner in this
     # project read "did not exit 0" as "the test caught it", which counted
@@ -286,7 +312,15 @@ def main():
 
         good = verdict == "RED"
         ok = ok and good
-        note = "caught" if good else "<-- ASSERTS NOTHING"
+        # A timeout is its own complaint. Reporting it as "asserts nothing"
+        # would send a reader to look at the suite, when what needs changing is
+        # the mutation: it did not terminate, so the suite never got to answer.
+        if good:
+            note = "caught"
+        elif verdict == "TIMED-OUT":
+            note = f"<-- DID NOT TERMINATE in {SUITE_TIMEOUT}s; mutation, not suite"
+        else:
+            note = "<-- ASSERTS NOTHING"
         print(f"{rid:5s} {verdict:18s} {topology}/{suite:8s} {note}")
 
     # Leave the tree built from unmutated source rather than from whichever
