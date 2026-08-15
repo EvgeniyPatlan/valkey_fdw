@@ -43,7 +43,27 @@ typedef struct VfdwRowCtx
 	int			cur_elem;		/* element index within a collection reply */
 } VfdwRowCtx;
 
-extern bool vfdw_scan_is_multirow(VfdwTableType type);
+/*
+ * Resolve everything tuple construction caches for the life of a scan.
+ *
+ * Here rather than in the scan because what a column's Datum is built THROUGH
+ * is this file's business. A packed collection column is what makes the
+ * difference visible: the function it needs cached is its ELEMENT's input
+ * function, since the array is assembled from Datums and never passes through
+ * array_in.
+ */
+extern void vfdw_row_ctx_init(VfdwRowCtx *ctx, VfdwTableMap *map,
+							  MemoryContext cxt);
+
+/*
+ * Does one key of this table produce one row per member?
+ *
+ * Takes the MAP and not the table type, because the type alone cannot answer:
+ * a packed table over a list is the same table type as a column-mapped one and
+ * produces one row per KEY. Deciding from the type gives a packed table one
+ * row per member with the whole collection repeated in every one of them.
+ */
+extern bool vfdw_scan_is_multirow(const VfdwTableMap *map);
 extern int	vfdw_scan_member_stride(VfdwTableType type, const valkeyReply *reply);
 
 /*

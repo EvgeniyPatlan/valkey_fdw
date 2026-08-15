@@ -163,6 +163,14 @@ CREATE FOREIGN TABLE map_legacy_wide (k text, v text[], x text) SERVER map_srv
     OPTIONS (tabletype 'hash', legacy_value 'true');
 EXPLAIN (COSTS OFF) SELECT * FROM map_legacy_wide;
 
+-- The well-formed shape the width check above is measured against. It plans,
+-- which is the half of that pair worth stating: "wide is refused" says nothing
+-- unless narrow is accepted, and a check that refuses everything passes the
+-- first assertion.
+CREATE FOREIGN TABLE map_legacy (k text, v text[]) SERVER map_srv
+    OPTIONS (tabletype 'hash', legacy_value 'true');
+EXPLAIN (COSTS OFF) SELECT * FROM map_legacy;
+
 -- ---------------------------------------------------------------------------
 -- Shapes that are designed and validated but not yet read.
 --
@@ -171,10 +179,6 @@ EXPLAIN (COSTS OFF) SELECT * FROM map_legacy_wide;
 -- plausible empty result, which is the failure this wrapper exists to avoid,
 -- so they are refused at plan time until the phase that implements them.
 -- ---------------------------------------------------------------------------
-CREATE FOREIGN TABLE map_legacy (k text, v text[]) SERVER map_srv
-    OPTIONS (tabletype 'hash', legacy_value 'true');
-EXPLAIN (COSTS OFF) SELECT * FROM map_legacy;
-
 CREATE FOREIGN TABLE map_ttl (
     k text,
     f text      OPTIONS (field 'f'),

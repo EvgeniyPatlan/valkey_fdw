@@ -213,6 +213,45 @@ vfdw_check_key_options(List *options)
 						 "alternatives; keep exactly one.")));
 }
 
+/*
+ * A packed collection over a string, refused here for the reason the check
+ * above is here: the rule is about two options together, so no per-option
+ * validator can see it.
+ *
+ * A string holds one value and has no members. An array of it would always
+ * have one element and its length would say nothing, the mapped shape already
+ * reads that value, and the packed one would give a string table a second
+ * answer to "is this key absent" - GET's nil, or an empty container.
+ *
+ * vfdw_map_resolve_packed refuses it too, and both are wanted: this one
+ * catches the definition, that one catches a catalogue row nothing validated.
+ */
+static void
+vfdw_check_shape_options(List *options)
+{
+	const char *tabletype = NULL;
+	bool		legacy = false;
+	ListCell   *lc;
+
+	foreach(lc, options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "tabletype") == 0)
+			tabletype = defGetString(def);
+		else if (strcmp(def->defname, "legacy_value") == 0)
+			legacy = defGetBoolean(def);
+	}
+
+	if (legacy && tabletype != NULL && strcmp(tabletype, "string") == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("legacy_value cannot be combined with tabletype \"string\""),
+				 errdetail("A string holds one value, not a collection."),
+				 errhint("Drop legacy_value to read it as a single column, or "
+						 "name a collection table type.")));
+}
+
 Datum
 valkey_fdw_validator(PG_FUNCTION_ARGS)
 {
@@ -259,7 +298,10 @@ valkey_fdw_validator(PG_FUNCTION_ARGS)
 	 * combination rule fires on options that may themselves be nonsense.
 	 */
 	if (context == ForeignTableRelationId)
+	{
 		vfdw_check_key_options(options);
+		vfdw_check_shape_options(options);
+	}
 
 	PG_RETURN_VOID();
 }

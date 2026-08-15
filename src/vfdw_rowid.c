@@ -14,6 +14,8 @@
  */
 #include "vfdw_rowid.h"
 
+#include "vfdw_refuse.h"
+
 #include "access/table.h"
 #include "catalog/pg_foreign_table.h"
 #include "executor/executor.h"
@@ -116,6 +118,17 @@ vfdw_rowid_add_update_targets(PlannerInfo *root, Index rtindex,
 	Oid			relid = RelationGetRelid(target_relation);
 	VfdwTableMap *map = vfdw_map_build(target_relation, GetForeignTable(relid));
 	VfdwRowId	rowid;
+
+	/*
+	 * Asked here, before the shape is taken, because this callback runs ahead
+	 * of PlanForeignModify and vfdw_rowid_shape has no answer for a table that
+	 * cannot be written. A packed collection is the case: it names no member
+	 * column, so the shape would demand one and reach its own internal error -
+	 * an XX000 about row identity, for a table whose real answer is that this
+	 * shape reads and does not write. The refusal that says so lives one
+	 * callback later, and nothing reaches it.
+	 */
+	vfdw_refuse_unwritable(relid, map, root->parse->commandType);
 
 	vfdw_rowid_shape(map, root->parse->commandType, &rowid);
 

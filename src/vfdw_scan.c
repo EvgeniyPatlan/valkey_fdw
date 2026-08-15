@@ -87,7 +87,18 @@ vfdw_scan_value_command(VfdwScanState *state, VfdwCmd *cmd,
 			vfdw_cmd_add_bytes(cmd, key, keylen);
 			vfdw_cmd_add_cstr(cmd, "0");
 			vfdw_cmd_add_cstr(cmd, "-1");
-			vfdw_cmd_add_cstr(cmd, "WITHSCORES");
+
+			/*
+			 * A packed table takes the members and not the scores, so it does
+			 * not ask for them. WITHSCORES is answered by RESP2 with member
+			 * and score alternating and by RESP3 with a nested pair per member
+			 * (see vfdw_scan_member_at), so packing that reply would give the
+			 * same table a differently-shaped array depending on which
+			 * protocol the connection negotiated. A score is read by mapping a
+			 * score column instead.
+			 */
+			if (!state->map->legacy_value)
+				vfdw_cmd_add_cstr(cmd, "WITHSCORES");
 			break;
 		case VFDW_TABLE_STRING:
 		default:
@@ -543,7 +554,7 @@ vfdw_scan_fetch(VfdwScanState *state, TupleTableSlot *slot)
 		}
 
 		vfdw_scan_expect_value(state, reply);
-		if (vfdw_scan_is_multirow(state->map->tabletype))
+		if (vfdw_scan_is_multirow(state->map))
 		{
 			vfdw_scan_take_collection(state, key, keylen, reply);
 			continue;
@@ -629,7 +640,6 @@ vfdw_scan_state_create(Relation rel, MemoryContext parent)
 	MemoryContext scan_cxt = AllocSetContextCreate(parent, "valkey_fdw scan",
 												   ALLOCSET_DEFAULT_SIZES);
 	VfdwScanState *state;
-	int			i;
 
 	state = MemoryContextAllocZero(scan_cxt, sizeof(VfdwScanState));
 	state->scan_cxt = scan_cxt;
@@ -646,20 +656,7 @@ vfdw_scan_state_create(Relation rel, MemoryContext parent)
 
 	vfdw_conn_select_db(state->vconn, state->map->database);
 
-	state->infuncs = MemoryContextAlloc(scan_cxt,
-										sizeof(FmgrInfo) * Max(state->map->natts, 1));
-	for (i = 0; i < state->map->natts; i++)
-	{
-		if (state->map->cols[i].attnum == InvalidAttrNumber)
-			continue;
-		fmgr_info_cxt(state->map->cols[i].typinput, &state->infuncs[i], scan_cxt);
-	}
-
-	state->rowctx.map = state->map;
-	state->rowctx.infuncs = state->infuncs;
-	state->rowctx.domain_extra =
-		MemoryContextAllocZero(scan_cxt, sizeof(void *) * Max(state->map->natts, 1));
-	state->rowctx.cache_cxt = scan_cxt;
+	vfdw_row_ctx_init(&state->rowctx, state->map, scan_cxt);
 
 	state->batch_cxt = AllocSetContextCreate(scan_cxt, "valkey_fdw scan batch",
 											 ALLOCSET_SMALL_SIZES);

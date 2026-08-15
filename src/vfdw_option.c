@@ -201,12 +201,16 @@ const VfdwOptionDef vfdw_options[] = {
 	/*
 	 * ACCEPTED AND REFUSED, WHICH IS A POSITION RATHER THAN AN OVERSIGHT.
 	 *
-	 * search_index and legacy_value here, and ttl, distance and index_type in
-	 * the column group below, all validate and then do not do what they name:
-	 * the first plan over a legacy_value, ttl or distance table raises 0A000,
-	 * and the two search options are simply never consulted - the ordinary key
-	 * path answers, no qual reaches an index. They are accepted so that a
-	 * table definition can be written ahead of the feature.
+	 * search_index here, and ttl, distance and index_type in the column group
+	 * below, validate and then do not do what they name: the first plan over a
+	 * ttl or distance table raises 0A000, and the two search options are
+	 * simply never consulted - the ordinary key path answers, no qual reaches
+	 * an index. They are accepted so that a table definition can be written
+	 * ahead of the feature.
+	 *
+	 * legacy_value is no longer one of them. It reads, and its writes are
+	 * refused for a reason of their own - a packed collection names no member,
+	 * so a row in it has no identity to update or delete by.
 	 *
 	 * The rule that keeps this from being a broken promise: an option may be
 	 * accepted and refused only where a suite asserts the exact refusal and

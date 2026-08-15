@@ -21,9 +21,43 @@
 
 #include "executor/executor.h"
 #include "mb/pg_wchar.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 
 #include "vfdw_cmd.h"
+
+/*
+ * One FmgrInfo per attribute, plus the per-attribute domain cache.
+ *
+ * A packed column's values arrive one element at a time, so the function
+ * cached for it is the ELEMENT's input function: the array itself is built
+ * from Datums by construct_md_array and never passes through array_in, and
+ * caching array_in here would leave the elements with no input function at
+ * all.
+ */
+void
+vfdw_row_ctx_init(VfdwRowCtx *ctx, VfdwTableMap *map, MemoryContext cxt)
+{
+	int			i;
+
+	ctx->map = map;
+	ctx->infuncs = MemoryContextAlloc(cxt, sizeof(FmgrInfo) * Max(map->natts, 1));
+	ctx->domain_extra = MemoryContextAllocZero(cxt,
+											   sizeof(void *) * Max(map->natts, 1));
+	ctx->cache_cxt = cxt;
+	ctx->cur_elem = 0;
+
+	for (i = 0; i < map->natts; i++)
+	{
+		const VfdwColumn *col = &map->cols[i];
+
+		if (col->attnum == InvalidAttrNumber)
+			continue;
+
+		fmgr_info_cxt(col->packed != NULL ? col->packed->col.typinput
+					  : col->typinput, &ctx->infuncs[i], cxt);
+	}
+}
 
 /*
  * Bytes from Valkey to a Datum of the column's declared type.
@@ -97,6 +131,74 @@ vfdw_scan_store(VfdwRowCtx *ctx, TupleTableSlot *slot,
 	}
 
 	slot->tts_values[idx] = vfdw_row_datum_from_bytes(ctx, col, data, len);
+	slot->tts_isnull[idx] = false;
+}
+
+/*
+ * The whole collection, as one array, for a packed table.
+ *
+ * WHAT THE ARRAY HOLDS, per table type, and why:
+ *
+ * A hash is its reply in the reply's own order - field, value, field, value.
+ * That flat alternation is what makes hstore(value) reconstruct the hash, and
+ * reconstructing a hash whose fields were not known when the table was defined
+ * is the whole reason this shape exists. It is the same order under both
+ * protocol versions: libvalkey lays a RESP3 map out as 2n alternating children
+ * exactly as RESP2 sends them, which is the same fact vfdw_scan_hash_lookup
+ * relies on to walk a hash in pairs without asking which protocol it got.
+ *
+ * A list and a set are their members, in the order the server gave them.
+ *
+ * A zset is its members and NOT its scores: vfdw_scan_value_command drops
+ * WITHSCORES for a packed table, so the reply is a flat array of members under
+ * either protocol. Packing scores as well would make the array's shape depend
+ * on the transport rather than on the data, since WITHSCORES answers RESP2
+ * with member and score alternating and RESP3 with a nested pair per member.
+ *
+ * Every element goes through vfdw_row_datum_from_bytes, so a text element is
+ * verified against the server encoding by the one route every other text value
+ * takes, and a bytea element keeps bytes that route would reject (I3).
+ */
+static void
+vfdw_row_store_packed(VfdwRowCtx *ctx, TupleTableSlot *slot,
+					  const VfdwColumn *col, const valkeyReply *reply)
+{
+	const VfdwPackedElem *elem = col->packed;
+	int			idx = col->attnum - 1;
+	int			n = (int) reply->elements;
+	Datum	   *values = palloc(sizeof(Datum) * Max(n, 1));
+	bool	   *nulls = palloc0(sizeof(bool) * Max(n, 1));
+	int			dims[1];
+	int			lbs[1];
+	int			i;
+
+	for (i = 0; i < n; i++)
+	{
+		const valkeyReply *e = vfdw_reply_child(reply, (size_t) i);
+
+		/*
+		 * A null element becomes a NULL element rather than being dropped:
+		 * dropping it would shift every later member down one position, and
+		 * for a hash that turns the field,value alternation into a mapping of
+		 * each field onto the next field's value. libvalkey never leaves str
+		 * NULL for a zero-length bulk, so this is an element that carried no
+		 * bytes at all rather than an empty one.
+		 */
+		if (e->str == NULL)
+		{
+			nulls[i] = true;
+			continue;
+		}
+
+		values[i] = vfdw_row_datum_from_bytes(ctx, &elem->col, e->str, e->len);
+	}
+
+	dims[0] = n;
+	lbs[0] = 1;
+	slot->tts_values[idx] =
+		PointerGetDatum(construct_md_array(values, nulls, 1, dims, lbs,
+										   elem->col.typid, elem->typlen,
+										   elem->typbyval, elem->typalign));
 	slot->tts_isnull[idx] = false;
 }
 
@@ -208,11 +310,25 @@ vfdw_scan_member_stride(VfdwTableType type, const valkeyReply *reply)
 	return 2;
 }
 
+/*
+ * One row per member, or one row per key?
+ *
+ * The MAP decides, not the table type. A packed table over a list, a set or a
+ * zset is the same table type as a column-mapped one and answers with one row
+ * per KEY, the members packed into its array column; taking the answer from
+ * the type gives it one row per member instead, each carrying a copy of the
+ * whole collection, and the row count is then the member count rather than the
+ * key count.
+ */
 bool
-vfdw_scan_is_multirow(VfdwTableType type)
+vfdw_scan_is_multirow(const VfdwTableMap *map)
 {
-	return type == VFDW_TABLE_LIST || type == VFDW_TABLE_SET ||
-		type == VFDW_TABLE_ZSET;
+	if (map->legacy_value)
+		return false;
+
+	return map->tabletype == VFDW_TABLE_LIST ||
+		map->tabletype == VFDW_TABLE_SET ||
+		map->tabletype == VFDW_TABLE_ZSET;
 }
 
 /*
@@ -244,53 +360,55 @@ vfdw_row_fill_column(VfdwRowCtx *ctx, TupleTableSlot *slot,
 	const char *data = NULL;
 	size_t		len = 0;
 
+	switch (col->kind)
 	{
-		switch (col->kind)
+		case VFDW_COL_KEY:
+			vfdw_scan_store(ctx, slot, col, key, keylen);
+			break;
+
+		case VFDW_COL_VALUE:
+			if (reply->type == VALKEY_REPLY_STRING)
+				vfdw_scan_store(ctx, slot, col, reply->str, reply->len);
+			break;
+
+		case VFDW_COL_FIELD:
+			if (reply->type == VALKEY_REPLY_MAP ||
+				reply->type == VALKEY_REPLY_ARRAY)
+			{
+				if (vfdw_scan_hash_lookup(reply, col->field, &data, &len))
+					vfdw_scan_store(ctx, slot, col, data, len);
+			}
+			break;
+
+		case VFDW_COL_LEGACY_VALUE:
+			vfdw_row_store_packed(ctx, slot, col, reply);
+			break;
+
+		case VFDW_COL_MEMBER:
 		{
-			case VFDW_COL_KEY:
-				vfdw_scan_store(ctx, slot, col, key, keylen);
-				break;
+			const valkeyReply *m = NULL;
+			const valkeyReply *sc = NULL;
 
-			case VFDW_COL_VALUE:
-				if (reply->type == VALKEY_REPLY_STRING)
-					vfdw_scan_store(ctx, slot, col, reply->str, reply->len);
-				break;
-
-			case VFDW_COL_FIELD:
-				if (reply->type == VALKEY_REPLY_MAP ||
-					reply->type == VALKEY_REPLY_ARRAY)
-				{
-					if (vfdw_scan_hash_lookup(reply, col->field, &data, &len))
-						vfdw_scan_store(ctx, slot, col, data, len);
-				}
-				break;
-
-			case VFDW_COL_MEMBER:
-			{
-				const valkeyReply *m = NULL;
-				const valkeyReply *sc = NULL;
-
-				if (vfdw_scan_member_at(reply, ctx->cur_elem,
-										map->tabletype == VFDW_TABLE_ZSET,
-										&m, &sc))
-					vfdw_scan_store(ctx, slot, col, m->str, m->len);
-				break;
-			}
-
-			case VFDW_COL_SCORE:
-			{
-				const valkeyReply *m = NULL;
-				const valkeyReply *sc = NULL;
-
-				if (vfdw_scan_member_at(reply, ctx->cur_elem, true, &m, &sc) &&
-					sc != NULL && sc->str != NULL)
-					vfdw_scan_store(ctx, slot, col, sc->str, sc->len);
-				break;
-			}
-
-			default:
-				/* Remaining kinds arrive with the write and search phases. */
-				break;
+			if (vfdw_scan_member_at(reply, ctx->cur_elem,
+									map->tabletype == VFDW_TABLE_ZSET,
+									&m, &sc))
+				vfdw_scan_store(ctx, slot, col, m->str, m->len);
+			break;
 		}
+
+		case VFDW_COL_SCORE:
+		{
+			const valkeyReply *m = NULL;
+			const valkeyReply *sc = NULL;
+
+			if (vfdw_scan_member_at(reply, ctx->cur_elem, true, &m, &sc) &&
+				sc != NULL && sc->str != NULL)
+				vfdw_scan_store(ctx, slot, col, sc->str, sc->len);
+			break;
+		}
+
+		default:
+			/* ttl and distance arrive with the phases that fill them. */
+			break;
 	}
 }

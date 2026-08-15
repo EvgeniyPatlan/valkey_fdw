@@ -175,6 +175,65 @@ vfdw_map_read_column_options(VfdwColumn *col, List *options)
 }
 
 /*
+ * Table options that contradict each other.
+ *
+ * The three key-discovery strategies are alternatives. A rule that is
+ * documented but not enforced, because the branch meant to check it is
+ * unreachable, leaves the combination accepted and one option silently
+ * ignored at runtime.
+ *
+ * valkey_fdw_validator sees a table's whole option list, so it refuses that
+ * combination at CREATE and at ALTER too - which is where the mistake is, and
+ * which is what keeps vfdw_map_writability from calling such a table fully
+ * updatable. The check here is the second line, for a catalog row nothing
+ * validated.
+ *
+ * The legacy_value rule below has only this line. The validator does not check
+ * it, so that contradiction is caught at the first plan rather than at CREATE;
+ * it belongs beside the trio in vfdw_check_key_options, which is the one place
+ * that sees a table's options together.
+ */
+static void
+vfdw_map_check_table_options(const VfdwTableMap *map)
+{
+	if (map->singleton_key != NULL && map->keyprefix != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("singleton_key cannot be combined with keyprefix")));
+	if (map->singleton_key != NULL && map->keyset != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("singleton_key cannot be combined with keyset")));
+	if (map->keyprefix != NULL && map->keyset != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("keyprefix cannot be combined with keyset")));
+
+	/*
+	 * legacy_value packs a collection into one array. A "string" key holds one
+	 * value and has no members, so the two contradict each other, and the
+	 * contradiction is between two TABLE options - which is why it is refused
+	 * here beside the three above rather than argued about per column.
+	 *
+	 * An array of one element is the other defensible answer and is rejected
+	 * deliberately: it is the only case in which the array's length would say
+	 * nothing about the data, it makes every query unwrap a value that
+	 * (key, value text) already delivers, and it would give a string table a
+	 * second, differently-shaped answer to "is this key absent" - GET says so
+	 * with a nil, while vfdw_scan_reply_is_absent reads emptiness only for the
+	 * container types.
+	 */
+	if (map->legacy_value && map->tabletype == VFDW_TABLE_STRING)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("legacy_value requires a collection tabletype"),
+				 errdetail("A \"string\" key holds one value, not a collection, "
+						   "so there is nothing to pack into an array."),
+				 errhint("Use tabletype 'hash', 'list', 'set' or 'zset', or "
+						 "drop legacy_value and map the value to a column.")));
+}
+
+/*
  * Table-level options.
  */
 static void
@@ -214,30 +273,7 @@ vfdw_map_read_table_options(VfdwTableMap *map, List *options)
 			map->readonly = vfdw_parse_bool(def, value);
 	}
 
-	/*
-	 * The three key-discovery strategies are alternatives. A rule that is
-	 * documented but not enforced, because the branch meant to check it is
-	 * unreachable, leaves the combination accepted and one option silently
-	 * ignored at runtime.
-	 *
-	 * valkey_fdw_validator sees a table's whole option list, so it refuses the
-	 * combination at CREATE and at ALTER - which is where the mistake is, and
-	 * which is what keeps vfdw_map_writability from calling such a table
-	 * fully updatable. These three are the second line, for a catalog row
-	 * nothing validated.
-	 */
-	if (map->singleton_key != NULL && map->keyprefix != NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("singleton_key cannot be combined with keyprefix")));
-	if (map->singleton_key != NULL && map->keyset != NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("singleton_key cannot be combined with keyset")));
-	if (map->keyprefix != NULL && map->keyset != NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("keyprefix cannot be combined with keyset")));
+	vfdw_map_check_table_options(map);
 }
 
 /*
@@ -317,9 +353,19 @@ vfdw_map_report_unsourced(VfdwTableMap *map, TupleDesc tupdesc, int unclaimed)
 }
 
 /*
- * The legacy layout: (key, value) by position, no column options. Supported
- * for migration only, which is why it is a separate shape rather than a
- * special case threaded through the normal one.
+ * The packed layout: (key, value) by position, no column options.
+ *
+ * A separate shape rather than a special case threaded through the normal one,
+ * because it answers a different question. Every other shape names each hash
+ * field in a column option, so a keyspace of per-tenant hashes whose field
+ * sets differ from key to key - or are simply not known when the table is
+ * defined - has no expressible mapping at all. This one hands the whole
+ * collection over in one array and lets the query decide what it is:
+ *
+ *		SELECT key, (populate_record(NULL::t, hstore(value))).* FROM tbl
+ *
+ * is schema-on-read, and it is why the array a hash produces is the reply's
+ * own field,value,field,value order (see vfdw_row_store_packed).
  */
 static void
 vfdw_map_assign_legacy(VfdwTableMap *map)
@@ -329,6 +375,19 @@ vfdw_map_assign_legacy(VfdwTableMap *map)
 				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
 				 errmsg("legacy_value tables must have exactly two columns"),
 				 errdetail("This table has %d.", map->natts)));
+
+	/*
+	 * A dropped column keeps its attnum, so a table can pass the width test
+	 * with only one live column. Refused rather than mapped: the dropped one
+	 * has no type resolved behind it, and asking for the element type of a
+	 * type that was never looked up is a cache lookup on InvalidOid.
+	 */
+	if (map->cols[0].attnum == InvalidAttrNumber ||
+		map->cols[1].attnum == InvalidAttrNumber)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				 errmsg("legacy_value tables must have exactly two columns"),
+				 errdetail("One of this table's two columns has been dropped.")));
 
 	map->cols[0].kind = VFDW_COL_KEY;
 	map->keyattno = map->cols[0].attnum;
@@ -483,6 +542,75 @@ vfdw_map_check_types(VfdwTableMap *map, TupleDesc tupdesc)
 }
 
 /*
+ * Resolve what a packed column's array is made of, or refuse the column.
+ *
+ * One row carries the whole collection, so the column is an array and its
+ * elements are the members. Two element types and no others: text, checked
+ * against the server encoding like every other text value, and bytea, which
+ * is the only one that can carry a member holding a NUL or bytes that are not
+ * valid in the server encoding at all (invariant I3). A column that is neither
+ * is a table definition error naming the column, because the alternative -
+ * discovering it when the first row is built - is a runtime failure per key
+ * for a mistake that is visible in the CREATE statement.
+ */
+static void
+vfdw_map_resolve_packed(VfdwTableMap *map, TupleDesc tupdesc)
+{
+	VfdwPackedElem *elem;
+	VfdwColumn *col;
+	const char *name;
+	Oid			elemtypid;
+	Oid			elembase;
+
+	if (!map->legacy_value)
+		return;
+
+	/* vfdw_map_assign_legacy fixed the shape: the key first, the array last. */
+	col = &map->cols[map->natts - 1];
+	name = NameStr(TupleDescAttr(tupdesc, map->natts - 1)->attname);
+
+	/*
+	 * A domain over the ARRAY is refused rather than quietly accepted: the
+	 * array is assembled from element Datums and never passes through
+	 * array_in, so a constraint on the array as a whole would never run, and a
+	 * constraint that never runs is worse than a table that is not created. A
+	 * domain over the ELEMENT is fine - vfdw_row_datum_from_bytes applies that
+	 * one per element, exactly as it does for a scalar column.
+	 */
+	if (col->is_domain)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				 errmsg("column \"%s\" cannot be a domain over an array", name),
+				 errdetail("The array is built from its elements rather than "
+						   "parsed, so a constraint on the array itself would "
+						   "never be checked."),
+				 errhint("Declare the column text[] or bytea[], or move the "
+						 "domain to the element type.")));
+
+	elemtypid = get_element_type(col->typid);
+	elembase = OidIsValid(elemtypid) ? getBaseType(elemtypid) : InvalidOid;
+
+	if (elembase != TEXTOID && elembase != BYTEAOID)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				 errmsg("column \"%s\" must be an array of text or of bytea",
+						name),
+				 errdetail("A legacy_value table gives one row per key with the "
+						   "whole collection in this column, so it holds the "
+						   "members rather than one value."),
+				 errhint("Use text[] for members that are text in the server "
+						 "encoding, or bytea[] for arbitrary bytes.")));
+
+	elem = palloc0(sizeof(VfdwPackedElem));
+	vfdw_map_resolve_type(&elem->col, elemtypid, col->typmod);
+	elem->col.attnum = col->attnum;
+	elem->col.kind = col->kind;
+	get_typlenbyvalalign(elemtypid, &elem->typlen, &elem->typbyval,
+						 &elem->typalign);
+	col->packed = elem;
+}
+
+/*
  * Refuse what the option grammar accepts but the scan cannot yet read.
  *
  * These shapes are part of the design and their options validate, but nothing
@@ -496,11 +624,6 @@ static void
 vfdw_map_check_implemented(VfdwTableMap *map, TupleDesc tupdesc)
 {
 	int			i;
-
-	if (map->legacy_value)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("legacy_value tables are not implemented yet")));
 
 	for (i = 0; i < map->natts; i++)
 	{
@@ -643,6 +766,7 @@ vfdw_map_build(Relation rel, ForeignTable *table)
 
 	vfdw_map_assign_defaults(map, tupdesc);
 	vfdw_map_check_types(map, tupdesc);
+	vfdw_map_resolve_packed(map, tupdesc);
 	vfdw_map_index_roles(map, tupdesc);
 	vfdw_map_check_implemented(map, tupdesc);
 

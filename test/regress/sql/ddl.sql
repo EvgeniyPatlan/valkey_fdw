@@ -94,8 +94,12 @@ CREATE FOREIGN TABLE w_list (k text, m text OPTIONS (member 'true'))
     SERVER w_srv OPTIONS (tabletype 'list');
 CREATE FOREIGN TABLE w_readonly (k text, v text) SERVER w_srv
     OPTIONS (readonly 'true');
+-- Scoped to a prefix nothing else writes. This table is READ once below, and
+-- an unscoped one would walk the whole keyspace and print whatever the suites
+-- before it left behind - an assertion whose answer is decided by execution
+-- order rather than by this file.
 CREATE FOREIGN TABLE w_legacy (k text, v text[]) SERVER w_srv
-    OPTIONS (tabletype 'hash', legacy_value 'true');
+    OPTIONS (tabletype 'hash', legacy_value 'true', keyprefix 'ddl:legacy:');
 
 -- A table whose reader is not implemented for a reason that has nothing to do
 -- with row identity, and one whose column is not implemented at all. Both used
@@ -155,8 +159,10 @@ ORDER BY c.relname;
 -- ---------------------------------------------------------------------------
 -- Accepted, then refused.
 --
--- Five options validate at DDL and then do not do what they name:
--- legacy_value, a ttl column, a distance column, search_index and index_type.
+-- Four options validate at DDL and then do not do what they name: a ttl
+-- column, a distance column, search_index and index_type. legacy_value has
+-- left this list - it reads - and its write direction is refused below for a
+-- reason of its own, which is row identity rather than an absent feature.
 -- The validator takes them so that a table definition can be written ahead of
 -- the feature, and that is only an honest bargain while the refusal is exact
 -- and something holds it still. Unasserted, a refusal is free to become a
@@ -177,7 +183,12 @@ CREATE FOREIGN TABLE w_distance (
 -- The read direction. Each message names the column or the shape that is
 -- waiting, not the table type, because that is the line the user has to
 -- delete to make the query run.
-SELECT * FROM w_legacy;
+-- legacy_value is no longer among them, so this one is seeded and asserted on
+-- what comes back rather than on the refusal it used to raise.
+SELECT valkey_fdw_test_probe('w_srv', 0, 'HSET', 'ddl:legacy:h', 'f', 'fv')
+    IS NOT NULL AS seeded;
+SELECT k, v FROM w_legacy ORDER BY k;
+
 SELECT * FROM w_ttl;
 SELECT * FROM w_distance;
 
@@ -222,7 +233,8 @@ FROM pg_class c
 WHERE c.relname IN ('w_distance', 'w_index_type', 'w_search_read')
 ORDER BY c.relname;
 
-SELECT valkey_fdw_test_probe('w_srv', 0, 'DEL', 'ddl:inert:s1', 'ddl:inert:h1')
+SELECT valkey_fdw_test_probe('w_srv', 0, 'DEL', 'ddl:inert:s1', 'ddl:inert:h1',
+                             'ddl:legacy:h')
     IS NOT NULL AS cleaned;
 
 DROP SERVER w_srv CASCADE;

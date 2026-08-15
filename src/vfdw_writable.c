@@ -32,10 +32,10 @@
  *
  * IsForeignRelUpdatable is called by the rewriter for every foreign table it
  * touches, and by information_schema.tables for every relation in the
- * database. It must therefore never raise: vfdw_map_build refuses a json or
- * legacy_value table, and the regression database is left holding several of
- * those, so a map built here would break the next suite's first look at
- * information_schema rather than the write it was asked about.
+ * database. It must therefore never raise: vfdw_map_build refuses a table
+ * whose column reads ttl or distance, and the regression database is left
+ * holding several of those, so a map built here would break the next suite's
+ * first look at information_schema rather than the write it was asked about.
  *
  * So the options are read directly, with parsers that report failure instead
  * of raising. They were validated at DDL time; anything unrecognised here is
@@ -141,9 +141,18 @@ vfdw_map_write_block(Oid relid, const VfdwWritability *w, const char **hint)
 	}
 	if (w->legacy)
 	{
-		*hint = "See the README for the shapes that are.";
-		return "legacy_value is not implemented, so this table has no reader "
-			"and no writer.";
+		/*
+		 * Read-only, and not merely unimplemented: an array of members carries
+		 * no identity for any member in it, so nothing in a packed row says
+		 * WHICH member an UPDATE changed or whether a shorter array means
+		 * "remove the rest" or "leave them alone". The mapped shapes answer
+		 * that by naming a member or a field per column, which is where a
+		 * write belongs.
+		 */
+		*hint = "Map the members to columns of their own to write them.";
+		return "A legacy_value table reads the whole collection into one "
+			"array, and an array of members says nothing about which member a "
+			"write means.";
 	}
 	if (w->search_index)
 	{

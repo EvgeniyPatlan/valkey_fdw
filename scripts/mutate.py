@@ -243,6 +243,28 @@ MUTATIONS = [
      "\t\tplan->state = VFDW_KEY_CREATED;",
      "\t\tplan->state = VFDW_KEY_LIVE;",
      "standalone", "wbuf"),
+
+    # One row per key against one row per member. The table TYPE cannot decide
+    # this: a packed table over a list is the same type as a column-mapped one.
+    # Taking the answer from the type gives a packed list one row per MEMBER,
+    # each carrying a copy of the whole array, so the row count silently
+    # becomes the member count - a result that looks like data rather than
+    # like a failure. legacy asserts the row counts and the arrays beside them.
+    ("PK1", "src/vfdw_row.c",
+     "\tif (map->legacy_value)\n\t\treturn false;",
+     "\tif (false && map->legacy_value)\n\t\treturn false;",
+     "standalone", "legacy"),
+
+    # A packed zset takes members, not scores. Restoring WITHSCORES makes the
+    # array's shape follow the negotiated protocol rather than the data: RESP2
+    # returns member and score alternating, RESP3 a nested pair per member
+    # whose children carry no bytes of their own. The zset round trip in
+    # legacy asserts the members alone, so both spellings go red.
+    ("PK2", "src/vfdw_scan.c",
+     "\t\t\tif (!state->map->legacy_value)\n"
+     "\t\t\t\tvfdw_cmd_add_cstr(cmd, \"WITHSCORES\");",
+     "\t\t\tvfdw_cmd_add_cstr(cmd, \"WITHSCORES\");",
+     "standalone", "legacy"),
 ]
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

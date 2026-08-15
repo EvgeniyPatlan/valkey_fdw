@@ -58,7 +58,7 @@ typedef struct VfdwScanState
 	MemoryContext seen_cxt;
 	VfdwBatch  *batch;
 
-	FmgrInfo   *infuncs;		/* one per attribute */
+	/* Type resolution and the input functions live here; see vfdw_row_ctx_init. */
 	VfdwRowCtx	rowctx;
 
 	/*

@@ -36,12 +36,13 @@ including against a cluster. Vector search does not.
 | Area | State |
 |---|---|
 | Table types | `string`, `hash`, `list`, `set`, `zset` |
+| Table shapes | one column per field or member, or `legacy_value 'true'` for the whole collection in one array column (read-only) |
 | Discovery | keyspace scan, `keyprefix`, `keyset` index, `singleton_key` |
 | Pushdown | `key = 'literal'` answered with a single fetch; `ANALYZE` estimates |
 | Writes | `INSERT`, `UPDATE`, `DELETE`, `COPY FROM` — one atomic unit per transaction |
 | Transport | TLS with hostname verification, ACL auth, RESP3 with a tested RESP2 fallback |
 | Cluster | slot discovery, per-node pooling, fan-out scans, `MOVED`/`ASK`, single-slot writes |
-| Accepted, then refused | `legacy_value 'true'`, `ttl` columns and `distance` columns. The validator takes all three so a table can be defined ahead of the feature; the first query against such a table raises `0A000` |
+| Accepted, then refused | `ttl` columns and `distance` columns. The validator takes both so a table can be defined ahead of the feature; the first query against such a table raises `0A000` |
 | Declared, not routed | `prefer_replica` marks a server a replica and refuses writes through it. It sends no read anywhere else |
 
 Three qualifications, stated once here rather than repeated below.
@@ -58,7 +59,7 @@ a query you may not run.** `search_index` and `index_type` stop one step short
 of that: they are accepted, they raise nothing, and nothing consults them — no
 qual reaches the index, and a table carrying one cannot be written. Between
 those two and a refused `distance` column, vector similarity search is absent
-rather than partial. No date is attached to it or to the other two.
+rather than partial. No date is attached to it or to the other one.
 
 **Every claim of working behaviour above is a suite rather than a sentence.**
 `harness.sh ci` runs those suites across three PostgreSQL majors, two Valkey
@@ -335,6 +336,7 @@ anything that would need two is refused when it is issued — not discovered at
 | A second logical `database` in one transaction | `0A000` |
 | More than `write_max_ops` operations, or `write_max_bytes` accumulated | `54000` |
 | `UPDATE` on a `tabletype 'list'` table | `0A000` |
+| Any write to a `legacy_value 'true'` table | `0A000` |
 | Any write to a `readonly 'true'` table, including `COPY FROM` | core's own message |
 | Any write to a server with `prefer_replica 'true'` | `25006` |
 | `INSERT ... ON CONFLICT`, any form | `0A000` |
@@ -347,10 +349,15 @@ facts about the keyspace rather than about the statement: a key that already
 exists where one is being created (`23505`), and a key holding a different
 Valkey type than its table declares (`42804`).
 
-Three shapes are refused in both directions rather than only on write, at the
-first plan over the table and at `0A000`: `legacy_value 'true'`, a `ttl` column
-and a `distance` column. Those are the unimplemented shapes described under
-*Usage*, and the refusal is what stands in for them.
+Two shapes are refused in both directions rather than only on write, at the
+first plan over the table and at `0A000`: a `ttl` column and a `distance`
+column. Those are the unimplemented shapes described under *Usage*, and the
+refusal is what stands in for them.
+
+A `legacy_value 'true'` table is in the table above rather than in this
+paragraph: it reads, and only the write is refused. The reason is its own — an
+array of members carries no identity for any member in it, so nothing in such a
+row says which member a write means.
 
 ## Requirements
 
@@ -420,12 +427,49 @@ CREATE FOREIGN TABLE leaderboard (
   OPTIONS (tabletype 'zset', singleton_key 'scores:global');
 ```
 
-Three things in the option tables below may be written into a table definition
-and cannot yet be queried. A legacy `(key text, value text[])` shape — one
-array column holding whatever the key contains, whatever its type — is planned
-under `legacy_value 'true'`, so that a table already written that way can be
-pointed here without being redefined column by column. A `ttl` column and a
-`distance` column stand in the same place. **None of the three is
+### The whole collection in one column
+
+`legacy_value 'true'` gives a `(key, value)` table whose second column is an
+array holding the entire collection, one row per key rather than one row per
+member:
+
+```sql
+CREATE FOREIGN TABLE sessions (
+    key   text,
+    value text[]
+) SERVER valkey_main
+  OPTIONS (tabletype 'hash', keyprefix 'sess:', legacy_value 'true');
+
+-- with the hstore extension; jsonb_populate_record and jsonb_object(value)
+-- do the same with nothing but core.
+SELECT key, (populate_record(NULL::session, hstore(value))).*
+FROM sessions;
+```
+
+This is the only shape that can read a keyspace whose hash fields are not known
+when the table is defined. Every other one names each field in a column option,
+so per-tenant hashes with differing field sets have no expressible mapping at
+all; here the query supplies the schema and the table supplies the bytes.
+
+- **A hash is its fields and values alternating**, in the order the server
+  returns them — which is what makes `hstore(value)` and `json_object(value)`
+  reconstruct it. A list and a set are their members. A zset is its members;
+  its scores are not in the array, because `WITHSCORES` is shaped differently
+  by RESP2 and RESP3 and the array would then depend on the negotiated
+  protocol rather than on the data. Map a `score` column to read scores.
+- **The column is `text[]` or `bytea[]`, and nothing else.** `text[]` elements
+  are checked against the server encoding like every other text value;
+  `bytea[]` takes the bytes verbatim and is the only way to read a member
+  holding a NUL or a byte sequence the server encoding rejects. Any other
+  declared type is a table definition error naming the column.
+- **A key that is not there produces no row**, exactly as the column-mapped
+  shape does — never a row with an empty array.
+- **It is read-only**, for the reason given under *What is refused*.
+- `tabletype 'string'` is refused with it: a string holds one value and has no
+  members, and `(key, value text)` already reads it.
+
+Two things in the option tables below may be written into a table definition
+and cannot yet be queried: a `ttl` column and a `distance` column. **Neither is
 implemented**: declaring one is accepted, and the first plan over it raises
 `0A000`, in either direction. They are accepted by the validator so that a
 table definition can be written ahead of the feature, which is the only reason
@@ -537,7 +581,7 @@ it on is not.
 | `keyset` | string | — | Set holding the table's key names | no |
 | `singleton_key` | string | — | Draw all rows from this single key | no |
 | `search_index` | string | — | valkey-search index backing this table; accepted and not consulted | no |
-| `legacy_value` | boolean | `false` | Expose the legacy `(key, value[])` shape; accepted and refused at plan time | no |
+| `legacy_value` | boolean | `false` | Expose the whole collection as one `text[]` or `bytea[]` column, one row per key; read-only, and needs a collection `tabletype` | no |
 | `readonly` | boolean | `false` | Reject all writes on this table | no |
 
 ### Column
@@ -585,6 +629,7 @@ on the way out. These are decisions, not defects; each is pinned by a vector in
 | `options` | Option table, validation, rejections, secret redaction |
 | `ddl`, `mapping` | DDL, table shape resolution, tables that cannot be filled |
 | `scan` | All five read types, paging, rescan, pushdown, `ANALYZE` |
+| `legacy` | The packed collection shape: what the array holds, its element type, and the writes it refuses |
 | `io` | Pipelining, binary safety, timeouts, cancellation |
 | `pool`, `leak` | Connection reuse and lease accounting; descriptor accounting |
 | `val` | Type round-trips, encodings, NULs, hash-tag and CRC-16 vectors |

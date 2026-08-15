@@ -54,8 +54,10 @@ typedef enum VfdwColKind
 	VFDW_COL_SCORE,				/* a zset score */
 	VFDW_COL_TTL,				/* time to live of the paired field */
 	VFDW_COL_DISTANCE,			/* vector search score */
-	VFDW_COL_LEGACY_VALUE		/* legacy text[] of the whole value */
+	VFDW_COL_LEGACY_VALUE		/* the whole collection, packed into an array */
 } VfdwColKind;
+
+struct VfdwPackedElem;
 
 typedef struct VfdwColumn
 {
@@ -96,7 +98,35 @@ typedef struct VfdwColumn
 	 * path has to apply that check itself.
 	 */
 	bool		is_domain;
+
+	/* VFDW_COL_LEGACY_VALUE only; NULL for every other kind. */
+	struct VfdwPackedElem *packed;
 } VfdwColumn;
+
+/*
+ * The element a packed collection column is assembled from.
+ *
+ * A packed table answers with one row per KEY and the whole collection in one
+ * array column, so every value that arrives from Valkey is an ELEMENT of that
+ * column's type and never a value of it. col describes that element and is
+ * what the row builder hands to vfdw_row_datum_from_bytes, so an element takes
+ * the same route a scalar column's value takes rather than a second one: a
+ * text element is checked against the server encoding, a bytea element keeps
+ * its NUL bytes and its unconvertible ones (invariant I3).
+ *
+ * The three assembly parameters are read from the element type rather than
+ * written down as the constants that happen to be right for text and bytea.
+ * They are what construct_md_array lays the array out with, and a wrong
+ * typalign does not fail: it builds an array whose elements are then read from
+ * the wrong offsets.
+ */
+typedef struct VfdwPackedElem
+{
+	VfdwColumn	col;
+	int16		typlen;
+	bool		typbyval;
+	char		typalign;
+} VfdwPackedElem;
 
 typedef struct VfdwTableMap
 {
