@@ -32,8 +32,8 @@ FROM valkey_fdw_test_probe('tta_srv', 0, 'HSET', 'tta:k', 'a', 'av');
 -- asserted rather than after.
 SELECT * FROM tta;
 ERROR:  this Valkey server has no per-field expiry
-DETAIL:  A ttl column is read with HPTTL, which this server does not have. Per-field expiry arrived in Valkey 9.
-HINT:  Drop the ttl column to read the rest of this table, or point the server at Valkey 9 or later.
+DETAIL:  A ttl column needs HPTTL to read and HPEXPIRE and HPERSIST to write, none of which this server has. Per-field expiry arrived in Valkey 9.
+HINT:  Drop the ttl column to use the rest of this table, or point the server at Valkey 9 or later.
 -- The refusal is about the column and not the table, so the same keyspace read
 -- without that column still works. A capability refusal that took the whole
 -- table with it would be a bigger claim than the server made.
@@ -58,12 +58,23 @@ EXPLAIN (COSTS OFF) SELECT * FROM tta;
    Valkey Match: tta:*
 (3 rows)
 
--- The write refusal is decided from the catalogue alone, so it reads the same
--- on every server and says the same thing here as it does on 9.
+-- The WRITE direction is refused by the same capability and at the same
+-- moment - when the statement opens, not at COMMIT. A transaction accepted
+-- statement by statement and then refused at COMMIT would have told the user
+-- their rows were written before taking it back.
+--
+-- Both an INSERT that says nothing about the expiry and an UPDATE that sets
+-- one: the refusal is about the table's shape rather than about whether this
+-- particular statement mentioned the column, because the write program is
+-- loaded per transaction and cannot be half-supported.
 INSERT INTO tta VALUES ('tta:new', 'av', NULL);
-ERROR:  cannot insert into a Valkey "hash" table
-DETAIL:  A ttl column reads a field's expiry, and setting one is not implemented.
-HINT:  Drop the ttl column to write this table, or wait for the phase that writes an expiry.
+ERROR:  this Valkey server has no per-field expiry
+DETAIL:  A ttl column needs HPTTL to read and HPEXPIRE and HPERSIST to write, none of which this server has. Per-field expiry arrived in Valkey 9.
+HINT:  Drop the ttl column to use the rest of this table, or point the server at Valkey 9 or later.
+UPDATE tta SET t = interval '5 minutes' WHERE key = 'tta:k';
+ERROR:  this Valkey server has no per-field expiry
+DETAIL:  A ttl column needs HPTTL to read and HPEXPIRE and HPERSIST to write, none of which this server has. Per-field expiry arrived in Valkey 9.
+HINT:  Drop the ttl column to use the rest of this table, or point the server at Valkey 9 or later.
 SELECT num AS keys_removed
 FROM valkey_fdw_test_probe('tta_srv', 0, 'DEL', 'tta:k');
  keys_removed 

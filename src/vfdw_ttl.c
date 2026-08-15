@@ -44,12 +44,19 @@ static void
 vfdw_ttl_probe(VfdwConn *vconn)
 {
 	TimestampTz deadline = vfdw_io_deadline(vconn->opts.command_timeout_ms);
-	const char *argv[] = {"COMMAND", "INFO", "HPTTL"};
-	const size_t arglens[] = {7, 4, 5};
+
+	/*
+	 * ALL THREE VERBS, because all three are used and a server is not obliged
+	 * to have them together merely because one release shipped them together.
+	 * Asking about the read verb alone and then sending a write verb would put
+	 * the assumption back that this probe exists to remove.
+	 */
+	const char *argv[] = {"COMMAND", "INFO", "HPTTL", "HPEXPIRE", "HPERSIST"};
+	const size_t arglens[] = {7, 4, 5, 8, 8};
 	valkeyReply *reply;
 	bool		present = false;
 
-	if (valkeyAppendCommandArgv(vconn->conn, 3, argv, arglens) != VALKEY_OK)
+	if (valkeyAppendCommandArgv(vconn->conn, 5, argv, arglens) != VALKEY_OK)
 		vfdw_error_from_context(vconn->conn,
 								"could not ask the server about per-field expiry");
 
@@ -57,19 +64,28 @@ vfdw_ttl_probe(VfdwConn *vconn)
 	reply = vfdw_io_get_reply(vconn->conn, deadline);
 
 	/*
-	 * One entry per command asked about, and the entry for a command the
-	 * server does not have is a nil rather than an omission - so the array's
-	 * length says nothing and only the element does.
+	 * One entry per command asked about, in the order asked, and the entry for
+	 * a command the server does not have is a nil rather than an omission - so
+	 * the array's length says nothing and only the elements do. Every one of
+	 * them has to be there.
 	 */
 	if (!vfdw_reply_is_error(reply) &&
 		(reply->type == VALKEY_REPLY_ARRAY || reply->type == VALKEY_REPLY_MAP) &&
-		reply->elements >= 1)
+		reply->elements >= 3)
 	{
-		const valkeyReply *entry = reply->element[0];
+		size_t		i;
 
-		present = entry != NULL &&
-			(entry->type == VALKEY_REPLY_ARRAY || entry->type == VALKEY_REPLY_MAP) &&
-			entry->elements > 0;
+		present = true;
+		for (i = 0; i < 3; i++)
+		{
+			const valkeyReply *entry = reply->element[i];
+
+			if (entry == NULL ||
+				(entry->type != VALKEY_REPLY_ARRAY &&
+				 entry->type != VALKEY_REPLY_MAP) ||
+				entry->elements == 0)
+				present = false;
+		}
 	}
 
 	vconn->field_ttl = present ? VFDW_CAP_PRESENT : VFDW_CAP_ABSENT;
@@ -86,9 +102,10 @@ vfdw_ttl_require(VfdwConn *vconn)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("this Valkey server has no per-field expiry"),
-				 errdetail("A ttl column is read with HPTTL, which this server "
-						   "does not have. Per-field expiry arrived in Valkey 9."),
-				 errhint("Drop the ttl column to read the rest of this table, "
+				 errdetail("A ttl column needs HPTTL to read and HPEXPIRE and "
+						   "HPERSIST to write, none of which this server has. "
+						   "Per-field expiry arrived in Valkey 9."),
+				 errhint("Drop the ttl column to use the rest of this table, "
 						 "or point the server at Valkey 9 or later.")));
 }
 

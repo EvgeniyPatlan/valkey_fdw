@@ -76,7 +76,7 @@ FROM (SELECT substring(valkey_fdw_test_script()
 SELECT kind, count(*) AS entries FROM sc_lua GROUP BY kind ORDER BY kind;
   kind  | entries 
 --------+---------
- action |      13
+ action |      15
  check  |      12
 (2 rows)
 

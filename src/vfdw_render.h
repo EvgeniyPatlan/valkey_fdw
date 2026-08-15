@@ -25,6 +25,10 @@
 extern const char *vfdw_modify_retain_name(const char *field, size_t *namelen);
 extern void vfdw_modify_render_fields(VfdwModifyState *st,
 									  TupleTableSlot *slot, VfdwWriteOp *op);
+
+/* The expiries a row sets; see the definition for why they are not fields. */
+extern void vfdw_modify_render_ttls(VfdwModifyState *st, TupleTableSlot *slot,
+									VfdwWriteOp *op);
 extern void vfdw_modify_render_payload(VfdwModifyState *st,
 									   TupleTableSlot *slot, VfdwWriteOp *op);
 

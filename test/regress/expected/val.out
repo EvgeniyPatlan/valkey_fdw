@@ -592,12 +592,18 @@ WITH v(id, payload, typ, kind, want, why) AS (VALUES
         'a bytea score column feeds the same validator: the trailing NUL is a byte'),
     ('D-12', 'str:a',        'text',  'key',    'ok:str:a',
         'the key arm reaches the builder'),
-    ('D-13', 'x',            'text',  'ttl',           'XX000',
-        'an unimplemented kind is loud; a silent default is how the next kind'),
+    ('D-13', 'x',            'text',  'ttl',           '22023',
+        'a ttl column of any other type is refused BEFORE the conversion reads'),
+    ('D-13b', '10 minutes',  'interval', 'ttl',        'ok:600000',
+        'the interval arrives as the milliseconds HPEXPIRE takes'),
+    ('D-13c', '1 day',       'interval', 'ttl',        'ok:86400000',
+        'a day is 24 hours, the convention EXTRACT(EPOCH FROM ...) uses'),
+    ('D-13d', '0',           'interval', 'ttl',        '22023',
+        'and a non-positive duration is refused: it would delete the field'),
     ('D-14', 'x',            'text',  'distance',      'XX000',
-        'added to the enum acquires accidental semantics, so all four'),
+        'an unimplemented kind is loud; a silent default is how the next kind'),
     ('D-15', 'x',            'text',  'legacy_value',  'XX000',
-        'arms are asserted rather than the one that happens to be reachable'),
+        'added to the enum acquires accidental semantics, so all three'),
     ('D-16', 'x',            'text',  'dropped',       'XX000', '')
 )
 SELECT id, coalesce(encode(payload, 'escape'), 'NULL') AS payload, typ, kind,
@@ -606,25 +612,28 @@ SELECT id, coalesce(encode(payload, 'escape'), 'NULL') AS payload, typ, kind,
             ELSE 'DISAGREES' END AS verdict,
        why
 FROM v ORDER BY id;
-  id  | payload  |  typ  |     kind     |   got    |   want   | verdict |                                    why                                    
-------+----------+-------+--------------+----------+----------+---------+---------------------------------------------------------------------------
- D-01 | hello    | text  | value        | ok:hello | ok:hello | ok      | the value arm renders and retains
- D-02 | NULL     | text  | value        | 23502    | 23502    | ok      | N-02: a null value IS the string row's absence, so it is refused
- D-03 | red      | text  | member       | ok:red   | ok:red   | ok      | the member arm
- D-04 | NULL     | text  | member       | 23502    | 23502    | ok      | N-03: and a null member likewise
- D-05 | alpha    | text  | field        | ok:alpha | ok:alpha | ok      | a hash field renders like any other value
- D-06 | NULL     | text  | field        | null     | null     | ok      | but a null FIELD is not an error: an absent field, then an HDEL
- D-07 | 1.5      | text  | score        | ok:1.5   | ok:1.5   | ok      | the score arm routes through the validator and passes
- D-08 | nan      | text  | score        | 22023    | 22023    | ok      | and refuses: drop the check_score call and this reads ok:nan
- D-09 | Infinity | text  | score        | 22023    | 22023    | ok      | including the spelling float8out produces for +inf
- D-10 | NULL     | text  | score        | 23502    | 23502    | ok      | N-04 reached through the dispatch rather than through the probe
- D-11 | 1.5\000  | bytea | score        | 22023    | 22023    | ok      | a bytea score column feeds the same validator: the trailing NUL is a byte
- D-12 | str:a    | text  | key          | ok:str:a | ok:str:a | ok      | the key arm reaches the builder
- D-13 | x        | text  | ttl          | XX000    | XX000    | ok      | an unimplemented kind is loud; a silent default is how the next kind
- D-14 | x        | text  | distance     | XX000    | XX000    | ok      | added to the enum acquires accidental semantics, so all four
- D-15 | x        | text  | legacy_value | XX000    | XX000    | ok      | arms are asserted rather than the one that happens to be reachable
- D-16 | x        | text  | dropped      | XX000    | XX000    | ok      | 
-(16 rows)
+  id   |  payload   |   typ    |     kind     |     got     |    want     | verdict |                                    why                                    
+-------+------------+----------+--------------+-------------+-------------+---------+---------------------------------------------------------------------------
+ D-01  | hello      | text     | value        | ok:hello    | ok:hello    | ok      | the value arm renders and retains
+ D-02  | NULL       | text     | value        | 23502       | 23502       | ok      | N-02: a null value IS the string row's absence, so it is refused
+ D-03  | red        | text     | member       | ok:red      | ok:red      | ok      | the member arm
+ D-04  | NULL       | text     | member       | 23502       | 23502       | ok      | N-03: and a null member likewise
+ D-05  | alpha      | text     | field        | ok:alpha    | ok:alpha    | ok      | a hash field renders like any other value
+ D-06  | NULL       | text     | field        | null        | null        | ok      | but a null FIELD is not an error: an absent field, then an HDEL
+ D-07  | 1.5        | text     | score        | ok:1.5      | ok:1.5      | ok      | the score arm routes through the validator and passes
+ D-08  | nan        | text     | score        | 22023       | 22023       | ok      | and refuses: drop the check_score call and this reads ok:nan
+ D-09  | Infinity   | text     | score        | 22023       | 22023       | ok      | including the spelling float8out produces for +inf
+ D-10  | NULL       | text     | score        | 23502       | 23502       | ok      | N-04 reached through the dispatch rather than through the probe
+ D-11  | 1.5\000    | bytea    | score        | 22023       | 22023       | ok      | a bytea score column feeds the same validator: the trailing NUL is a byte
+ D-12  | str:a      | text     | key          | ok:str:a    | ok:str:a    | ok      | the key arm reaches the builder
+ D-13  | x          | text     | ttl          | 22023       | 22023       | ok      | a ttl column of any other type is refused BEFORE the conversion reads
+ D-13b | 10 minutes | interval | ttl          | ok:600000   | ok:600000   | ok      | the interval arrives as the milliseconds HPEXPIRE takes
+ D-13c | 1 day      | interval | ttl          | ok:86400000 | ok:86400000 | ok      | a day is 24 hours, the convention EXTRACT(EPOCH FROM ...) uses
+ D-13d | 0          | interval | ttl          | 22023       | 22023       | ok      | and a non-positive duration is refused: it would delete the field
+ D-14  | x          | text     | distance     | XX000       | XX000       | ok      | an unimplemented kind is loud; a silent default is how the next kind
+ D-15  | x          | text     | legacy_value | XX000       | XX000       | ok      | added to the enum acquires accidental semantics, so all three
+ D-16  | x          | text     | dropped      | XX000       | XX000       | ok      | 
+(19 rows)
 
 -- ---------------------------------------------------------------------------
 -- D-20: the retained bytes of a row that is no longer the current row.

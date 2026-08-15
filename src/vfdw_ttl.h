@@ -33,12 +33,13 @@
 #include "vfdw_map.h"
 
 /*
- * Whether this connection's server can answer for per-field expiry, raising if
- * it cannot.
+ * Whether this connection's server can do per-field expiry, raising if it
+ * cannot. Asked of the three verbs actually sent - HPTTL to read, HPEXPIRE and
+ * HPERSIST to write - rather than of one taken to imply the others.
  *
  * Raises rather than returning a verdict because there is exactly one thing to
- * do with a no: a table with a ttl column cannot be read from this server, and
- * every caller would otherwise write the same refusal. The probe runs once per
+ * do with a no: a table with a ttl column can be neither read from nor written
+ * to this server, and every caller would otherwise write the same refusal. The probe runs once per
  * connection and the answer is cached on it.
  */
 extern void vfdw_ttl_require(VfdwConn *vconn);

@@ -67,6 +67,28 @@ vfdw_test_val_setup(VfdwTestVal *tv, Oid typid, VfdwColKind kind)
 	tv->col.kind = kind;
 	vfdw_map_resolve_type(&tv->col, typid, -1);
 
+	/*
+	 * THE ONE RULE THIS PROBE CANNOT SKIP.
+	 *
+	 * A probe builds its column directly and so bypasses the map, which is the
+	 * point of it - a real table cannot be talked into most of the shapes worth
+	 * asserting about. But the write conversion for a ttl column reads its
+	 * Datum as an Interval, and the reason it may is that vfdw_map_build
+	 * refuses a ttl column of any other type. Bypassing that here would not
+	 * exercise the code a real statement drives; it would hand a text varlena
+	 * to a struct pointer and read whatever follows it.
+	 *
+	 * So the probe applies the map's rule rather than trusting it, and the
+	 * refusal is what the val suite asserts for the combination.
+	 */
+	if (kind == VFDW_COL_TTL && getBaseType(typid) != INTERVALOID)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("ttl columns must be of type interval"),
+				 errdetail("A real table is refused this at CREATE; the probe "
+						   "refuses it because the write conversion reads the "
+						   "Datum as an Interval.")));
+
 	fmgr_info(tv->col.typinput, &tv->infunc);
 	tv->rowctx.infuncs = &tv->infunc;
 

@@ -292,6 +292,35 @@ MUTATIONS = [
      "\t\tvfdw_ttl_take(state->map, vfdw_batch_next(state->batch),",
      "standalone", "ttl"),
 
+    # NULL on a ttl column is PERSIST, not "expire now". Sending HPEXPIRE with
+    # the field's own name and no duration would be a syntax error and fail
+    # loudly; the mutation that does NOT fail loudly is treating the absence as
+    # a zero-length expiry, which deletes the field. ttl asserts the field is
+    # still there after the expiry is cleared, which is what tells the two
+    # apart.
+    ("T5-persist", "src/vfdw_ledger_fold.c",
+     "\t\tif (t->isnull)",
+     "\t\tif (false && t->isnull)",
+     "standalone", "ttl"),
+
+    # An expiry is applied AFTER the field it belongs to exists. HPEXPIRE on a
+    # missing field answers -2 and sets nothing, so folding the expiries before
+    # the field loop loses exactly the INSERT that creates a field and gives it
+    # a lifetime in one row - and loses it silently, since -2 is not an error.
+    ("T6-order", "src/vfdw_ledger_fold.c",
+     "\tvfdw_ledger_fold_fields(plan, op, rel);\n"
+     "\tvfdw_ledger_fold_ttls(plan, op);",
+     "\tvfdw_ledger_fold_ttls(plan, op);\n"
+     "\tvfdw_ledger_fold_fields(plan, op, rel);",
+     "standalone", "ttl"),
+
+    # A duration already past deletes the field rather than setting a property
+    # of it, so it is refused. Admitting it turns an UPDATE into a delete.
+    ("T7-nonpositive", "src/vfdw_val.c",
+     "\tif (ms <= 0)",
+     "\tif (false)",
+     "standalone", "ttl"),
+
     # A packed zset takes members, not scores. Restoring WITHSCORES makes the
     # array's shape follow the negotiated protocol rather than the data: RESP2
     # returns member and score alternating, RESP3 a nested pair per member

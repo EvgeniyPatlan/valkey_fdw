@@ -30,7 +30,8 @@ static const char *const vfdw_check_names[] = {
 
 static const char *const vfdw_action_names[] = {
 	"SET", "DEL", "HSET", "HDEL", "SADD", "SREM", "ZADD", "ZREM",
-	"RPUSH", "LREM1", "RENAME", "KSET_ADD", "KSET_REM"
+	"RPUSH", "LREM1", "RENAME", "KSET_ADD", "KSET_REM",
+	"HPEXPIRE", "HPERSIST"
 };
 
 const char *

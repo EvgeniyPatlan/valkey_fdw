@@ -45,9 +45,17 @@ SELECT key, a FROM tta_novel ORDER BY key;
 -- the check earlier is a visible change rather than a silent one.
 EXPLAIN (COSTS OFF) SELECT * FROM tta;
 
--- The write refusal is decided from the catalogue alone, so it reads the same
--- on every server and says the same thing here as it does on 9.
+-- The WRITE direction is refused by the same capability and at the same
+-- moment - when the statement opens, not at COMMIT. A transaction accepted
+-- statement by statement and then refused at COMMIT would have told the user
+-- their rows were written before taking it back.
+--
+-- Both an INSERT that says nothing about the expiry and an UPDATE that sets
+-- one: the refusal is about the table's shape rather than about whether this
+-- particular statement mentioned the column, because the write program is
+-- loaded per transaction and cannot be half-supported.
 INSERT INTO tta VALUES ('tta:new', 'av', NULL);
+UPDATE tta SET t = interval '5 minutes' WHERE key = 'tta:k';
 
 SELECT num AS keys_removed
 FROM valkey_fdw_test_probe('tta_srv', 0, 'DEL', 'tta:k');

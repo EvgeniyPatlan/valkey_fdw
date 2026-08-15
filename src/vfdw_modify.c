@@ -33,6 +33,7 @@
 
 #include "vfdw_conn.h"
 #include "vfdw_refuse.h"
+#include "vfdw_ttl.h"
 #include "vfdw_rowid.h"
 #include "vfdw_wbuf.h"
 
@@ -222,6 +223,15 @@ vfdw_modify_connect(VfdwModifyState *st, Relation rel)
 	refusal = vfdw_conn_write_refusal(vconn, &refusallen);
 	if (refusal != NULL)
 		vfdw_refuse_no_write_program(server, refusal, refusallen);
+
+	/*
+	 * And whether it can do what a ttl column asks, for the same reason and at
+	 * the same moment: the alternative is a transaction accepted statement by
+	 * statement and refused at COMMIT, after the user has been told their rows
+	 * were written.
+	 */
+	if (st->map->nttl > 0)
+		vfdw_ttl_require(vconn);
 
 	vfdw_wbuf_bind(rel, table->serverid, user->umid, GetUserId(),
 				   st->map->database, opts->write_max_ops,

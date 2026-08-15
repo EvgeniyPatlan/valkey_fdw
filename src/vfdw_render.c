@@ -117,6 +117,55 @@ vfdw_modify_render_fields(VfdwModifyState *st, TupleTableSlot *slot,
 	op->nfields = n;
 }
 
+/*
+ * The expiries a row sets, one entry per ttl column.
+ *
+ * Rendered in the same walk order the read path assigns slots in, so a table
+ * with two ttl columns writes each field's own duration; and rendered from the
+ * COLUMN's field name rather than from whatever fields[] ended up holding,
+ * because a ttl column may name a field this statement did not otherwise
+ * touch.
+ */
+void
+vfdw_modify_render_ttls(VfdwModifyState *st, TupleTableSlot *slot,
+						VfdwWriteOp *op)
+{
+	const VfdwTableMap *map = st->map;
+	VfdwWriteArg *args;
+	int			n = 0;
+	int			i;
+
+	if (map->nttl == 0)
+		return;
+
+	args = (VfdwWriteArg *) MemoryContextAllocZero(vfdw_wbuf_context(),
+												   sizeof(VfdwWriteArg) *
+												   map->nttl);
+
+	for (i = 0; i < map->natts; i++)
+	{
+		const VfdwColumn *col = &map->cols[i];
+		Datum		d;
+		bool		isnull;
+		VfdwValue	v;
+
+		if (col->kind != VFDW_COL_TTL)
+			continue;
+
+		d = slot_getattr(slot, col->attnum, &isnull);
+		vfdw_val_from_slot(&st->vc, map, col, d, isnull, &v);
+
+		args[n].name = vfdw_modify_retain_name(col->field, &args[n].namelen);
+		args[n].isnull = v.isnull;
+		args[n].data = v.data;
+		args[n].len = v.len;
+		n++;
+	}
+
+	op->ttls = args;
+	op->nttls = n;
+}
+
 void
 vfdw_modify_render_payload(VfdwModifyState *st, TupleTableSlot *slot,
 						   VfdwWriteOp *op)
@@ -130,6 +179,7 @@ vfdw_modify_render_payload(VfdwModifyState *st, TupleTableSlot *slot,
 	if (map->tabletype == VFDW_TABLE_HASH)
 	{
 		vfdw_modify_render_fields(st, slot, op);
+		vfdw_modify_render_ttls(st, slot, op);
 		return;
 	}
 

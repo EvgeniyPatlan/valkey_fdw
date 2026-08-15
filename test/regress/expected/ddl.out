@@ -117,12 +117,14 @@ CREATE FOREIGN TABLE w_readonly (k text, v text) SERVER w_srv
 CREATE FOREIGN TABLE w_legacy (k text, v text[]) SERVER w_srv
     OPTIONS (tabletype 'hash', legacy_value 'true', keyprefix 'ddl:legacy:');
 -- A table whose reader is not implemented for a reason that has nothing to do
--- with row identity, and one whose column is not implemented at all. Both used
--- to report a fully writable mask, because writability was decided from table
--- options alone: w_ttl cannot even be SELECTed and information_schema called
--- it insertable, updatable and deletable.
+-- with row identity. It used to report a fully writable mask, because
+-- writability was decided from table options alone.
 CREATE FOREIGN TABLE w_search (k text, v text) SERVER w_srv
     OPTIONS (search_index 'idx');
+-- A ttl column no longer withholds anything: it reads and it writes, so this
+-- table is here to assert that it is reported as ORDINARY. It kept the mask
+-- honest while the column was unimplemented; the same pairing now has to show
+-- the refusal being lifted rather than only being applied.
 CREATE FOREIGN TABLE w_ttl (
     k text,
     f text     OPTIONS (field 'f'),
@@ -142,7 +144,7 @@ ORDER BY c.relname;
  w_readonly |    0
  w_search   |    0
  w_string   |   28
- w_ttl      |    0
+ w_ttl      |   28
 (6 rows)
 
 -- information_schema asks the same question for every relation, including
@@ -158,7 +160,7 @@ ORDER BY table_name;
  w_readonly | NO
  w_search   | NO
  w_string   | YES
- w_ttl      | NO
+ w_ttl      | YES
 (6 rows)
 
 -- The refusals themselves.
@@ -179,13 +181,11 @@ INSERT INTO w_search VALUES ('k', 'v');
 ERROR:  cannot insert into a Valkey "string" table
 DETAIL:  A table with a search_index is served by the search phase, which is not implemented.
 HINT:  Drop the search_index option to use the ordinary key path.
--- A ttl column is refused while the map is built, before writability is even
--- consulted, so this reports the column and not the write. That is the more
--- useful of the two answers and is why the map is built first.
-INSERT INTO w_ttl VALUES ('k', 'v', NULL);
-ERROR:  cannot insert into a Valkey "hash" table
-DETAIL:  A ttl column reads a field's expiry, and setting one is not implemented.
-HINT:  Drop the ttl column to write this table, or wait for the phase that writes an expiry.
+-- No INSERT into w_ttl here. It is writable now, so the statement would be a
+-- real write, and what it writes depends on the server: the expiry verbs exist
+-- only on Valkey 9. The write, its refusal on an older server, and the ordering
+-- that makes an expiry outlive the field it belongs to are all in the ttl and
+-- ttl_absent suites, which run where each is the true statement.
 -- The mask must agree with the refusal rather than contradict it. This is the
 -- pair that used to disagree: 28 - insertable, updatable and deletable -
 -- reported through information_schema for two tables that raise on every
@@ -198,7 +198,7 @@ ORDER BY c.relname;
  relname  | mask 
 ----------+------
  w_search |    0
- w_ttl    |    0
+ w_ttl    |   28
 (2 rows)
 
 -- ---------------------------------------------------------------------------

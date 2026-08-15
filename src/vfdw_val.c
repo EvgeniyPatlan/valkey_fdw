@@ -60,6 +60,10 @@
  */
 #include "vfdw_val.h"
 
+#include "common/int.h"
+#include "datatype/timestamp.h"
+#include "utils/timestamp.h"
+
 /*
  * varatt.h explicitly rather than through utils/builtins.h: VARDATA_ANY and
  * VARSIZE_ANY_EXHDR are the whole reason the bytea branch is correct, so the
@@ -297,6 +301,72 @@ vfdw_val_score_column(VfdwValCtx *vc, const VfdwColumn *col, Datum d,
 	out->len = len;
 }
 
+/*
+ * An interval, as the milliseconds HPEXPIRE takes.
+ *
+ * Months and days are converted with PostgreSQL's own convention - a month is
+ * 30 days and a day is 24 hours, the same arithmetic EXTRACT(EPOCH FROM ...)
+ * uses. Refusing them instead would rule out `interval '1 day'`, which is the
+ * most natural way to write a cache lifetime; converting them by any other
+ * rule would make this wrapper disagree with the server it runs inside.
+ *
+ * A NON-POSITIVE DURATION IS REFUSED. HPEXPIRE with a deadline already past
+ * deletes the field, so `SET t = interval '0'` would remove data as a side
+ * effect of an UPDATE that reads like it sets a property. The user who means
+ * that can say so with an UPDATE that sets the field itself to NULL, which is
+ * this wrapper's spelling for "remove it" everywhere else.
+ */
+static void
+vfdw_val_ttl_column(VfdwValCtx *vc, const VfdwColumn *col, Datum d,
+					bool isnull, VfdwValue *out)
+{
+	Interval   *iv;
+	int64		days;
+	int64		ms;
+	char		buf[32];
+	int			len;
+
+	/*
+	 * NULL is PERSIST, not "expire now". Setting a column to NULL everywhere
+	 * else in this wrapper removes the thing the column describes, and what
+	 * this column describes is the expiry - not the field. Reading NULL back
+	 * from a field that has no expiry is the exact inverse, so it round trips.
+	 */
+	if (isnull)
+	{
+		out->isnull = true;
+		out->data = NULL;
+		out->len = 0;
+		return;
+	}
+
+	iv = DatumGetIntervalP(d);
+	days = iv->month * INT64CONST(30) + iv->day;
+
+	if (pg_mul_s64_overflow(days, INT64CONST(86400000), &ms) ||
+		pg_add_s64_overflow(ms, iv->time / 1000, &ms))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("time to live is too large for column \"%s\" of \"%s\"",
+						vfdw_val_colname(vc, col), vfdw_val_relname(vc))));
+
+	if (ms <= 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("time to live must be positive for column \"%s\" of \"%s\"",
+						vfdw_val_colname(vc, col), vfdw_val_relname(vc)),
+				 errdetail("An expiry in the past deletes the field rather than "
+						   "setting a property of it."),
+				 errhint("Set the field itself to NULL to remove it, or NULL "
+						 "this column to remove the expiry.")));
+
+	len = snprintf(buf, sizeof(buf), INT64_FORMAT, ms);
+
+	out->isnull = false;
+	out->data = vfdw_val_retain(vc, buf, (size_t) len);
+	out->len = (size_t) len;
+}
+
 void
 vfdw_val_from_slot(VfdwValCtx *vc, const VfdwTableMap *map,
 				   const VfdwColumn *col, Datum d, bool isnull, VfdwValue *out)
@@ -333,17 +403,20 @@ vfdw_val_from_slot(VfdwValCtx *vc, const VfdwTableMap *map,
 			vfdw_val_render(vc, col, d, isnull, out);
 			return;
 
-		case VFDW_COL_DROPPED:
 		case VFDW_COL_TTL:
+			vfdw_val_ttl_column(vc, col, d, isnull, out);
+			return;
+
+		case VFDW_COL_DROPPED:
 		case VFDW_COL_DISTANCE:
 		case VFDW_COL_LEGACY_VALUE:
 
 			/*
-			 * Unreachable: vfdw_map_check_implemented refuses ttl, distance,
-			 * legacy_value and json tables at plan time, and a dropped column
-			 * has no slot value to read. Loud rather than a silent default,
-			 * because an arm that falls through is how the next kind added to
-			 * the enum acquires accidental semantics.
+			 * Unreachable: vfdw_map_check_implemented refuses distance at plan
+			 * time, legacy_value tables are refused every write, and a dropped
+			 * column has no slot value to read. Loud rather than a silent
+			 * default, because an arm that falls through is how the next kind
+			 * added to the enum acquires accidental semantics.
 			 */
 			break;
 	}

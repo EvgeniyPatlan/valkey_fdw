@@ -102,12 +102,15 @@ CREATE FOREIGN TABLE w_legacy (k text, v text[]) SERVER w_srv
     OPTIONS (tabletype 'hash', legacy_value 'true', keyprefix 'ddl:legacy:');
 
 -- A table whose reader is not implemented for a reason that has nothing to do
--- with row identity, and one whose column is not implemented at all. Both used
--- to report a fully writable mask, because writability was decided from table
--- options alone: w_ttl cannot even be SELECTed and information_schema called
--- it insertable, updatable and deletable.
+-- with row identity. It used to report a fully writable mask, because
+-- writability was decided from table options alone.
 CREATE FOREIGN TABLE w_search (k text, v text) SERVER w_srv
     OPTIONS (search_index 'idx');
+
+-- A ttl column no longer withholds anything: it reads and it writes, so this
+-- table is here to assert that it is reported as ORDINARY. It kept the mask
+-- honest while the column was unimplemented; the same pairing now has to show
+-- the refusal being lifted rather than only being applied.
 CREATE FOREIGN TABLE w_ttl (
     k text,
     f text     OPTIONS (field 'f'),
@@ -141,10 +144,11 @@ INSERT INTO w_readonly VALUES ('k', 'v');
 -- with the one UPDATE w_list produced above: they must differ.
 INSERT INTO w_search VALUES ('k', 'v');
 
--- A ttl column is refused while the map is built, before writability is even
--- consulted, so this reports the column and not the write. That is the more
--- useful of the two answers and is why the map is built first.
-INSERT INTO w_ttl VALUES ('k', 'v', NULL);
+-- No INSERT into w_ttl here. It is writable now, so the statement would be a
+-- real write, and what it writes depends on the server: the expiry verbs exist
+-- only on Valkey 9. The write, its refusal on an older server, and the ordering
+-- that makes an expiry outlive the field it belongs to are all in the ttl and
+-- ttl_absent suites, which run where each is the true statement.
 
 -- The mask must agree with the refusal rather than contradict it. This is the
 -- pair that used to disagree: 28 - insertable, updatable and deletable -

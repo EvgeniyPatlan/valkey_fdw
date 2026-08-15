@@ -101,21 +101,76 @@ CREATE FOREIGN TABLE tt_text (
 ) SERVER tt_srv OPTIONS (tabletype 'hash', keyprefix 'tt:');
 SELECT * FROM tt_text;
 
--- Writes are refused whole, and the reason names the expiry rather than the
--- table type: reading a ttl works, setting one is what has not landed.
-INSERT INTO tt VALUES ('tt:new', 'av', 'bv', NULL, NULL);
-UPDATE tt SET a = 'x' WHERE key = 'tt:k';
-DELETE FROM tt WHERE key = 'tt:k';
+-- ---------------------------------------------------------------------------
+-- Writing an expiry.
+-- ---------------------------------------------------------------------------
+-- ONE ROW SETTING BOTH a field and its lifetime, which is the case the action
+-- order exists for: HPEXPIRE on a field that is not there yet answers -2 and
+-- sets nothing, so an expiry applied before the HSET that creates its field
+-- would be lost exactly here and nowhere else.
+INSERT INTO tt VALUES ('tt:new', 'av', 'bv', interval '10 minutes', NULL);
 
--- information_schema must agree with those refusals rather than contradict
--- them; a table that raises on every write and advertises itself as writable
--- is the disagreement this pair exists to catch.
+SELECT key, a, b,
+       a_ttl > interval '9 minutes' AS a_in_window,
+       b_ttl IS NULL AS b_unexpiring
+FROM tt WHERE key = 'tt:new';
+
+-- NULL PERSISTS, and does not expire the field now. The field must still be
+-- there afterwards - that is the whole distinction, and a wrapper that read
+-- NULL as "expire immediately" would pass an assertion that only checked the
+-- expiry had gone.
+UPDATE tt SET a_ttl = NULL WHERE key = 'tt:new';
+
+SELECT key, a, a_ttl IS NULL AS expiry_removed
+FROM tt WHERE key = 'tt:new';
+
+-- Months and days convert with PostgreSQL's own 30-day, 24-hour convention,
+-- the arithmetic EXTRACT(EPOCH FROM ...) uses.
+UPDATE tt SET a_ttl = interval '1 day' WHERE key = 'tt:new';
+
+SELECT key,
+       a_ttl > interval '23 hours' AS at_least_a_day,
+       a_ttl <= interval '24 hours' AS at_most_a_day
+FROM tt WHERE key = 'tt:new';
+
+-- A DURATION IN THE PAST IS REFUSED rather than applied. HPEXPIRE with a
+-- deadline already gone deletes the field, so this would remove data as a side
+-- effect of a statement that reads like it sets a property.
+UPDATE tt SET a_ttl = interval '0' WHERE key = 'tt:new';
+UPDATE tt SET a_ttl = interval '-5 minutes' WHERE key = 'tt:new';
+
+-- The refusal left the row alone, which is the half of it worth asserting: a
+-- refusal that had already applied part of the statement would be worse than
+-- no refusal.
+SELECT key, a, a_ttl > interval '23 hours' AS still_a_day
+FROM tt WHERE key = 'tt:new';
+
+-- ROLLBACK sends nothing, expiries included.
+BEGIN;
+UPDATE tt SET a_ttl = interval '5 minutes' WHERE key = 'tt:new';
+ROLLBACK;
+
+SELECT key, a_ttl > interval '23 hours' AS unchanged_by_rollback
+FROM tt WHERE key = 'tt:new';
+
+-- Setting a field's value does not disturb its lifetime: the statement said
+-- nothing about the expiry, so nothing about the expiry is sent.
+UPDATE tt SET b = 'bv2' WHERE key = 'tt:new';
+
+SELECT key, b, a_ttl > interval '23 hours' AS ttl_survived_a_field_write
+FROM tt WHERE key = 'tt:new';
+
+-- information_schema must agree with what the table now accepts. It reported
+-- NO while every write raised; it has to report YES now that they do not.
 SELECT c.relname, ist.is_insertable_into
 FROM information_schema.tables ist
 JOIN pg_class c ON c.relname = ist.table_name
 WHERE c.relname = 'tt' AND ist.table_schema = 'public';
 
+DELETE FROM tt WHERE key = 'tt:new';
+SELECT count(*) AS rows_after_delete FROM tt WHERE key = 'tt:new';
+
 SELECT num AS keys_removed
-FROM valkey_fdw_test_probe('tt_srv', 0, 'DEL', 'tt:k', 'tt:plain');
+FROM valkey_fdw_test_probe('tt_srv', 0, 'DEL', 'tt:k', 'tt:plain', 'tt:new');
 
 DROP SERVER tt_srv CASCADE;

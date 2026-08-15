@@ -29,8 +29,40 @@
 /* The ledger owns the context everything below allocates in. */
 extern MemoryContext vfdw_ledger_cxt;
 
-void
-vfdw_ledger_fold_hash(VfdwKeyPlan *plan, const VfdwWriteOp *op, Relation rel)
+/*
+ * The expiries this operation sets.
+ *
+ * No preconditions. An expiry is something this transaction sets, not
+ * something it requires to have been true beforehand: a concurrent writer that
+ * changed a field's lifetime has not invalidated this statement's intent the
+ * way one that changed the field's VALUE has.
+ */
+static void
+vfdw_ledger_fold_ttls(VfdwKeyPlan *plan, const VfdwWriteOp *op)
+{
+	int			i;
+
+	for (i = 0; i < op->nttls; i++)
+	{
+		const VfdwWriteArg *t = &op->ttls[i];
+
+		if (t->isnull)
+		{
+			vfdw_ledger_act1(plan, VFDW_ACT_HPERSIST, t->name, t->namelen);
+		}
+		else
+		{
+			VfdwLedgerStep *s = vfdw_ledger_step(VFDW_ACT_HPEXPIRE, 2);
+
+			vfdw_ledger_set_arg(s, 0, t->name, t->namelen);
+			vfdw_ledger_set_arg(s, 1, t->data, t->len);
+			vfdw_ledger_add_action(plan, s);
+		}
+	}
+}
+
+static void
+vfdw_ledger_fold_fields(VfdwKeyPlan *plan, const VfdwWriteOp *op, Relation rel)
 {
 	int			i;
 
@@ -85,6 +117,23 @@ vfdw_ledger_fold_hash(VfdwKeyPlan *plan, const VfdwWriteOp *op, Relation rel)
 			m->present = true;
 		}
 	}
+}
+
+/*
+ * A hash operation is its fields and then their expiries, IN THAT ORDER.
+ *
+ * Written as two calls rather than as one function that happens to do the
+ * second thing last, because the order is the correctness condition and not an
+ * implementation detail. HPEXPIRE on a field that is not there answers -2 and
+ * sets nothing, so an expiry applied first is lost on exactly the case that
+ * matters most - an INSERT that gives a new field both a value and a lifetime
+ * - and lost silently, because -2 is not an error.
+ */
+void
+vfdw_ledger_fold_hash(VfdwKeyPlan *plan, const VfdwWriteOp *op, Relation rel)
+{
+	vfdw_ledger_fold_fields(plan, op, rel);
+	vfdw_ledger_fold_ttls(plan, op);
 }
 
 /*

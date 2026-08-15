@@ -145,6 +145,20 @@ typedef struct VfdwWriteOp
 	VfdwWriteArg *fields;
 	int			nfields;
 
+	/*
+	 * The expiries this operation sets, one per ttl column, with the FIELD's
+	 * name and the milliseconds as decimal bytes. isnull means persist - the
+	 * expiry is removed and the field is not.
+	 *
+	 * Kept apart from fields[] rather than folded into it, because the two
+	 * describe different things about the same field and both may be set by
+	 * one row: an INSERT that gives a field a value and a lifetime emits an
+	 * HSET and an HPEXPIRE, in that order, and a single array would have to
+	 * carry two payloads per entry to say so.
+	 */
+	VfdwWriteArg *ttls;
+	int			nttls;
+
 	/* The overlay's payload (S7); see the HeapTuple note in the file prose. */
 	HeapTuple	newtup;
 

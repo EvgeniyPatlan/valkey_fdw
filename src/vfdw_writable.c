@@ -86,10 +86,10 @@ vfdw_map_read_writability(List *options, VfdwWritability *w)
 /*
  * Does any column of this relation name a source nothing fills yet?
  *
- * Table options alone used to decide writability, so a hash table with a ttl
- * column was advertised through information_schema as fully writable while it
- * could not even be SELECTed. Returns the option's name rather than a bool,
- * because the two it looks for are refused for different reasons now. The syscache is walked directly rather than
+ * Table options alone used to decide writability, so a hash table with a
+ * distance column was advertised through information_schema as fully writable
+ * while it could not even be SELECTed. Returns the option's name rather than a
+ * bool so the refusal can name what it found. The syscache is walked directly rather than
  * through the relcache because this must not open a relation and must not
  * raise; attnums are contiguous, so the first miss is the end.
  */
@@ -114,8 +114,13 @@ vfdw_map_has_unimplemented_column(Oid relid)
 			DefElem    *elem = (DefElem *) lfirst(lc);
 			bool		flag;
 
-			if (strcmp(elem->defname, "ttl") != 0 &&
-				strcmp(elem->defname, "distance") != 0)
+			/*
+			 * ttl is no longer one of these. It reads, and it is written, so
+			 * a table carrying one is as writable as the same table without
+			 * it - which is why this function stopped naming it rather than
+			 * keeping it with a softer message.
+			 */
+			if (strcmp(elem->defname, "distance") != 0)
 				continue;
 			if (parse_bool(defGetString(elem), &flag) && flag)
 				return elem->defname;
@@ -167,27 +172,11 @@ vfdw_map_write_block(Oid relid, const VfdwWritability *w, const char **hint)
 		return "This table names more than one key-discovery option, so no "
 			"key can be resolved for a row.";
 	}
+	if (vfdw_map_has_unimplemented_column(relid) != NULL)
 	{
-		/*
-		 * WHICH column, because the two are no longer refused for the same
-		 * reason and one message for both would now be false about one of
-		 * them. A ttl column reads; what it cannot yet do is be written.
-		 */
-		const char *unfilled = vfdw_map_has_unimplemented_column(relid);
-
-		if (unfilled != NULL && strcmp(unfilled, "ttl") == 0)
-		{
-			*hint = "Drop the ttl column to write this table, or wait for the "
-				"phase that writes an expiry.";
-			return "A ttl column reads a field's expiry, and setting one is "
-				"not implemented.";
-		}
-		if (unfilled != NULL)
-		{
-			*hint = "Drop the column, or wait for the phase that fills it.";
-			return "A column of this table reads distance, which is not "
-				"implemented.";
-		}
+		*hint = "Drop the column, or wait for the phase that fills it.";
+		return "A column of this table reads distance, which is not "
+			"implemented.";
 	}
 
 	return NULL;

@@ -76,7 +76,16 @@ typedef enum VfdwActionOp
 	VFDW_ACT_LREM1,
 	VFDW_ACT_RENAME,
 	VFDW_ACT_KSET_ADD,
-	VFDW_ACT_KSET_REM
+	VFDW_ACT_KSET_REM,
+
+	/*
+	 * Appended, never inserted: the numbering is on the wire. Both are actions
+	 * rather than checks, so the two-phase structure is untouched - an expiry
+	 * is something this transaction sets, not something it requires to have
+	 * been true beforehand.
+	 */
+	VFDW_ACT_HPEXPIRE,
+	VFDW_ACT_HPERSIST
 } VfdwActionOp;
 
 /*

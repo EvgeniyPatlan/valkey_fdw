@@ -154,6 +154,8 @@ static const char vfdw_script_src[] =
 "  [10] = function(k, a) return server.pcall('RENAME', KEYS[tonumber(a[1])], k) end,\n"
 "  [11] = function(k, a) return server.pcall('SADD', KEYS[tonumber(a[1])], a[2]) end,\n"
 "  [12] = function(k, a) return server.pcall('SREM', KEYS[tonumber(a[1])], a[2]) end,\n"
+"  [13] = function(k, a) return server.pcall('HPEXPIRE', k, a[2], 'FIELDS', 1, a[1]) end,\n"
+"  [14] = function(k, a) return server.pcall('HPERSIST', k, 'FIELDS', 1, a[1]) end,\n"
 "}\n"
 "\n"
 "for p = 1, nplans do\n"
