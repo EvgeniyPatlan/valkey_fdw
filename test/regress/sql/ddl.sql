@@ -182,14 +182,18 @@ CREATE FOREIGN TABLE w_distance (
 
 -- The read direction. Each message names the column or the shape that is
 -- waiting, not the table type, because that is the line the user has to
--- delete to make the query run.
+-- delete to make the query run. One shape is left: distance.
 -- legacy_value is no longer among them, so this one is seeded and asserted on
 -- what comes back rather than on the refusal it used to raise.
 SELECT valkey_fdw_test_probe('w_srv', 0, 'HSET', 'ddl:legacy:h', 'f', 'fv')
     IS NOT NULL AS seeded;
 SELECT k, v FROM w_legacy ORDER BY k;
 
-SELECT * FROM w_ttl;
+-- w_ttl is not read here. It reads now, but only from a server that HAS
+-- per-field expiry, and this suite runs against every Valkey this wrapper
+-- supports - so the one assertion that could be made here is one whose answer
+-- changes with the server. The read and the refusal both belong in the ttl
+-- suite, which runs only where each of them means something.
 SELECT * FROM w_distance;
 
 -- The write direction reaches the same refusal, from PlanForeignModify, which

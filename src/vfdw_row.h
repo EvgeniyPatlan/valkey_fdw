@@ -41,6 +41,17 @@ typedef struct VfdwRowCtx
 	MemoryContext cache_cxt;	/* where those entries live */
 
 	int			cur_elem;		/* element index within a collection reply */
+
+	/*
+	 * The CURRENT key's per-field expiry, map->nttl entries, or NULL for a
+	 * table with no ttl column.
+	 *
+	 * Here rather than read from a reply where it lies, because by the time a
+	 * tuple is built the reply it came from is gone: a batch reply is valid
+	 * only until the next one is taken, and the value reply the rest of the
+	 * tuple is built from is taken after this one. See vfdw_ttl.h.
+	 */
+	int64	   *ttl_ms;
 } VfdwRowCtx;
 
 /*

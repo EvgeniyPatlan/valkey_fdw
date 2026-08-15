@@ -183,7 +183,9 @@ HINT:  Drop the search_index option to use the ordinary key path.
 -- consulted, so this reports the column and not the write. That is the more
 -- useful of the two answers and is why the map is built first.
 INSERT INTO w_ttl VALUES ('k', 'v', NULL);
-ERROR:  column "t" reads ttl, which is not implemented yet
+ERROR:  cannot insert into a Valkey "hash" table
+DETAIL:  A ttl column reads a field's expiry, and setting one is not implemented.
+HINT:  Drop the ttl column to write this table, or wait for the phase that writes an expiry.
 -- The mask must agree with the refusal rather than contradict it. This is the
 -- pair that used to disagree: 28 - insertable, updatable and deletable -
 -- reported through information_schema for two tables that raise on every
@@ -224,7 +226,7 @@ CREATE FOREIGN TABLE w_distance (
 ) SERVER w_srv OPTIONS (search_index 'idx');
 -- The read direction. Each message names the column or the shape that is
 -- waiting, not the table type, because that is the line the user has to
--- delete to make the query run.
+-- delete to make the query run. One shape is left: distance.
 -- legacy_value is no longer among them, so this one is seeded and asserted on
 -- what comes back rather than on the refusal it used to raise.
 SELECT valkey_fdw_test_probe('w_srv', 0, 'HSET', 'ddl:legacy:h', 'f', 'fv')
@@ -240,8 +242,11 @@ SELECT k, v FROM w_legacy ORDER BY k;
  ddl:legacy:h | {f,fv}
 (1 row)
 
-SELECT * FROM w_ttl;
-ERROR:  column "t" reads ttl, which is not implemented yet
+-- w_ttl is not read here. It reads now, but only from a server that HAS
+-- per-field expiry, and this suite runs against every Valkey this wrapper
+-- supports - so the one assertion that could be made here is one whose answer
+-- changes with the server. The read and the refusal both belong in the ttl
+-- suite, which runs only where each of them means something.
 SELECT * FROM w_distance;
 ERROR:  column "d" reads distance, which is not implemented yet
 -- The write direction reaches the same refusal, from PlanForeignModify, which

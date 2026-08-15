@@ -161,6 +161,13 @@ typedef struct VfdwScanState
  */
 extern void vfdw_scan_queue_page(VfdwScanState *state);
 
+/*
+ * Take one key's replies off the batch and return the one the tuple is built
+ * from. Declared beside the queuer and defined beside it, because the order it
+ * takes them in is only correct while it matches the order that queued them.
+ */
+extern valkeyReply *vfdw_scan_take_replies(VfdwScanState *state);
+
 extern void vfdw_scan_seen_reset(VfdwScanState *state);
 
 #endif							/* VFDW_SCAN_INTERNAL_H */

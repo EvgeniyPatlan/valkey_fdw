@@ -33,6 +33,21 @@
  */
 #define VFDW_MAX_WRITE_REFUSAL 256
 
+/*
+ * What a server has been found to support.
+ *
+ * Three states and not a bool, because "not asked yet" and "asked, and it
+ * cannot" are different: collapsed into one false, a lazily probed capability
+ * is re-probed on every use, and collapsed into one true it is never probed at
+ * all. The distinction is the whole reason a lazy probe can be cached.
+ */
+typedef enum VfdwCap
+{
+	VFDW_CAP_UNKNOWN = 0,		/* not asked; must be the zero value */
+	VFDW_CAP_PRESENT,
+	VFDW_CAP_ABSENT
+} VfdwCap;
+
 typedef struct VfdwConnKey
 {
 	Oid			serverid;
@@ -116,6 +131,20 @@ struct VfdwConn
 	bool		write_refused;
 	int			write_refusal_len;
 	char		write_refusal[VFDW_MAX_WRITE_REFUSAL];
+
+	/*
+	 * Whether this server has per-field expiry, asked the first time a table
+	 * that needs it is read. See vfdw_ttl.h for why it is asked rather than
+	 * read off a version.
+	 *
+	 * UNKNOWN until asked, and asked LAZILY rather than in vfdw_conn_open,
+	 * because most tables have no ttl column and the question costs a round
+	 * trip. That makes this the one capability here a new entry can read
+	 * uninitialised, so unlike write_refused it is set where the entry is
+	 * created as well as where the socket is - which vfdw_conn_close returns
+	 * it to, since a reconnect may land on a different server.
+	 */
+	VfdwCap		field_ttl;
 
 	/*
 	 * Which subtransaction took the lease, so an aborting one can release what

@@ -42,7 +42,8 @@ including against a cluster. Vector search does not.
 | Writes | `INSERT`, `UPDATE`, `DELETE`, `COPY FROM` — one atomic unit per transaction |
 | Transport | TLS with hostname verification, ACL auth, RESP3 with a tested RESP2 fallback |
 | Cluster | slot discovery, per-node pooling, fan-out scans, `MOVED`/`ASK`, single-slot writes |
-| Accepted, then refused | `ttl` columns and `distance` columns. The validator takes both so a table can be defined ahead of the feature; the first query against such a table raises `0A000` |
+| Field expiry | a `ttl` column reads a hash field's remaining time to live as an `interval`, on a server that has per-field expiry (Valkey 9+) |
+| Accepted, then refused | `distance` columns. The validator takes them so a table can be defined ahead of the feature; the first query against such a table raises `0A000` |
 | Declared, not routed | `prefer_replica` marks a server a replica and refuses writes through it. It sends no read anywhere else |
 
 Three qualifications, stated once here rather than repeated below.
@@ -349,10 +350,17 @@ facts about the keyspace rather than about the statement: a key that already
 exists where one is being created (`23505`), and a key holding a different
 Valkey type than its table declares (`42804`).
 
-Two shapes are refused in both directions rather than only on write, at the
-first plan over the table and at `0A000`: a `ttl` column and a `distance`
-column. Those are the unimplemented shapes described under *Usage*, and the
-refusal is what stands in for them.
+One shape is refused in both directions rather than only on write, at the
+first plan over the table and at `0A000`: a `distance` column. That is the
+unimplemented shape described under *Usage*, and the refusal is what stands in
+for it.
+
+A `ttl` column is refused in one direction only, and for two different reasons
+in the two places it can be refused. Every write to a table carrying one is
+refused because setting an expiry is not implemented. A read is refused only
+when the server has no per-field expiry, which is a fact about the server
+rather than about the wrapper, and is reported when the scan opens — the first
+moment there is a server to ask.
 
 A `legacy_value 'true'` table is in the table above rather than in this
 paragraph: it reads, and only the write is refused. The reason is its own — an
@@ -468,12 +476,24 @@ all; here the query supplies the schema and the table supplies the bytes.
 - `tabletype 'string'` is refused with it: a string holds one value and has no
   members, and `(key, value text)` already reads it.
 
-Two things in the option tables below may be written into a table definition
-and cannot yet be queried: a `ttl` column and a `distance` column. **Neither is
-implemented**: declaring one is accepted, and the first plan over it raises
-`0A000`, in either direction. They are accepted by the validator so that a
-table definition can be written ahead of the feature, which is the only reason
-they appear in the option tables at all.
+One thing in the option tables below may be written into a table definition
+and cannot yet be queried: a `distance` column. It is **not implemented**:
+declaring one is accepted, and the first plan over it raises `0A000`, in either
+direction. It is accepted by the validator so that a table definition can be
+written ahead of the feature, which is the only reason it appears in the option
+tables at all.
+
+A `ttl` column is no longer one of them in the read direction. It reads a hash
+field's remaining time to live as an `interval`, and reports NULL both for a
+field with no expiry and for a field that is not there — neither is a duration,
+and the row's other columns already say which case it is. It needs a server
+with per-field expiry, which arrived in Valkey 9; against an older one the
+query is refused with `0A000` naming the server rather than the column, because
+that is what has to change. Whether the server has it is settled by asking it,
+not by reading a version, so a fork or a backport is judged on what it can do.
+
+Writing an expiry is not implemented, and a table carrying a `ttl` column is
+refused for every write until it is.
 
 `search_index` and `index_type` fail differently: they are accepted and simply
 not consulted. No qual reaches the index, and a write through a table carrying
@@ -592,7 +612,7 @@ it on is not.
 | `field` | string | — | Hash field name | no |
 | `member` | boolean | `false` | Column holds the list/set/zset member | no |
 | `score` | boolean | `false` | Column holds the zset score | no |
-| `ttl` | boolean | `false` | Column holds the paired field's time to live; accepted and refused at plan time | no |
+| `ttl` | boolean | `false` | Column holds the paired field's time to live, as an `interval`; read-only, needs `tabletype 'hash'`, a `field`, and Valkey 9+ | no |
 | `distance` | boolean | `false` | Column receives the vector search score; accepted and refused at plan time | no |
 | `index_type` | enum | — | `tag`, `numeric` or `vector`; accepted and not consulted | no |
 

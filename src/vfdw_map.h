@@ -99,6 +99,17 @@ typedef struct VfdwColumn
 	 */
 	bool		is_domain;
 
+	/*
+	 * VFDW_COL_TTL only: which entry of the HPTTL reply is this column's.
+	 *
+	 * Assigned where the ttl columns are counted, so the position a field is
+	 * ASKED for and the position its answer is READ from are decided by one
+	 * walk in one order. Two walks would be two chances to disagree, and the
+	 * disagreement would not fail - it would give each column another
+	 * column's expiry.
+	 */
+	int			ttl_slot;
+
 	/* VFDW_COL_LEGACY_VALUE only; NULL for every other kind. */
 	struct VfdwPackedElem *packed;
 } VfdwColumn;
@@ -158,6 +169,14 @@ typedef struct VfdwTableMap
 	bool		readonly;
 
 	int			nfields;		/* VFDW_COL_FIELD columns */
+
+	/*
+	 * VFDW_COL_TTL columns. Both the width of the array vfdw_ttl_take fills
+	 * and the count HPTTL is told, which is why it is kept rather than
+	 * recounted: the two have to be the same number, and a second walk that
+	 * disagreed with the first would misalign every field after it.
+	 */
+	int			nttl;
 } VfdwTableMap;
 
 /*

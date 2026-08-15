@@ -253,7 +253,12 @@ CREATE FOREIGN TABLE map_ttl (
     t interval  OPTIONS (ttl 'true', field 'f')
 ) SERVER map_srv OPTIONS (tabletype 'hash');
 EXPLAIN (COSTS OFF) SELECT * FROM map_ttl;
-ERROR:  column "t" reads ttl, which is not implemented yet
+            QUERY PLAN            
+----------------------------------
+ Foreign Scan on map_ttl
+   Valkey Strategy: Keyspace Scan
+(2 rows)
+
 CREATE FOREIGN TABLE map_distance (
     k text,
     d double precision OPTIONS (distance 'true')

@@ -17,6 +17,7 @@
 #include "access/table.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_foreign_table.h"
+#include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "lib/stringinfo.h"
 #include "nodes/parsenodes.h"
@@ -518,6 +519,9 @@ vfdw_map_check_types(VfdwTableMap *map, TupleDesc tupdesc)
 					why = "ttl columns require tabletype 'hash'";
 				else if (col->field == NULL)
 					why = "a ttl column must also name its field";
+				else if (getBaseType(col->typid) != INTERVALOID)
+					why = "ttl columns must be of type interval";
+				col->ttl_slot = map->nttl++;
 				break;
 			case VFDW_COL_DISTANCE:
 				if (map->search_index == NULL)
@@ -629,9 +633,14 @@ vfdw_map_check_implemented(VfdwTableMap *map, TupleDesc tupdesc)
 	{
 		const char *what = NULL;
 
-		if (map->cols[i].kind == VFDW_COL_TTL)
-			what = "ttl";
-		else if (map->cols[i].kind == VFDW_COL_DISTANCE)
+		/*
+		 * ttl has left this list. It is read, by a second command per key, and
+		 * what it needs from the server is asked of the server rather than
+		 * decided here - see vfdw_ttl.h. A server without per-field expiry is
+		 * refused when the scan opens, which is the first moment there is a
+		 * server to ask.
+		 */
+		if (map->cols[i].kind == VFDW_COL_DISTANCE)
 			what = "distance";
 
 		if (what == NULL)

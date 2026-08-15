@@ -25,6 +25,7 @@
 #include "utils/builtins.h"
 
 #include "vfdw_cmd.h"
+#include "vfdw_ttl.h"
 
 /*
  * One FmgrInfo per attribute, plus the per-attribute domain cache.
@@ -46,6 +47,9 @@ vfdw_row_ctx_init(VfdwRowCtx *ctx, VfdwTableMap *map, MemoryContext cxt)
 											   sizeof(void *) * Max(map->natts, 1));
 	ctx->cache_cxt = cxt;
 	ctx->cur_elem = 0;
+	ctx->ttl_ms = map->nttl > 0
+		? MemoryContextAllocZero(cxt, sizeof(int64) * map->nttl)
+		: NULL;
 
 	for (i = 0; i < map->natts; i++)
 	{
@@ -351,6 +355,49 @@ vfdw_scan_fill(VfdwRowCtx *ctx, TupleTableSlot *slot,
 	ExecStoreVirtualTuple(slot);
 }
 
+/*
+ * A ttl column, from the expiries copied out before the value reply arrived.
+ *
+ * Left NULL when the server had no duration to report, which vfdw_ttl_datum
+ * decides: a field with no expiry and a field that is not there are both
+ * absences rather than durations, and a row whose field is missing has its
+ * other columns NULL for the same reason.
+ */
+static void
+vfdw_row_store_ttl(VfdwRowCtx *ctx, TupleTableSlot *slot,
+				   const VfdwColumn *col)
+{
+	Datum		value;
+
+	/*
+	 * ttl_ms is NULL only when the map says there are no ttl columns, and then
+	 * this is unreachable. Tested anyway: the cost is one branch per ttl column
+	 * per row, and what it buys is that a path which builds a tuple without
+	 * having asked for expiries reports NULL rather than dereferencing NULL.
+	 */
+	if (ctx->ttl_ms == NULL || !vfdw_ttl_datum(ctx->ttl_ms[col->ttl_slot], &value))
+		return;
+
+	slot->tts_values[col->attnum - 1] = value;
+	slot->tts_isnull[col->attnum - 1] = false;
+}
+
+/*
+ * A zset member's score, which is the second half of the pair the member came
+ * from and so is found the same way rather than by a parallel index.
+ */
+static void
+vfdw_row_store_score(VfdwRowCtx *ctx, TupleTableSlot *slot,
+					 const VfdwColumn *col, valkeyReply *reply)
+{
+	const valkeyReply *m = NULL;
+	const valkeyReply *sc = NULL;
+
+	if (vfdw_scan_member_at(reply, ctx->cur_elem, true, &m, &sc) &&
+		sc != NULL && sc->str != NULL)
+		vfdw_scan_store(ctx, slot, col, sc->str, sc->len);
+}
+
 static void
 vfdw_row_fill_column(VfdwRowCtx *ctx, TupleTableSlot *slot,
 					 const VfdwColumn *col, const char *key, size_t keylen,
@@ -397,18 +444,15 @@ vfdw_row_fill_column(VfdwRowCtx *ctx, TupleTableSlot *slot,
 		}
 
 		case VFDW_COL_SCORE:
-		{
-			const valkeyReply *m = NULL;
-			const valkeyReply *sc = NULL;
-
-			if (vfdw_scan_member_at(reply, ctx->cur_elem, true, &m, &sc) &&
-				sc != NULL && sc->str != NULL)
-				vfdw_scan_store(ctx, slot, col, sc->str, sc->len);
+			vfdw_row_store_score(ctx, slot, col, reply);
 			break;
-		}
+
+		case VFDW_COL_TTL:
+			vfdw_row_store_ttl(ctx, slot, col);
+			break;
 
 		default:
-			/* ttl and distance arrive with the phases that fill them. */
+			/* distance arrives with the phase that fills it. */
 			break;
 	}
 }

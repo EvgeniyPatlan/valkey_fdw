@@ -255,12 +255,49 @@ MUTATIONS = [
      "\tif (false && map->legacy_value)\n\t\treturn false;",
      "standalone", "legacy"),
 
+    # An expiry the server does not have is not a duration. -1 is a field with
+    # no expiry and -2 is a field that is not there; admitting either builds an
+    # interval out of a sentinel, and ttl asserts that a key whose fields never
+    # expired reports NULL for both of them.
+    ("T1-noexpiry", "src/vfdw_ttl.c",
+     "\tif (ms == VFDW_TTL_NO_EXPIRY || ms == VFDW_TTL_ABSENT || ms < 0)",
+     "\tif (false)",
+     "standalone", "ttl"),
+
+    # Each ttl column reads ITS OWN field's answer. The reply is positional, so
+    # taking every column's expiry from the first slot is a mutation that keeps
+    # the row shape, keeps the nullness of the common case, and silently gives
+    # two fields one duration - which is why ttl expires two fields to plainly
+    # different durations and compares them rather than reading one.
+    ("T2-slot", "src/vfdw_row.c",
+     "vfdw_ttl_datum(ctx->ttl_ms[col->ttl_slot], &value)",
+     "vfdw_ttl_datum(ctx->ttl_ms[0], &value)",
+     "standalone", "ttl"),
+
+    # The capability verdict itself. Reporting every server as lacking the
+    # command refuses a server that has it, which is the direction a Valkey 9
+    # run can prove; the other direction is what ttl_absent asserts on 8.
+    ("T3-cap", "src/vfdw_ttl.c",
+     "\tvconn->field_ttl = present ? VFDW_CAP_PRESENT : VFDW_CAP_ABSENT;",
+     "\tvconn->field_ttl = (present && false) ? VFDW_CAP_PRESENT : VFDW_CAP_ABSENT;",
+     "standalone", "ttl"),
+
+    # One key, two replies, and the consumer has to take both. Taking only the
+    # value leaves each key's expiry to be read as the NEXT key's value, which
+    # is the misalignment the queue and take comments both exist to prevent.
+    ("T4-pair", "src/vfdw_scan_cmd.c",
+     "\tif (state->map->nttl > 0)\n"
+     "\t\tvfdw_ttl_take(state->map, vfdw_batch_next(state->batch),",
+     "\tif (false && state->map->nttl > 0)\n"
+     "\t\tvfdw_ttl_take(state->map, vfdw_batch_next(state->batch),",
+     "standalone", "ttl"),
+
     # A packed zset takes members, not scores. Restoring WITHSCORES makes the
     # array's shape follow the negotiated protocol rather than the data: RESP2
     # returns member and score alternating, RESP3 a nested pair per member
     # whose children carry no bytes of their own. The zset round trip in
     # legacy asserts the members alone, so both spellings go red.
-    ("PK2", "src/vfdw_scan.c",
+    ("PK2", "src/vfdw_scan_cmd.c",
      "\t\t\tif (!state->map->legacy_value)\n"
      "\t\t\t\tvfdw_cmd_add_cstr(cmd, \"WITHSCORES\");",
      "\t\t\tvfdw_cmd_add_cstr(cmd, \"WITHSCORES\");",

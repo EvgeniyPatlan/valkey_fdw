@@ -56,57 +56,7 @@
 #include "vfdw_error.h"
 #include "vfdw_map.h"
 #include "vfdw_row.h"
-
-/*
- * The command that reads one key's value, by table type.
- */
-static void
-vfdw_scan_value_command(VfdwScanState *state, VfdwCmd *cmd,
-						const char *key, size_t keylen)
-{
-	vfdw_cmd_reset(cmd);
-
-	switch (state->map->tabletype)
-	{
-		case VFDW_TABLE_HASH:
-			vfdw_cmd_add_cstr(cmd, "HGETALL");
-			vfdw_cmd_add_bytes(cmd, key, keylen);
-			break;
-		case VFDW_TABLE_LIST:
-			vfdw_cmd_add_cstr(cmd, "LRANGE");
-			vfdw_cmd_add_bytes(cmd, key, keylen);
-			vfdw_cmd_add_cstr(cmd, "0");
-			vfdw_cmd_add_cstr(cmd, "-1");
-			break;
-		case VFDW_TABLE_SET:
-			vfdw_cmd_add_cstr(cmd, "SMEMBERS");
-			vfdw_cmd_add_bytes(cmd, key, keylen);
-			break;
-		case VFDW_TABLE_ZSET:
-			vfdw_cmd_add_cstr(cmd, "ZRANGE");
-			vfdw_cmd_add_bytes(cmd, key, keylen);
-			vfdw_cmd_add_cstr(cmd, "0");
-			vfdw_cmd_add_cstr(cmd, "-1");
-
-			/*
-			 * A packed table takes the members and not the scores, so it does
-			 * not ask for them. WITHSCORES is answered by RESP2 with member
-			 * and score alternating and by RESP3 with a nested pair per member
-			 * (see vfdw_scan_member_at), so packing that reply would give the
-			 * same table a differently-shaped array depending on which
-			 * protocol the connection negotiated. A score is read by mapping a
-			 * score column instead.
-			 */
-			if (!state->map->legacy_value)
-				vfdw_cmd_add_cstr(cmd, "WITHSCORES");
-			break;
-		case VFDW_TABLE_STRING:
-		default:
-			vfdw_cmd_add_cstr(cmd, "GET");
-			vfdw_cmd_add_bytes(cmd, key, keylen);
-			break;
-	}
-}
+#include "vfdw_ttl.h"
 
 /* The Valkey type name for SCAN's server-side TYPE filter. */
 static const char *
@@ -315,23 +265,6 @@ vfdw_scan_next_page(VfdwScanState *state)
 }
 
 /*
- * Queue value fetches for every key of the current page.
- */
-void
-vfdw_scan_queue_page(VfdwScanState *state)
-{
-	VfdwCmd		cmd;
-	int			i;
-
-	vfdw_cmd_init(&cmd, state->page_cxt, 4);
-	for (i = 0; i < state->nkeys; i++)
-	{
-		vfdw_scan_value_command(state, &cmd, state->keys[i], state->keylens[i]);
-		vfdw_batch_add(state->batch, &cmd);
-	}
-}
-
-/*
  * Make more replies available, or report that there are none left.
  */
 static bool
@@ -531,7 +464,7 @@ vfdw_scan_fetch(VfdwScanState *state, TupleTableSlot *slot)
 		state->next_key++;
 
 		/* Taken FIRST, always: see vfdw_scan_apply_overlay. */
-		reply = vfdw_batch_next(state->batch);
+		reply = vfdw_scan_take_replies(state);
 		if (reply == NULL)
 			return slot;
 
@@ -655,6 +588,15 @@ vfdw_scan_state_create(Relation rel, MemoryContext parent)
 	state->vconn = vfdw_get_connection_cluster(server, user);
 
 	vfdw_conn_select_db(state->vconn, state->map->database);
+
+	/*
+	 * Before a single command is sent, so a server that cannot answer for
+	 * expiry says so instead of answering the first page and then failing.
+	 * This is the earliest point there is a server to ask: the map is resolved
+	 * at plan time, where there is no connection and so no question to put.
+	 */
+	if (state->map->nttl > 0)
+		vfdw_ttl_require(state->vconn);
 
 	vfdw_row_ctx_init(&state->rowctx, state->map, scan_cxt);
 

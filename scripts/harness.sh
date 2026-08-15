@@ -81,12 +81,28 @@ base_for_kind() {
 # Which regression suites are meaningful on which topology. The fault suite
 # needs the proxy in front of the server; the io suite assumes the server
 # behaves.
+# The Valkey major, for the suites whose subject only exists on some of them.
+#
+# A suite is already scoped to the topology where it means something; a feature
+# the server either has or does not have is the same statement about a
+# different axis. Per-field expiry arrived in Valkey 9, so `ttl` asserts what it
+# does and `ttl_absent` asserts the refusal, and each runs only where its own
+# assertion is the true one. Neither is skipped anywhere - between them they
+# cover every supported server.
+valkey_major() {
+    echo "${VALKEY_VERSION%%.*}"
+}
+
 suites_for_topology() {
+    local ttl_suite=ttl_absent
+
+    [[ "$(valkey_major)" -ge 9 ]] && ttl_suite=ttl
+
     case "$1" in
         # priv runs last: it drops and re-creates valkey_fdw_test to assert the
         # split between the two extensions, so anything after it would be
         # running against a catalog this suite briefly emptied.
-        standalone) echo "smoke probe options ddl mapping scan legacy io pool leak val wbuf modify script dml overlay priv" ;;
+        standalone) echo "smoke probe options ddl mapping scan legacy ${ttl_suite} io pool leak val wbuf modify script dml overlay priv" ;;
         # smoke is no longer topology-neutral: now that it really scans, it
         # needs a server it can reach in plaintext. The tls suite covers the
         # load-and-connect path for this topology itself.
