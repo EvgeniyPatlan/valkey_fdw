@@ -341,6 +341,21 @@ MUTATIONS = [
      "\tif (false)\n\t\tvfdw_modify_check_position(st, slot);",
      "standalone", "position"),
 
+    # The row-identity Var must name the range table entry it is filed under.
+    #
+    # UNDER CASSERT, because what catches this is core's own assertion in
+    # add_row_identity_var, which an ordinary build compiles out. CI runs the
+    # whole suite that way for this class of defect.
+    #
+    # The mutation is hardcoding 1, which is what a plain UPDATE or DELETE
+    # would never notice: the result relation IS the first entry there, so the
+    # wrong answer and the right one are the same number. dml reaches it
+    # through an inherited child, where the parent takes entry one.
+    ("R1-rtindex", "src/vfdw_rowid.c",
+     "\tvar = makeVar(rtindex, attno, attr->atttypid, attr->atttypmod,",
+     "\tvar = makeVar(1, attno, attr->atttypid, attr->atttypmod,",
+     "standalone+cassert", "dml"),
+
     # A packed zset takes members, not scores. Restoring WITHSCORES makes the
     # array's shape follow the negotiated protocol rather than the data: RESP2
     # returns member and score alternating, RESP3 a nested pair per member
@@ -363,16 +378,28 @@ SUITE_TIMEOUT = 900
 
 
 def run_suite(pg, topology, suite):
+    # A topology may carry "+cassert", which runs the suite against a
+    # PostgreSQL built with --enable-cassert. Some defects are caught by core's
+    # own assertions rather than by anything this tree asserts - a row-identity
+    # Var whose varno disagrees with the range table index it is filed under is
+    # one - and those assertions are compiled out of an ordinary build. CI runs
+    # a cassert job for the same reason.
+    cassert = topology.endswith("+cassert")
+    if cassert:
+        topology = topology[: -len("+cassert")]
+
     # A mutation can remove a loop's only exit, and then the suite neither
     # passes nor fails: it runs until something kills it. Unbounded, that is
     # indistinguishable from slow, and every mutation queued after it is never
     # reached - so the set reports nothing at all rather than reporting a
     # problem. Bounded, it becomes a verdict of its own.
     try:
-        r = subprocess.run(
-            ["./scripts/harness.sh", "test", "--pg", str(pg),
-             "--topology", topology, "--suite", suite],
-            cwd=HERE, capture_output=True, text=True, timeout=SUITE_TIMEOUT)
+        cmd = ["./scripts/harness.sh", "test", "--pg", str(pg),
+               "--topology", topology, "--suite", suite]
+        if cassert:
+            cmd.append("--cassert")
+        r = subprocess.run(cmd, cwd=HERE, capture_output=True, text=True,
+                           timeout=SUITE_TIMEOUT)
     except subprocess.TimeoutExpired:
         return "TIMED-OUT"
     out = r.stdout + r.stderr

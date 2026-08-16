@@ -110,7 +110,12 @@ suites_for_topology() {
         # The default user is disabled on this topology, so nothing that
         # connects without credentials can run here - smoke included.
         acl)        echo "acl probe_acl" ;;
-        fault)      echo "smoke fault wfault resp" ;;
+        # The write-path suites run here as well as on standalone, which is
+        # the whole of item 5.4: the overlay, the ledger fold and the script
+        # were exercised only over a plain socket to one node, and the proxy
+        # this topology puts in front answers to the same name, so they run
+        # unchanged and reach the server by a different path.
+        fault)      echo "smoke fault wfault resp wbuf overlay script dml" ;;
 
         cluster)    echo "smoke cluster" ;;
         search)     echo "smoke vsearch" ;;

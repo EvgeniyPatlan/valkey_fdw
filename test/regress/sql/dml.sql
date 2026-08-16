@@ -302,6 +302,75 @@ SELECT d_err($$INSERT INTO d_hash VALUES ('dh:none', NULL, NULL)$$)
     AS insert_all_null_still_refused;
 
 -- ---------------------------------------------------------------------------
+-- JOINED DML: UPDATE ... FROM and DELETE ... USING.
+--
+-- Neither appeared anywhere in this tree, which left one line unguarded:
+-- vfdw_rowid_add_one builds the junk row-identity Var with makeVar(rtindex,
+-- attno, atttypid, atttypmod, attcollation, 0). In a single-relation
+-- statement the target is the only range table entry, so an rtindex taken
+-- from the wrong place is still right by accident, and a collation dropped
+-- from the Var is never compared against anything. A join makes both wrong
+-- answers reachable: the target is no longer entry one, and the junk column
+-- is compared with a column from another relation.
+--
+-- The key column is text, so its collation is not the invalid one that an
+-- uncollatable type would carry - a Var built with InvalidOid here would be
+-- a collation mismatch the planner reports rather than something silently
+-- returning the wrong rows.
+-- ---------------------------------------------------------------------------
+CREATE TABLE d_local (k text, want text);
+INSERT INTO d_local VALUES ('dh:j1', 'updated'), ('dh:j2', 'deleted');
+
+INSERT INTO d_hash VALUES ('dh:j1', 'a1', 'b1'), ('dh:j2', 'a2', 'b2');
+
+-- The target is the FOREIGN table and the joined relation is local, which is
+-- the direction that exercises the callback: the junk Var belongs to the
+-- foreign side and has to name it correctly among two entries.
+UPDATE d_hash SET a = d_local.want
+FROM d_local WHERE d_hash.k = d_local.k AND d_local.want = 'updated';
+
+SELECT k, a, b FROM d_hash WHERE k IN ('dh:j1', 'dh:j2') ORDER BY k;
+
+-- RETURNING through a join, because a DELETE has no new row and its old row
+-- is captured by the whole-row Var this same callback asks for.
+DELETE FROM d_hash USING d_local
+WHERE d_hash.k = d_local.k AND d_local.want = 'deleted'
+RETURNING d_hash.k, d_hash.a;
+
+SELECT k, a FROM d_hash WHERE k IN ('dh:j1', 'dh:j2') ORDER BY k;
+
+-- A join that matches nothing changes nothing, and says so rather than
+-- deleting the table: a row-identity Var naming the wrong range table entry
+-- is one of the ways a WHERE that should match nothing matches everything.
+DELETE FROM d_hash USING d_local
+WHERE d_hash.k = d_local.k AND d_local.want = 'no such row';
+
+SELECT count(*) AS survivors FROM d_hash WHERE k IN ('dh:j1', 'dh:j2');
+
+-- THE TARGET IS NOT RANGE TABLE ENTRY ONE.
+--
+-- Everything above still leaves rtindex unguarded, because for a plain UPDATE
+-- or DELETE the result relation is the first entry: hardcoding 1 there is
+-- wrong and right at the same time. Under inheritance it is not. The parent
+-- takes entry one and each child is appended after it, so the junk Var for
+-- this foreign child has to name the child's own index - and naming the
+-- parent's instead is a row identity pointing at another relation entirely.
+CREATE TABLE d_parent (k text, a text, b text);
+ALTER FOREIGN TABLE d_hash INHERIT d_parent;
+
+UPDATE d_parent SET a = 'inherited' WHERE k = 'dh:j1';
+SELECT k, a, b FROM d_hash WHERE k = 'dh:j1';
+
+DELETE FROM d_parent WHERE k = 'dh:j1' RETURNING k, a;
+SELECT count(*) AS gone FROM d_hash WHERE k = 'dh:j1';
+
+ALTER FOREIGN TABLE d_hash NO INHERIT d_parent;
+DROP TABLE d_parent;
+
+DELETE FROM d_hash WHERE k = 'dh:j1';
+DROP TABLE d_local;
+
+-- ---------------------------------------------------------------------------
 -- An empty transaction costs nothing.
 -- ---------------------------------------------------------------------------
 SELECT calls AS calls_before, empty_returns AS empty_before
