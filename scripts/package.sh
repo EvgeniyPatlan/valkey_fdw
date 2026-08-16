@@ -71,6 +71,24 @@ base_for() {
     esac
 }
 
+# What a target calls PostgreSQL, for the targets that do not use PGDG's names.
+#
+# Only names chosen by a package manager live here. WHERE the files go is asked
+# of pg_config by the spec itself, so this stays short and cannot drift from
+# the layout it describes: it says what to install, not where it lands.
+#
+# Empty for every PGDG target, and the spec's own defaults cover those.
+spec_overrides_for() {
+    SPEC_PGCONFIG=""
+    SPEC_PGDEVEL=""
+    case "$1" in
+        amazon-*)
+            SPEC_PGCONFIG=/usr/bin/pg_config
+            SPEC_PGDEVEL="postgresql${PG_MAJOR}-server-devel"
+            ;;
+    esac
+}
+
 family_for() {
     case "$1" in
         el-*|amazon-*) echo rpm ;;
@@ -91,6 +109,8 @@ build_one() {
     image="valkey_fdw/pkg-${target}:pg${PG_MAJOR}"
     out="dist/${target}/${ARCH}"
 
+    spec_overrides_for "$target"
+
     say "building ${target} (${base}, ${DOCKER_ARCH}, pg${PG_MAJOR})"
     docker build --platform "$DOCKER_ARCH" \
         -f "packaging/Dockerfile.${family}" \
@@ -105,6 +125,7 @@ build_one() {
         docker run --rm --platform "$DOCKER_ARCH" \
             -v "$PWD:/src:ro" -v "$PWD/$out:/out" \
             -e "PG_MAJOR=${PG_MAJOR}" -e "VERSION=${VERSION}" \
+            -e "SPEC_PGCONFIG=${SPEC_PGCONFIG}" -e "SPEC_PGDEVEL=${SPEC_PGDEVEL}" \
             "$image" bash -lc '
                 set -eux
                 name="valkey_fdw_${PG_MAJOR}-${VERSION}"
@@ -130,9 +151,16 @@ build_one() {
                 rm -rf /build/*/.harness
                 tar -C /build -czf /root/rpmbuild/SOURCES/$name.tar.gz $name
                 cp /src/packaging/rpm/valkey_fdw.spec /root/rpmbuild/SPECS/
+                # Added only when non-empty: an empty --define would set the
+                # macro to nothing, which is not the same as leaving the
+                # spec default in place - it would blank the path.
+                extra=()
+                [ -n "${SPEC_PGCONFIG:-}" ] && extra+=(--define "pgconfig ${SPEC_PGCONFIG}")
+                [ -n "${SPEC_PGDEVEL:-}" ] && extra+=(--define "pgdevel ${SPEC_PGDEVEL}")
                 rpmbuild -bb /root/rpmbuild/SPECS/valkey_fdw.spec \
                     --define "pgmajor ${PG_MAJOR}" \
-                    --define "vfdw_version ${VERSION}"
+                    --define "vfdw_version ${VERSION}" \
+                    "${extra[@]}"
                 find /root/rpmbuild/RPMS -name "*.rpm" -exec cp {} /out/ \;
             '
     else

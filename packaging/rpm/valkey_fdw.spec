@@ -21,7 +21,34 @@
 %global debug_package %{nil}
 
 %global pgmajor  %{?pgmajor}%{!?pgmajor:17}
-%global pgpath   /usr/pgsql-%{pgmajor}
+
+# WHERE POSTGRESQL IS, ASKED OF pg_config RATHER THAN ASSUMED.
+#
+# The PGDG layout - /usr/pgsql-<major>, one tree per major - is the default
+# because it is what every EL target in this matrix uses. It is not universal.
+# Amazon Linux 2023 packages PostgreSQL itself, one major at a time, with the
+# module directory at /usr/lib64/pgsql and pg_config on $PATH; a spec that
+# hardcodes the PGDG tree looks for a pgxs that is not there, which is one of
+# the two reasons that target had never built.
+#
+# So the only thing named here is pg_config, and the three paths that follow
+# are what it answers. Hardcoding them per distribution would be two sources of
+# truth for one layout, and the failure mode of their disagreeing is a package
+# whose files are installed somewhere the server does not look - which builds,
+# and installs, and does nothing.
+#
+# The fallback is deliberately a path that cannot exist. If pg_config is absent
+# the build fails at %%files with a name that says what happened, rather than
+# packaging /lib/valkey_fdw.so from an empty macro.
+%global pgconfig %{?pgconfig}%{!?pgconfig:/usr/pgsql-%{pgmajor}/bin/pg_config}
+%global pglibdir %(%{pgconfig} --pkglibdir 2>/dev/null || echo /pg_config-not-found)
+%global pgsharedir %(%{pgconfig} --sharedir 2>/dev/null || echo /pg_config-not-found)
+
+# The development and server packages, which are named differently by the
+# distributions that build PostgreSQL themselves.
+%global pgdevel %{?pgdevel}%{!?pgdevel:postgresql%{pgmajor}-devel}
+%global pgserver %{?pgserver}%{!?pgserver:postgresql%{pgmajor}-server}
+
 %global libvalkey_ref %{?libvalkey_ref}%{!?libvalkey_ref:0.5.0}
 
 Name:           valkey_fdw_%{pgmajor}
@@ -39,8 +66,8 @@ License:        PostgreSQL
 Source0:        %{name}-%{version}.tar.gz
 
 BuildRequires:  gcc make cmake git openssl-devel
-BuildRequires:  postgresql%{pgmajor}-devel
-Requires:       postgresql%{pgmajor}-server
+BuildRequires:  %{pgdevel}
+Requires:       %{pgserver}
 
 %description
 valkey_fdw presents Valkey keys as PostgreSQL foreign tables: strings, hashes,
@@ -92,7 +119,7 @@ cmake --install _libvalkey/build
 # expressions. For a wrapper whose every interesting operation is a network
 # round trip, that is close to nothing. The Debian targets keep emitting it,
 # because there the toolchain is packaged and consistent.
-make %{?_smp_mflags} USE_PGXS=1 PG_CONFIG=%{pgpath}/bin/pg_config \
+make %{?_smp_mflags} USE_PGXS=1 PG_CONFIG=%{pgconfig} \
      VALKEY_VENDORED=1 LIBVALKEY_DIR=%{_builddir}/libvalkey-prefix \
      with_llvm=no
 
@@ -111,7 +138,7 @@ make %{?_smp_mflags} USE_PGXS=1 PG_CONFIG=%{pgpath}/bin/pg_config \
 # symlinked path - and this package would still fail on them.
 export QA_RPATHS=$(( 0x0002 ))
 
-make install with_llvm=no USE_PGXS=1 PG_CONFIG=%{pgpath}/bin/pg_config \
+make install with_llvm=no USE_PGXS=1 PG_CONFIG=%{pgconfig} \
      VALKEY_VENDORED=1 LIBVALKEY_DIR=%{_builddir}/libvalkey-prefix \
      DESTDIR=%{buildroot}
 
@@ -124,8 +151,8 @@ make install with_llvm=no USE_PGXS=1 PG_CONFIG=%{pgpath}/bin/pg_config \
 # that will never run the suites has no use for the surface, and the smallest
 # surface is the one that is absent. `make install` emits both extensions
 # because the build is one build; the choice of what to ship is made here.
-rm -f %{buildroot}%{pgpath}/share/extension/valkey_fdw_test.control \
-      %{buildroot}%{pgpath}/share/extension/valkey_fdw_test--*.sql
+rm -f %{buildroot}%{pgsharedir}/extension/valkey_fdw_test.control \
+      %{buildroot}%{pgsharedir}/extension/valkey_fdw_test--*.sql
 
 %files
 %license LICENSE
@@ -135,7 +162,7 @@ rm -f %{buildroot}%{pgpath}/share/extension/valkey_fdw_test.control \
 # --excludedocs and is found where a user looks for it.
 %license LICENSE-libvalkey
 %doc README.md
-%{pgpath}/lib/valkey_fdw.so
+%{pglibdir}/valkey_fdw.so
 # One extension, named exactly. The glob in valkey_fdw--*.sql ranges over
 # VERSIONS and not over extension names, so this pair matches the wrapper and
 # every future upgrade script of its own without also matching valkey_fdw_test
@@ -146,8 +173,8 @@ rm -f %{buildroot}%{pgpath}/share/extension/valkey_fdw_test.control \
 # section, which fails the build a hundred lines from the comment that caused
 # it. %%files and %%build are not macros and pass either way, which is why the
 # one at the top of this file is left as it is.
-%{pgpath}/share/extension/valkey_fdw.control
-%{pgpath}/share/extension/valkey_fdw--*.sql
+%{pgsharedir}/extension/valkey_fdw.control
+%{pgsharedir}/extension/valkey_fdw--*.sql
 
 %changelog
 * Mon Aug 10 2026 Evgeniy Patlan <evgeniy.patlan@percona.com> - 0.1-1

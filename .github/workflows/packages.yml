@@ -42,24 +42,24 @@ jobs:
       fail-fast: false
       matrix:
         pg: ["16", "17", "18"]
-        # amazon-2023 is absent, and not because of the majors it carries.
+        # amazon-2023 is here now, and its absence was never about majors: it
+        # ships 15 through 18. Two other things stopped it, both since fixed.
+        # Its development package is named postgresql<n>-server-devel where
+        # every other target here calls it postgresql<n>-devel, so the image
+        # installed a package that does not exist; and its PostgreSQL lives at
+        # /usr/lib64/pgsql rather than the /usr/pgsql-<n> the spec named, so
+        # even with the right package the build looked for a pgxs that was not
+        # there. The spec now asks pg_config where things go instead of
+        # assuming, and the image installs the name that exists.
         #
-        # It ships 15 through 18, so the driver's assumption that only some
-        # majors are buildable there is not what stops it. Two other things
-        # do, and neither is a version question. Its development package is
-        # named postgresql<n>-server-devel where every other target in this
-        # list calls it postgresql<n>-devel, so the image installs a package
-        # that does not exist. And its PostgreSQL lives at /usr/lib64/pgsql
-        # rather than the /usr/pgsql-<n> the spec names, so even with the
-        # right package the build would look for pgxs where there is none.
-        #
-        # Listing it here would mean three cells that cannot go green, which
-        # teaches a reader to ignore this workflow. It stays a target of
-        # scripts/package.sh, where it is a request someone makes on purpose.
+        # Listed rather than left to scripts/package.sh, because a target that
+        # nothing runs is a target that breaks quietly - which is how this one
+        # came to be unbuildable in the first place.
         target:
           - el-8
           - el-9
           - el-10
+          - amazon-2023
           - debian-12
           - debian-13
           - ubuntu-24.04
@@ -151,6 +151,7 @@ jobs:
             el-8)        img=oraclelinux:8 ;;
             el-9)        img=oraclelinux:9 ;;
             el-10)       img=oraclelinux:10 ;;
+            amazon-2023) img=amazonlinux:2023 ;;
             debian-12)   img=debian:12 ;;
             debian-13)   img=debian:13 ;;
             ubuntu-24.04) img=ubuntu:24.04 ;;
@@ -159,6 +160,17 @@ jobs:
           esac
 
           case "${{ matrix.target }}" in
+            amazon-*)
+              # No PGDG repo here, and none needed: Amazon Linux packages
+              # PostgreSQL itself, so the package's Requires resolves out of
+              # the distribution's own repositories.
+              pkg=$(ls dist/${{ matrix.target }}/*/*.rpm)
+              docker run --rm -v "$PWD/dist:/d:ro" -e "PKG=${pkg#dist/}" "$img" bash -lc '
+                set -e
+                dnf install -y "/d/${PKG}"
+                echo "installed; dependencies satisfied"
+              '
+              ;;
             el-*)
               pkg=$(ls dist/${{ matrix.target }}/*/*.rpm)
               docker run --rm -v "$PWD/dist:/d:ro" -e "PKG=${pkg#dist/}" "$img" bash -lc '

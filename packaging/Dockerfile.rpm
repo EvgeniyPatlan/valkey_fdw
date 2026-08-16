@@ -4,10 +4,10 @@
 #   amazonlinux:2023                -> Amazon Linux 2023
 #
 # Amazon Linux 2023 has no PGDG repository, so PostgreSQL comes from its own
-# repos and only the majors AL2023 ships are buildable there. That is a fact
-# about the distribution, not something the spec can paper over, and the
-# driver refuses the combination rather than producing a package linked
-# against a different major than its name claims.
+# repos. It packages PostgreSQL itself and names things its own way: the
+# development package is postgresql<n>-server-devel, and the tree lives at
+# /usr/lib64/pgsql rather than /usr/pgsql-<n>. The spec learns the second from
+# pg_config; the first is a package name, which only this file can know.
 ARG BASE=oraclelinux:9
 FROM ${BASE}
 
@@ -34,7 +34,13 @@ RUN set -eux; \
         gcc gcc-c++ clang make cmake git tar rpm-build openssl-devel \
         redhat-rpm-config findutils which dnf-plugins-core || true; \
     if command -v amazon-linux-extras >/dev/null 2>&1 || grep -qi amazon /etc/os-release; then \
-        $PKG install -y "postgresql${PG_MAJOR}-devel" "postgresql${PG_MAJOR}-server"; \
+        # postgresql<n>-SERVER-devel, which is what Amazon Linux calls it.
+        # Every other target in this file says postgresql<n>-devel, and
+        # installing that name here succeeds at nothing: dnf reports no match,
+        # `|| true` above swallows it, and the failure finally arrives as a
+        # missing pgxs.mk hundreds of lines later. AL2023 carries 15 through
+        # 18, so no major in this matrix is excluded by the distribution.
+        $PKG install -y "postgresql${PG_MAJOR}-server-devel" "postgresql${PG_MAJOR}-server"; \
     else \
         $PKG install -y \
           "https://download.postgresql.org/pub/repos/yum/reporpms/EL-${EL}-x86_64/pgdg-redhat-repo-latest.noarch.rpm" \
