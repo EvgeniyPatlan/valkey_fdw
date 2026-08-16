@@ -367,6 +367,38 @@ vfdw_val_ttl_column(VfdwValCtx *vc, const VfdwColumn *col, Datum d,
 	out->len = (size_t) len;
 }
 
+/*
+ * A position column is READ-ONLY, and NULL is how a row says nothing about it.
+ *
+ * A position is where a member happens to sit, not a property of the member: a
+ * concurrent RPUSH or LREM moves every position after it, so a write naming
+ * one would be addressing a member by a name another session can change
+ * between the read and the write. Valkey offers no verb for it either - LSET
+ * takes an index but replaces rather than inserts, and LINSERT takes a pivot
+ * VALUE and not an index.
+ *
+ * Only a non-NULL value is refused, rather than the whole table, so INSERT and
+ * DELETE keep working: an insert appends, which is what RPUSH does and what
+ * leaving the position unstated means.
+ */
+static void
+vfdw_val_position_column(VfdwValCtx *vc, const VfdwColumn *col, bool isnull,
+						 VfdwValue *out)
+{
+	if (!isnull)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot write to position column \"%s\" of \"%s\"",
+						vfdw_val_colname(vc, col), vfdw_val_relname(vc)),
+				 errdetail("A member's position is where it sits in the list, "
+						   "which another session's push or removal changes."),
+				 errhint("Leave it NULL: an insert appends to the list.")));
+
+	out->isnull = true;
+	out->data = NULL;
+	out->len = 0;
+}
+
 void
 vfdw_val_from_slot(VfdwValCtx *vc, const VfdwTableMap *map,
 				   const VfdwColumn *col, Datum d, bool isnull, VfdwValue *out)
@@ -405,6 +437,10 @@ vfdw_val_from_slot(VfdwValCtx *vc, const VfdwTableMap *map,
 
 		case VFDW_COL_TTL:
 			vfdw_val_ttl_column(vc, col, d, isnull, out);
+			return;
+
+		case VFDW_COL_POSITION:
+			vfdw_val_position_column(vc, col, isnull, out);
 			return;
 
 		case VFDW_COL_DROPPED:

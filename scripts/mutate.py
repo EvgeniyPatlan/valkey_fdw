@@ -321,6 +321,26 @@ MUTATIONS = [
      "\tif (false)",
      "standalone", "ttl"),
 
+    # A list member's position is its index, and each key starts again at
+    # zero. Numbering from a counter that survives the key it belongs to gives
+    # the second list positions 3 and 4 - which still passes an ORDER BY pos
+    # assertion made about one key, so position asserts the minimum per key.
+    ("L1-pos", "src/vfdw_row.c",
+     "\t\t? Int64GetDatum((int64) ctx->cur_elem)\n"
+     "\t\t: Int32GetDatum(ctx->cur_elem);",
+     "\t\t? Int64GetDatum((int64) ctx->cur_elem + 1)\n"
+     "\t\t: Int32GetDatum(ctx->cur_elem + 1);",
+     "standalone", "position"),
+
+    # A position column contributes nothing to the wire, so nothing on the
+    # write path would read it unless something says to. Without that read the
+    # refusal is unreachable: a row naming a position is accepted, the position
+    # discarded, and the member appended somewhere else with nothing said.
+    ("L2-poswrite", "src/vfdw_render.c",
+     "\tvfdw_modify_check_position(st, slot);",
+     "\tif (false)\n\t\tvfdw_modify_check_position(st, slot);",
+     "standalone", "position"),
+
     # A packed zset takes members, not scores. Restoring WITHSCORES makes the
     # array's shape follow the negotiated protocol rather than the data: RESP2
     # returns member and score alternating, RESP3 a nested pair per member

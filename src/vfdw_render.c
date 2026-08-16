@@ -166,6 +166,31 @@ vfdw_modify_render_ttls(VfdwModifyState *st, TupleTableSlot *slot,
 	op->nttls = n;
 }
 
+/*
+ * Refuse a row that names a member's position; see the position arm of
+ * vfdw_val_from_slot for why one cannot be written.
+ */
+static void
+vfdw_modify_check_position(VfdwModifyState *st, TupleTableSlot *slot)
+{
+	const VfdwTableMap *map = st->map;
+	int			i;
+
+	for (i = 0; i < map->natts; i++)
+	{
+		const VfdwColumn *col = &map->cols[i];
+		Datum		d;
+		bool		isnull;
+		VfdwValue	v;
+
+		if (col->kind != VFDW_COL_POSITION)
+			continue;
+
+		d = slot_getattr(slot, col->attnum, &isnull);
+		vfdw_val_from_slot(&st->vc, map, col, d, isnull, &v);
+	}
+}
+
 void
 vfdw_modify_render_payload(VfdwModifyState *st, TupleTableSlot *slot,
 						   VfdwWriteOp *op)
@@ -182,6 +207,19 @@ vfdw_modify_render_payload(VfdwModifyState *st, TupleTableSlot *slot,
 		vfdw_modify_render_ttls(st, slot, op);
 		return;
 	}
+
+	/*
+	 * A position column contributes nothing to the wire and so would never be
+	 * looked at - which is exactly why it is looked at here.
+	 *
+	 * The member and the score are what a list or a zset write is made of, and
+	 * a column that is neither is simply not read. For a position column that
+	 * silence is wrong in the one direction that matters: a row naming a
+	 * position would be accepted, the position discarded, and the member
+	 * appended somewhere else entirely, with nothing said. Reading it now is
+	 * what turns that into the refusal vfdw_val_from_slot already carries.
+	 */
+	vfdw_modify_check_position(st, slot);
 
 	if (map->valueattno == InvalidAttrNumber)
 		return;

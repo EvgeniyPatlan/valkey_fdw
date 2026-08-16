@@ -8,7 +8,7 @@ GROUP BY context
 ORDER BY context;
    context    | options 
 --------------+---------
- column       |       7
+ column       |       8
  server       |      20
  table        |       8
  user_mapping |       3
@@ -27,6 +27,7 @@ ORDER BY context, name;
  column       | index_type          | enum    |               | f         | f
  column       | key                 | boolean | false         | f         | f
  column       | member              | boolean | false         | f         | f
+ column       | position            | boolean | false         | f         | f
  column       | score               | boolean | false         | f         | f
  column       | ttl                 | boolean | false         | f         | f
  server       | cluster             | boolean | false         | f         | f
@@ -60,7 +61,7 @@ ORDER BY context, name;
  user_mapping | password            | string  |               | t         | f
  user_mapping | password_required   | boolean | true          | f         | t
  user_mapping | username            | string  |               | f         | f
-(38 rows)
+(39 rows)
 
 -- Anything credential-bearing must be marked sensitive so it is redacted
 -- from error text and EXPLAIN.
@@ -147,8 +148,9 @@ WHERE m.name IS NULL OR o.name IS NULL
 ORDER BY 1, 2;
  context |       name        |             discrepancy             
 ---------+-------------------+-------------------------------------
+ column  | position          | the code has it, this file does not
  server  | write_retry_count | the code has it, this file does not
-(1 row)
+(2 rows)
 
 DO $$
 DECLARE
@@ -193,7 +195,7 @@ DROP TABLE option_manifest;
 SELECT count(*) AS options_total FROM valkey_fdw_options();
  options_total 
 ---------------
-            38
+            39
 (1 row)
 
 -- ---------------------------------------------------------------------------

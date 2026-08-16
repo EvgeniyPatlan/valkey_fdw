@@ -79,7 +79,7 @@ CREATE FOREIGN TABLE bad_column_opt (
     k text OPTIONS (keyname 'true')
 ) SERVER vk;
 ERROR:  invalid option "keyname"
-HINT:  Valid options in this context are: key, field, member, score, ttl, distance, index_type
+HINT:  Valid options in this context are: key, field, member, score, ttl, position, distance, index_type
 CREATE FOREIGN TABLE bad_index_type (
     k text OPTIONS (field 'f', index_type 'geo')
 ) SERVER vk;

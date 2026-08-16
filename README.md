@@ -36,6 +36,7 @@ including against a cluster. Vector search does not.
 | Area | State |
 |---|---|
 | Table types | `string`, `hash`, `list`, `set`, `zset` |
+| List order | a `position` column reports a member's index, so `ORDER BY` can restore the order the list is in |
 | Table shapes | one column per field or member, or `legacy_value 'true'` for the whole collection in one array column (read-only) |
 | Discovery | keyspace scan, `keyprefix`, `keyset` index, `singleton_key` |
 | Pushdown | `key = 'literal'` answered with a single fetch; `ANALYZE` estimates |
@@ -623,6 +624,7 @@ it on is not.
 | `field` | string | — | Hash field name | no |
 | `member` | boolean | `false` | Column holds the list/set/zset member | no |
 | `score` | boolean | `false` | Column holds the zset score | no |
+| `position` | boolean | `false` | Column holds the member's zero-based index in its list; read-only, needs `tabletype 'list'` and `integer` or `bigint` | no |
 | `ttl` | boolean | `false` | Column holds the paired field's time to live, as an `interval`; needs `tabletype 'hash'`, a `field`, and Valkey 9+ | no |
 | `distance` | boolean | `false` | Column receives the vector search score; accepted and refused at plan time | no |
 | `index_type` | enum | — | `tag`, `numeric` or `vector`; accepted and not consulted | no |

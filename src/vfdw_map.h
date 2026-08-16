@@ -52,6 +52,7 @@ typedef enum VfdwColKind
 	VFDW_COL_FIELD,				/* one hash field, named by the field option */
 	VFDW_COL_MEMBER,			/* a list, set or zset member */
 	VFDW_COL_SCORE,				/* a zset score */
+	VFDW_COL_POSITION,			/* a list member's index within its list */
 	VFDW_COL_TTL,				/* time to live of the paired field */
 	VFDW_COL_DISTANCE,			/* vector search score */
 	VFDW_COL_LEGACY_VALUE		/* the whole collection, packed into an array */

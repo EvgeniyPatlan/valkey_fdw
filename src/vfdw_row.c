@@ -19,10 +19,12 @@
  */
 #include "vfdw_row.h"
 
+#include "catalog/pg_type.h"
 #include "executor/executor.h"
 #include "mb/pg_wchar.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 
 #include "vfdw_cmd.h"
 #include "vfdw_ttl.h"
@@ -398,6 +400,29 @@ vfdw_row_store_score(VfdwRowCtx *ctx, TupleTableSlot *slot,
 		vfdw_scan_store(ctx, slot, col, sc->str, sc->len);
 }
 
+/*
+ * A list member's index within its list, ZERO-BASED.
+ *
+ * Zero because that is how every Valkey verb taking a list index counts:
+ * LINDEX, LSET and LRANGE all read 0 as the head. Numbering from 1 to match
+ * SQL array subscripts would make `WHERE pos = 1` mean the second member to
+ * the server and the first to the reader.
+ *
+ * cur_elem IS the index rather than a count kept beside it. A list has a
+ * stride of one, so the element being emitted and its position are the same
+ * number, and a second counter would be a second thing to keep in step.
+ */
+static void
+vfdw_row_store_position(VfdwRowCtx *ctx, TupleTableSlot *slot,
+						const VfdwColumn *col)
+{
+	slot->tts_values[col->attnum - 1] =
+		(getBaseType(col->typid) == INT8OID)
+		? Int64GetDatum((int64) ctx->cur_elem)
+		: Int32GetDatum(ctx->cur_elem);
+	slot->tts_isnull[col->attnum - 1] = false;
+}
+
 static void
 vfdw_row_fill_column(VfdwRowCtx *ctx, TupleTableSlot *slot,
 					 const VfdwColumn *col, const char *key, size_t keylen,
@@ -449,6 +474,10 @@ vfdw_row_fill_column(VfdwRowCtx *ctx, TupleTableSlot *slot,
 
 		case VFDW_COL_TTL:
 			vfdw_row_store_ttl(ctx, slot, col);
+			break;
+
+		case VFDW_COL_POSITION:
+			vfdw_row_store_position(ctx, slot, col);
 			break;
 
 		default:

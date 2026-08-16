@@ -26,6 +26,8 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
+#include "vfdw_map_check.h"
+
 static const char *const vfdw_tabletype_names[] = {
 	"string", "hash", "list", "set", "zset"
 };
@@ -98,11 +100,13 @@ vfdw_tabletype_supplies(VfdwTableType type)
  */
 static void
 vfdw_map_check_single_source(bool is_key, bool is_member, bool is_score,
-							 bool is_distance, bool is_ttl, const char *field)
+							 bool is_distance, bool is_ttl, bool is_position,
+							 const char *field)
 {
 	int			claims = (is_key ? 1 : 0) + (is_member ? 1 : 0) +
 		(is_score ? 1 : 0) + (is_distance ? 1 : 0) +
-		(is_ttl ? 1 : 0) + (field != NULL && !is_ttl ? 1 : 0);
+		(is_ttl ? 1 : 0) + (is_position ? 1 : 0) +
+		(field != NULL && !is_ttl ? 1 : 0);
 
 	if (claims > 1)
 		ereport(ERROR,
@@ -126,6 +130,7 @@ vfdw_map_read_column_options(VfdwColumn *col, List *options)
 	bool		is_member = false;
 	bool		is_score = false;
 	bool		is_ttl = false;
+	bool		is_position = false;
 	bool		is_distance = false;
 	const char *field = NULL;
 
@@ -150,6 +155,8 @@ vfdw_map_read_column_options(VfdwColumn *col, List *options)
 			is_score = vfdw_parse_bool(def, value);
 		else if (strcmp(def->name, "ttl") == 0)
 			is_ttl = vfdw_parse_bool(def, value);
+		else if (strcmp(def->name, "position") == 0)
+			is_position = vfdw_parse_bool(def, value);
 		else if (strcmp(def->name, "distance") == 0)
 			is_distance = vfdw_parse_bool(def, value);
 		/* index_type is consumed by the search planner, not here */
@@ -157,12 +164,14 @@ vfdw_map_read_column_options(VfdwColumn *col, List *options)
 
 	col->field = field;
 	vfdw_map_check_single_source(is_key, is_member, is_score, is_distance,
-								 is_ttl, field);
+								 is_ttl, is_position, field);
 
 	if (is_key)
 		col->kind = VFDW_COL_KEY;
 	else if (is_ttl)
 		col->kind = VFDW_COL_TTL;
+	else if (is_position)
+		col->kind = VFDW_COL_POSITION;
 	else if (is_member)
 		col->kind = VFDW_COL_MEMBER;
 	else if (is_score)
@@ -484,66 +493,7 @@ vfdw_map_assign_defaults(VfdwTableMap *map, TupleDesc tupdesc)
 		vfdw_map_report_unsourced(map, tupdesc, unclaimed);
 }
 
-/*
- * Reject column kinds that cannot mean anything for this table type.
- */
-static void
-vfdw_map_check_types(VfdwTableMap *map, TupleDesc tupdesc)
-{
-	int			i;
 
-	for (i = 0; i < map->natts; i++)
-	{
-		VfdwColumn *col = &map->cols[i];
-		const char *why = NULL;
-
-		switch (col->kind)
-		{
-			case VFDW_COL_FIELD:
-				if (map->tabletype != VFDW_TABLE_HASH)
-					why = "field columns require tabletype 'hash'";
-				map->nfields++;
-				break;
-			case VFDW_COL_SCORE:
-				if (map->tabletype != VFDW_TABLE_ZSET)
-					why = "score columns require tabletype 'zset'";
-				break;
-			case VFDW_COL_MEMBER:
-				if (map->tabletype != VFDW_TABLE_LIST &&
-					map->tabletype != VFDW_TABLE_SET &&
-					map->tabletype != VFDW_TABLE_ZSET)
-					why = "member columns require tabletype 'list', 'set' or 'zset'";
-				break;
-			case VFDW_COL_TTL:
-				if (map->tabletype != VFDW_TABLE_HASH)
-					why = "ttl columns require tabletype 'hash'";
-				else if (col->field == NULL)
-					why = "a ttl column must also name its field";
-				else if (getBaseType(col->typid) != INTERVALOID)
-					why = "ttl columns must be of type interval";
-				col->ttl_slot = map->nttl++;
-				break;
-			case VFDW_COL_DISTANCE:
-				if (map->search_index == NULL)
-					why = "distance columns require the search_index option";
-				break;
-			case VFDW_COL_VALUE:
-				if (map->tabletype != VFDW_TABLE_STRING)
-					why = "this table type has no single value column";
-				break;
-			default:
-				break;
-		}
-
-		if (why != NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
-					 errmsg("column \"%s\" cannot be used with tabletype \"%s\"",
-							NameStr(TupleDescAttr(tupdesc, i)->attname),
-							vfdw_tabletype_name(map->tabletype)),
-					 errdetail("%s.", why)));
-	}
-}
 
 /*
  * Resolve what a packed column's array is made of, or refuse the column.
@@ -614,44 +564,6 @@ vfdw_map_resolve_packed(VfdwTableMap *map, TupleDesc tupdesc)
 	col->packed = elem;
 }
 
-/*
- * Refuse what the option grammar accepts but the scan cannot yet read.
- *
- * These shapes are part of the design and their options validate, but nothing
- * fills their columns yet. Leaving them to return NULL would be a plausible
- * empty result - the failure mode this wrapper exists to avoid - so they are
- * refused at plan time until the phase that implements them lands. Checked
- * after validity, so a table that is both malformed and unimplemented is
- * reported as malformed, which is the more useful of the two.
- */
-static void
-vfdw_map_check_implemented(VfdwTableMap *map, TupleDesc tupdesc)
-{
-	int			i;
-
-	for (i = 0; i < map->natts; i++)
-	{
-		const char *what = NULL;
-
-		/*
-		 * ttl has left this list. It is read, by a second command per key, and
-		 * what it needs from the server is asked of the server rather than
-		 * decided here - see vfdw_ttl.h. A server without per-field expiry is
-		 * refused when the scan opens, which is the first moment there is a
-		 * server to ask.
-		 */
-		if (map->cols[i].kind == VFDW_COL_DISTANCE)
-			what = "distance";
-
-		if (what == NULL)
-			continue;
-
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("column \"%s\" reads %s, which is not implemented yet",
-						NameStr(TupleDescAttr(tupdesc, i)->attname), what)));
-	}
-}
 
 /*
  * Everything a column derives from its declared PostgreSQL type.
