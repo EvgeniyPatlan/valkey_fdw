@@ -392,6 +392,24 @@ MUTATIONS = [
      "\n    IF false THEN",
      "standalone", "probe"),
 
+    # A named key on a keyset table is settled by SISMEMBER, not by walking
+    # the set. Restoring the guard sends the point lookup back through SSCAN,
+    # which answers the same rows at a cost the table does not bound - so
+    # fetch asserts on which command was issued rather than on the result.
+    ("K1-keyset", "src/vfdw_plan.c",
+     "\tif (vfdw_plan_find_keys(baserel, map, clauses, &keys))",
+     "\tif (map->keyset == NULL &&\n"
+     "\t\tvfdw_plan_find_keys(baserel, map, clauses, &keys))",
+     "standalone", "fetch"),
+
+    # And the verdict has to be READ. A key that exists in the keyspace but is
+    # not in the set answers the value fetch perfectly well; ignoring the
+    # membership reply turns it into a row of a table it does not belong to.
+    ("K2-member", "src/vfdw_scan.c",
+     "\treturn state->cur_member == 0 ||",
+     "\treturn false ||",
+     "standalone", "fetch"),
+
     # A packed zset takes members, not scores. Restoring WITHSCORES makes the
     # array's shape follow the negotiated protocol rather than the data: RESP2
     # returns member and score alternating, RESP3 a nested pair per member

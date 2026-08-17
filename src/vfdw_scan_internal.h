@@ -78,6 +78,18 @@ typedef struct VfdwScanState
 	int64		cur_hlen;
 
 	/*
+	 * Whether the current key is in this table's keyset: 1 yes, 0 no, -1 not
+	 * asked.
+	 *
+	 * Asked only on the NAMED-KEY path. A keyspace scan over a keyset walks
+	 * the set itself with SSCAN, so every key it produces is a member by
+	 * construction and asking again would be a reply per key to learn what the
+	 * previous reply already said. A named key arrived from a qual instead,
+	 * and nothing so far has connected it to the set.
+	 */
+	int			cur_member;
+
+	/*
 	 * Keys named by the plan, for a strategy that does not discover any.
 	 * These live in scan_cxt, not page_cxt, so they survive the per-page
 	 * reset and a rescan can fetch them again.

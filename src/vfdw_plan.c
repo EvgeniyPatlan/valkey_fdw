@@ -569,13 +569,16 @@ vfdw_scan_plan(PlannerInfo *root, RelOptInfo *baserel, VfdwTableMap *map,
 
 	/*
 	 * Whether a named key belongs to a keyset table is a question only the
-	 * server can answer, so no key list is built for one. SSCAN over the
-	 * keyset is bounded by the keyset rather than the keyspace and the clause
-	 * still filters, so the answer stays correct at a cost proportional to
-	 * the set.
+	 * server can answer - which is true, and used to be the reason no key list
+	 * was built for one. The conclusion was the wrong one: the server answers
+	 * it with SISMEMBER, in constant time, and the scan asks that alongside the
+	 * value fetch it was already going to send.
+	 *
+	 * So a keyset table takes the key list like any other, and pays one small
+	 * extra reply per named key instead of walking a set whose size the table
+	 * does not bound.
 	 */
-	if (map->keyset == NULL &&
-		vfdw_plan_find_keys(baserel, map, clauses, &keys))
+	if (vfdw_plan_find_keys(baserel, map, clauses, &keys))
 		return list_make3(makeInteger(VFDW_SCAN_KEYS), keys, NULL);
 
 	return list_make3(makeInteger(VFDW_SCAN_KEYSPACE), NIL,

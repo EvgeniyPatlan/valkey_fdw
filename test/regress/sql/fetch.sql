@@ -91,8 +91,65 @@ SELECT count(*) AS rows_for_a_missing_key FROM fx WHERE k = 'fx:nope';
 -- And the count is the two keys that exist, not one and not three.
 SELECT count(*) AS rows FROM fx;
 
+-- ---------------------------------------------------------------------------
+-- A POINT LOOKUP ON A KEYSET TABLE.
+--
+-- `WHERE key = 'x'` used to walk the whole set. The reasoning was that only
+-- the server can say whether a named key belongs to the keyset, which is true
+-- - and the server says it with SISMEMBER, in constant time. So the key list
+-- is built like any other table's and one small reply per named key settles
+-- membership, instead of an SSCAN whose cost is the set's size.
+-- ---------------------------------------------------------------------------
+SELECT num AS members_added
+FROM valkey_fdw_test_probe('fx_srv', 0, 'SADD', 'fx:set', 'fx:m1', 'fx:m2');
+
+SELECT num AS member_seeded
+FROM valkey_fdw_test_probe('fx_srv', 0, 'HSET', 'fx:m1', 'title', 'InSet');
+
+-- A key that EXISTS in the keyspace and is NOT in the set. It is the case the
+-- whole check is for: the value fetch would answer perfectly well, and the row
+-- must still not appear.
+SELECT num AS stranger_seeded
+FROM valkey_fdw_test_probe('fx_srv', 0, 'HSET', 'fx:stranger', 'title', 'Outside');
+
+CREATE FOREIGN TABLE fx_ks (
+    k     text OPTIONS (key 'true'),
+    title text OPTIONS (field 'title')
+) SERVER fx_srv OPTIONS (tabletype 'hash', keyset 'fx:set');
+
+SELECT reply_type AS stats_reset
+FROM valkey_fdw_test_probe('fx_srv', 0, 'CONFIG', 'RESETSTAT');
+
+-- The named key is in the set, so it is a row.
+SELECT k, title FROM fx_ks WHERE k = 'fx:m1';
+
+-- Asked, and asked WITHOUT walking: sscan is the command whose cost is the
+-- set's size, and a point lookup must not issue one.
+SELECT fx_calls('sismember') > 0 AS asked_membership,
+       fx_calls('sscan')     = 0 AS did_not_walk_the_set;
+
+-- The stranger exists under its own name and is not in the set, so it is not
+-- a row - which is what the membership reply decides, since the value fetch
+-- behind it answers normally.
+SELECT count(*) AS rows_for_a_non_member FROM fx_ks WHERE k = 'fx:stranger';
+
+-- A key in the set that holds nothing is not a row either: membership says
+-- the key belongs to this table, not that it exists.
+SELECT count(*) AS rows_for_an_absent_member FROM fx_ks WHERE k = 'fx:m2';
+
+-- WITHOUT a key qual the set is still walked, because then there is nothing
+-- to check membership OF - SSCAN produces the members itself.
+SELECT reply_type AS stats_reset
+FROM valkey_fdw_test_probe('fx_srv', 0, 'CONFIG', 'RESETSTAT');
+
+SELECT count(*) AS rows_from_a_full_scan FROM fx_ks;
+
+SELECT fx_calls('sscan')     > 0 AS walked_the_set,
+       fx_calls('sismember') = 0 AS asked_no_membership;
+
 DROP FUNCTION fx_calls(text);
 SELECT num AS keys_removed
-FROM valkey_fdw_test_probe('fx_srv', 0, 'DEL', 'fx:1', 'fx:2');
+FROM valkey_fdw_test_probe('fx_srv', 0, 'DEL', 'fx:1', 'fx:2',
+                           'fx:set', 'fx:m1', 'fx:stranger');
 
 DROP SERVER fx_srv CASCADE;

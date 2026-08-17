@@ -410,6 +410,23 @@ vfdw_scan_reply_is_absent(const VfdwScanState *state, const valkeyReply *reply)
 }
 
 /*
+ * Does this key produce no row, without ending the scan (I5)?
+ *
+ * Three unrelated reasons with one consequence: the key is not in the table's
+ * keyset, the reply is one the scan skips, or the key is not there at all.
+ * Gathered because the caller does the same thing with each - advance, and go
+ * on - and separating them would only invite a fourth to be handled somewhere
+ * that forgets to advance.
+ */
+static bool
+vfdw_scan_produces_nothing(VfdwScanState *state, const valkeyReply *reply)
+{
+	return state->cur_member == 0 ||
+		vfdw_scan_reply_is_skippable(reply) ||
+		vfdw_scan_reply_is_absent(state, reply);
+}
+
+/*
  * Emit the next member of a collection reply, if any remain.
  */
 static bool
@@ -500,8 +517,7 @@ vfdw_scan_fetch(VfdwScanState *state, TupleTableSlot *slot)
 		}
 
 		vfdw_scan_note_redirect(state, reply, key, keylen);
-		if (vfdw_scan_reply_is_skippable(reply) ||
-			vfdw_scan_reply_is_absent(state, reply))
+		if (vfdw_scan_produces_nothing(state, reply))
 		{
 			state->skipped++;
 			continue;			/* advance, do not end the scan */
@@ -622,6 +638,7 @@ vfdw_scan_state_create(Relation rel, MemoryContext parent)
 	vfdw_row_ctx_init(&state->rowctx, state->map, scan_cxt);
 
 	state->cur_hlen = -1;
+	state->cur_member = -1;
 
 	state->batch_cxt = AllocSetContextCreate(scan_cxt, "valkey_fdw scan batch",
 											 ALLOCSET_SMALL_SIZES);
