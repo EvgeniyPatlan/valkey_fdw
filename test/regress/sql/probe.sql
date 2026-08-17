@@ -577,3 +577,34 @@ DROP SERVER p5_srv;
 -- hand-built reply is the only thing that executes it.
 -- ---------------------------------------------------------------------------
 SELECT valkey_fdw_test_probe_child_guard();
+
+-- ---------------------------------------------------------------------------
+-- The flush guard.
+--
+-- valkey_fdw_test_flush is what the fixtures empty a keyspace with, and its
+-- whole purpose is to refuse a server this harness did not create - because
+-- test/bench/*.sh and the TAP test take their host from $VALKEY_HOST, and a
+-- FLUSHDB aimed at a real cache is silent and total.
+--
+-- A guard nothing exercises is a guard that stops guarding, so the refusal is
+-- provoked here: the mark is removed, the flush is attempted and must fail,
+-- and the mark is put back. The permitting direction needs no case of its own
+-- - wfault, resp and vsearch flush through this function every run.
+--
+-- Nothing is actually flushed here. This suite's own fixtures are still in
+-- the keyspace, and a guard test that emptied them would be paid for by every
+-- assertion after it.
+-- ---------------------------------------------------------------------------
+CREATE SERVER pg_srv FOREIGN DATA WRAPPER valkey_fdw
+    OPTIONS (host 'valkey', port '6379');
+CREATE USER MAPPING FOR CURRENT_USER SERVER pg_srv;
+
+SELECT num AS mark_removed
+FROM valkey_fdw_test_probe('pg_srv', 15, 'DEL', 'valkey_fdw:disposable');
+
+SELECT valkey_fdw_test_flush('pg_srv');
+
+SELECT reply_type AS mark_restored
+FROM valkey_fdw_test_probe('pg_srv', 15, 'SET', 'valkey_fdw:disposable', 'yes');
+
+DROP SERVER pg_srv CASCADE;

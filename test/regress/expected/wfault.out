@@ -48,10 +48,10 @@ BEGIN
     SELECT num INTO n FROM valkey_fdw_test_probe('wf_direct', 0, 'EXISTS', key::bytea);
     RETURN n = 1;
 END $$;
-SELECT valkey_fdw_test_probe('wf_direct', 0, 'FLUSHDB') IS NOT NULL AS cleared;
+SELECT valkey_fdw_test_flush('wf_direct') AS cleared;
  cleared 
 ---------
- f
+ flushed
 (1 row)
 
 -- Each faulted COMMIT below is followed by \echo :SQLSTATE, because an
@@ -325,10 +325,10 @@ SELECT fault_arm('clear') AS final_clear;
  +OK
 (1 row)
 
-SELECT valkey_fdw_test_probe('wf_direct', 0, 'FLUSHDB') IS NOT NULL AS cleaned_up;
+SELECT valkey_fdw_test_flush('wf_direct') AS cleaned_up;
  cleaned_up 
 ------------
- f
+ flushed
 (1 row)
 
 DROP FOREIGN TABLE wf;

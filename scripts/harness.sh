@@ -460,6 +460,12 @@ cmd_up() {
     esac
 
     topology_stamp "$topo" > "$STATE_DIR/topology"
+
+    # Marked here as well as after a reset, because not everything that erases
+    # a keyspace runs a reset first - `bench` does not - and an unmarked server
+    # refuses the flush its fixtures expect.
+    mark_disposable
+
     say "topology '$topo' up on network $NET"
 }
 
@@ -589,6 +595,34 @@ cmd_build() {
 # fixture. Best-effort: a topology whose server is not reachable this way
 # still runs, it just does not get the guarantee.
 #
+# Mark this server as one this harness created and may erase.
+#
+# Through `docker exec` into a container started here by name, which is the
+# point: it is a claim about the SERVER rather than about a hostname, and a
+# hostname is what $VALKEY_HOST would redirect. valkey_fdw_test_flush refuses
+# to FLUSHDB anything without this mark, so a bench run pointed at a real cache
+# stops instead of emptying it.
+#
+# IN DATABASE 15, which the fixtures do not use. FLUSHDB empties one database,
+# so a mark kept beside the data would be erased by the first fixture that
+# flushed - including the ones that still flush through valkey-cli rather than
+# through the guard - and every guarded flush after it would refuse. Kept a
+# database away, the mark outlives the keyspace it vouches for.
+#
+# FLUSHALL would take it, and nothing but reset_valkey issues one; that path
+# marks again immediately afterwards.
+#
+# Best effort. A topology whose server will not take the mark still runs; what
+# it loses is the ability to flush from inside a fixture, which fails loudly
+# there rather than quietly here.
+mark_disposable() {
+    local -a cli=(valkey-cli)
+
+    # shellcheck disable=SC2206
+    cli+=($(valkey_cli_args))
+    docker exec "$VK" "${cli[@]}" -n 15 SET valkey_fdw:disposable yes >/dev/null 2>&1 || true
+}
+
 reset_valkey() {
     local out
     local -a cli=(valkey-cli)
@@ -597,6 +631,7 @@ reset_valkey() {
     cli+=($(valkey_cli_args))
 
     if out="$(docker exec "$VK" "${cli[@]}" FLUSHALL 2>&1)" && [[ "$out" == OK* ]]; then
+        mark_disposable
         return 0
     fi
     say "could not flush ${VK}; suites will see whatever it already holds"

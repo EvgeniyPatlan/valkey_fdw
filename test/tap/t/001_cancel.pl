@@ -265,7 +265,7 @@ my $cancel_other = q{
 }
 
 $node->safe_psql('postgres',
-    "SELECT valkey_fdw_test_probe('tap_srv', 0, 'FLUSHDB')");
+    "SELECT valkey_fdw_test_flush('tap_srv')");
 
 $node->stop;
 done_testing();

@@ -9,7 +9,7 @@ CREATE SERVER vs FOREIGN DATA WRAPPER valkey_fdw
     OPTIONS (host 'valkey', port '6379');
 CREATE USER MAPPING FOR CURRENT_USER SERVER vs;
 
-SELECT valkey_fdw_test_probe('vs', 0, 'FLUSHDB') IS NOT NULL AS cleared;
+SELECT valkey_fdw_test_flush('vs') AS cleared;
 
 -- Is the module even loaded, and under what name?
 SELECT convert_from(coalesce(key_part, val_part), 'UTF8') AS module_line
@@ -58,7 +58,7 @@ FROM valkey_fdw_test_probe('vs', 0, 'FT.SEARCH', 'idx',
 ORDER BY ordinal;
 
 SELECT valkey_fdw_test_probe('vs', 0, 'FT.DROPINDEX', 'idx') IS NOT NULL AS dropped;
-SELECT valkey_fdw_test_probe('vs', 0, 'FLUSHDB') IS NOT NULL AS cleaned_up;
+SELECT valkey_fdw_test_flush('vs') AS cleaned_up;
 
 DROP USER MAPPING FOR CURRENT_USER SERVER vs;
 DROP SERVER vs;

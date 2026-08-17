@@ -42,7 +42,7 @@ CREATE SERVER rp_direct FOREIGN DATA WRAPPER valkey_fdw
     OPTIONS (host 'valkey-upstream', port '6379');
 CREATE USER MAPPING FOR CURRENT_USER SERVER rp_direct;
 
-SELECT valkey_fdw_test_probe('rp_direct', 0, 'FLUSHDB') IS NOT NULL AS cleared_db;
+SELECT valkey_fdw_test_flush('rp_direct') AS cleared_db;
 
 -- A hash and a zset, because those are the two shapes whose RESP2 and RESP3
 -- encodings differ. A string table would decode identically either way and
@@ -180,7 +180,7 @@ SELECT valkey_fdw_test_poke('rp3', 'rp:poke', 'v');
 SELECT valkey_fdw_test_poke('rp3', 'rp:poke', 'v') AS poke_after_empty_error;
 
 SELECT resp_arm('clear') AS final_clear;
-SELECT valkey_fdw_test_probe('rp_direct', 0, 'FLUSHDB') IS NOT NULL AS cleaned_up;
+SELECT valkey_fdw_test_flush('rp_direct') AS cleaned_up;
 
 DROP FOREIGN TABLE rp2_h, rp2_z, rp3_h, rp3_z;
 DROP FUNCTION resp_fired(), resp_arm(text);

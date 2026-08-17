@@ -56,7 +56,7 @@ BEGIN
     RETURN n = 1;
 END $$;
 
-SELECT valkey_fdw_test_probe('wf_direct', 0, 'FLUSHDB') IS NOT NULL AS cleared;
+SELECT valkey_fdw_test_flush('wf_direct') AS cleared;
 
 -- Each faulted COMMIT below is followed by \echo :SQLSTATE, because an
 -- application switches on the code and 08007 is the whole point of outcome 3
@@ -226,7 +226,7 @@ SELECT NOT EXISTS (
 ) AS no_partial_application_reported;
 
 SELECT fault_arm('clear') AS final_clear;
-SELECT valkey_fdw_test_probe('wf_direct', 0, 'FLUSHDB') IS NOT NULL AS cleaned_up;
+SELECT valkey_fdw_test_flush('wf_direct') AS cleaned_up;
 
 DROP FOREIGN TABLE wf;
 DROP FUNCTION wf_exists(text), fault_arm(text);

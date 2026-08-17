@@ -55,7 +55,7 @@ printf '%8s  %12s  %12s  %s\n' "rows" "commit_ms" "us_per_row" "note"
 
 for n in $SIZES; do
     $PSQL -X -q -d "$DB" -c \
-        "SELECT valkey_fdw_test_probe('b', 0, 'FLUSHDB')" >/dev/null
+        "SELECT valkey_fdw_test_flush('b')" >/dev/null
 
     # A realistic mix rather than the cheapest possible row: two thirds
     # strings, one third three-field hashes. A benchmark of the cheapest
@@ -85,4 +85,4 @@ SQL
     printf '%8s  %12s  %12s  %s\n' "$n" "$ms" "$per" "$note"
 done
 
-$PSQL -X -q -d "$DB" -c "SELECT valkey_fdw_test_probe('b', 0, 'FLUSHDB')" >/dev/null
+$PSQL -X -q -d "$DB" -c "SELECT valkey_fdw_test_flush('b')" >/dev/null

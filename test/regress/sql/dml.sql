@@ -371,6 +371,34 @@ DELETE FROM d_hash WHERE k = 'dh:j1';
 DROP TABLE d_local;
 
 -- ---------------------------------------------------------------------------
+-- DELETE WITH NO WHERE, on a table that spans several keys.
+--
+-- Scan-everything-then-delete-everything was never run. Every DELETE asserted
+-- here names a key, so the path where the scan supplies the rows and each one
+-- becomes a delete - the ledger folding as many plans as the keyspace holds -
+-- had no test at all. It is also the statement a user is most likely to run by
+-- accident, which is the other reason to know what it does.
+-- ---------------------------------------------------------------------------
+INSERT INTO d_hash VALUES ('dh:w1', 'a1', 'b1'), ('dh:w2', 'a2', 'b2'),
+                          ('dh:w3', 'a3', 'b3');
+
+SELECT count(*) AS before_delete FROM d_hash;
+
+DELETE FROM d_hash;
+
+SELECT count(*) AS after_delete FROM d_hash;
+
+-- And the keys are gone from the server, not merely invisible to this table:
+-- a hash whose every field is removed is a key Valkey does not keep, so the
+-- two statements have to agree.
+SELECT count(*) AS keys_left
+FROM valkey_fdw_test_keys('dml_srv', 0, 'dh:');
+
+-- Repeating it on an empty table is not an error and writes nothing.
+DELETE FROM d_hash;
+SELECT count(*) AS still_empty FROM d_hash;
+
+-- ---------------------------------------------------------------------------
 -- An empty transaction costs nothing.
 -- ---------------------------------------------------------------------------
 SELECT calls AS calls_before, empty_returns AS empty_before

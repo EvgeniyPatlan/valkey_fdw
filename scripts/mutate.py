@@ -382,6 +382,16 @@ MUTATIONS = [
      "\t\te = vfdw_reply_child(reply, 0);",
      "standalone", "fetch"),
 
+    # The flush guard. valkey_fdw_test_flush exists to refuse a server this
+    # harness did not create, because test/bench/*.sh and the TAP test take
+    # their host from $VALKEY_HOST and a FLUSHDB aimed at a real cache is
+    # silent and total. Ungated it flushes anything it is pointed at, which
+    # probe provokes deliberately by removing the mark first.
+    ("S1-flushguard", "sql/valkey_fdw_test--0.1.sql",
+     "\n    IF NOT marked THEN",
+     "\n    IF false THEN",
+     "standalone", "probe"),
+
     # A packed zset takes members, not scores. Restoring WITHSCORES makes the
     # array's shape follow the negotiated protocol rather than the data: RESP2
     # returns member and score alternating, RESP3 a nested pair per member

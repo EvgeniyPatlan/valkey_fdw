@@ -47,7 +47,7 @@ CREATE FOREIGN TABLE os (k text OPTIONS (key 'true'), v text)
     SERVER o OPTIONS (tabletype 'string', keyprefix 'o:');
 SQL
 
-$PSQL -X -q -d "$DB" -c "SELECT valkey_fdw_test_probe('o', 0, 'FLUSHDB')" >/dev/null
+$PSQL -X -q -d "$DB" -c "SELECT valkey_fdw_test_flush('o')" >/dev/null
 
 # Seeded OUTSIDE the measured transaction and committed, so the scan below
 # reads them from Valkey rather than from the overlay. Only the hot key's
@@ -89,4 +89,4 @@ SQL
     printf '%8s  %12s  %14s  %s\n' "$n" "$ms" "$per" "$note"
 done
 
-$PSQL -X -q -d "$DB" -c "SELECT valkey_fdw_test_probe('o', 0, 'FLUSHDB')" >/dev/null
+$PSQL -X -q -d "$DB" -c "SELECT valkey_fdw_test_flush('o')" >/dev/null
