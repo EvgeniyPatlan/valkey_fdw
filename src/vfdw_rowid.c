@@ -54,19 +54,34 @@ vfdw_rowid_shape(const VfdwTableMap *map, CmdType operation, VfdwRowId *out)
 	out->want_member = false;
 	out->memberattno = map->memberattno;
 
-	switch (map->tabletype)
+	/*
+	 * A PACKED ROW IS THE KEY, whatever collection is inside it. Its array is
+	 * the key's whole contents rather than one member of them, so the key
+	 * identifies the row completely and there is no member to name - which is
+	 * also why a packed table can be written at all: the objection to writing
+	 * one was that an array of members says nothing about WHICH member a write
+	 * means, and a write that replaces all of them names none.
+	 */
+	if (map->legacy_value)
 	{
-		case VFDW_TABLE_STRING:
-		case VFDW_TABLE_HASH:
-			out->want_key = !singleton;
-			break;
+		out->want_key = !singleton;
+	}
+	else
+	{
+		switch (map->tabletype)
+		{
+			case VFDW_TABLE_STRING:
+			case VFDW_TABLE_HASH:
+				out->want_key = !singleton;
+				break;
 
-		case VFDW_TABLE_LIST:
-		case VFDW_TABLE_SET:
-		case VFDW_TABLE_ZSET:
-			out->want_key = !singleton;
-			out->want_member = true;
-			break;
+			case VFDW_TABLE_LIST:
+			case VFDW_TABLE_SET:
+			case VFDW_TABLE_ZSET:
+				out->want_key = !singleton;
+				out->want_member = true;
+				break;
+		}
 	}
 
 	if (out->want_key && out->keyattno == InvalidAttrNumber)

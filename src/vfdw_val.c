@@ -763,9 +763,26 @@ vfdw_val_ctx_init(VfdwValCtx *vc, Relation rel, const VfdwTableMap *map,
 
 	for (i = 0; i < map->natts; i++)
 	{
-		if (map->cols[i].attnum == InvalidAttrNumber)
+		const VfdwColumn *col = &map->cols[i];
+
+		if (col->attnum == InvalidAttrNumber)
 			continue;
-		fmgr_info_cxt(map->cols[i].typoutput, &vc->outfuncs[i], stmt_cxt);
+
+		/*
+		 * A PACKED COLUMN CACHES ITS ELEMENT'S OUTPUT FUNCTION, not its own.
+		 *
+		 * Its Datums arrive one element at a time - the array is taken apart
+		 * before anything is written - so the column's own function is
+		 * array_out, and calling that on an element reads the element's first
+		 * bytes as an array header. It does not fail cleanly: the type OID it
+		 * finds there is whatever the value began with, so a member '1' was
+		 * reported as a cache lookup failure for type 49.
+		 *
+		 * The exact mirror of vfdw_row_ctx_init, which caches the element's
+		 * INPUT function for the same reason in the other direction.
+		 */
+		fmgr_info_cxt(col->packed != NULL ? col->packed->col.typoutput
+					  : col->typoutput, &vc->outfuncs[i], stmt_cxt);
 	}
 }
 

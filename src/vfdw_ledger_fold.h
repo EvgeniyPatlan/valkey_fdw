@@ -23,4 +23,10 @@ extern void vfdw_ledger_fold_member(VfdwKeyPlan *plan, const VfdwWriteOp *op,
 									Relation rel);
 extern void vfdw_ledger_fold_list(VfdwKeyPlan *plan, const VfdwWriteOp *op);
 
+/*
+ * A packed row: empty the key, then rebuild it from the array. See the
+ * definition for why the DEL is unconditional.
+ */
+extern void vfdw_ledger_fold_packed(VfdwKeyPlan *plan, const VfdwWriteOp *op);
+
 #endif							/* VFDW_LEDGER_FOLD_H */

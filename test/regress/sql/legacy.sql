@@ -21,7 +21,7 @@ CREATE USER MAPPING FOR CURRENT_USER SERVER lg_srv;
 -- Deleted first so the seeds report what they created rather than what a
 -- previous run left behind.
 SELECT valkey_fdw_test_probe('lg_srv', 0, 'DEL', 'lg:h', 'lg:h2', 'lg:l',
-                             'lg:s', 'lg:z', 'lgb:l') IS NOT NULL AS cleaned;
+                             'lg:s', 'lg:z', 'lgb:l', 'lg:ks', 'lg:k1') IS NOT NULL AS cleaned;
 SELECT num AS seeded_hash
 FROM valkey_fdw_test_probe('lg_srv', 0, 'HSET', 'lg:h', 'a', '1', 'b', '2');
 -- A second hash with a DIFFERENT field set, which is the case no column
@@ -163,16 +163,80 @@ SELECT (SELECT count(*) FROM lg_hash WHERE key = 'lg:gone') AS packed_absent,
        (SELECT count(*) FROM lg_cols WHERE key = 'lg:h')    AS mapped_present;
 
 -- ---------------------------------------------------------------------------
--- Writes stay refused, in every direction, and the advertised mask agrees.
+-- A PACKED ROW IS WRITTEN WHOLE.
 --
--- The refusal is not "not implemented": an array of members carries no
--- identity for any member in it, so nothing in a packed row says which member
--- a write means. The mapped table beside it is writable, which is what shows
--- the refusal belongs to the shape rather than to the server.
+-- The objection to writing one was that an array of members says nothing about
+-- WHICH member a write means. That is true of a write that changes one member,
+-- and a packed row's write changes all of them: the array is what the key
+-- should hold afterwards. So it folds into an emptying and a rebuild, and the
+-- key's contents are exactly the array every time.
 -- ---------------------------------------------------------------------------
-INSERT INTO lg_hash VALUES ('lg:new', ARRAY['a', '1']);
-UPDATE lg_hash SET value = ARRAY['a', '9'];
-DELETE FROM lg_hash;
+INSERT INTO lg_hash VALUES ('lg:new', ARRAY['a', '1', 'b', '2']);
+SELECT key, value FROM lg_hash WHERE key = 'lg:new';
+
+-- REPLACEMENT, NOT A MERGE, which a shorter array is the only way to show: an
+-- update that added and overwrote would leave 'b' behind and read back longer
+-- than it was written.
+UPDATE lg_hash SET value = ARRAY['a', '9'] WHERE key = 'lg:new';
+SELECT key, value FROM lg_hash WHERE key = 'lg:new';
+
+-- Asserted against the server too, because a table agreeing with itself is
+-- what a wrong answer also does.
+SELECT num AS fields_on_the_server
+FROM valkey_fdw_test_probe('lg_srv', 0, 'HLEN', 'lg:new');
+
+-- An empty array means the key holds nothing, and Valkey does not keep an
+-- empty collection - so it is gone, which is the same equivalence the mapped
+-- shapes have when their last field is nulled.
+UPDATE lg_hash SET value = ARRAY[]::text[] WHERE key = 'lg:new';
+SELECT count(*) AS rows_after_emptying FROM lg_hash WHERE key = 'lg:new';
+
+-- A list keeps the array's ORDER, which is the property that distinguishes it
+-- and the reason the rebuild empties first rather than appending.
+INSERT INTO lg_list VALUES ('lg:l2', ARRAY['z', 'y', 'x']);
+SELECT key, value FROM lg_list WHERE key = 'lg:l2';
+
+UPDATE lg_list SET value = ARRAY['q', 'r'] WHERE key = 'lg:l2';
+SELECT key, value FROM lg_list WHERE key = 'lg:l2';
+
+DELETE FROM lg_list WHERE key = 'lg:l2';
+SELECT count(*) AS rows_after_delete FROM lg_list WHERE key = 'lg:l2';
+
+-- A PACKED TABLE OVER A KEYSET, where a delete has to do more than remove the
+-- key: the keyset is the table's index of its own keys, so a key left in it
+-- after its contents are gone is a row the next scan reports and then cannot
+-- fetch.
+SELECT num AS keyset_seeded
+FROM valkey_fdw_test_probe('lg_srv', 0, 'SADD', 'lg:ks', 'lg:k1');
+SELECT num AS keyset_member_seeded
+FROM valkey_fdw_test_probe('lg_srv', 0, 'RPUSH', 'lg:k1', 'one', 'two');
+
+CREATE FOREIGN TABLE lg_keyset (key text, value text[]) SERVER lg_srv
+    OPTIONS (tabletype 'list', keyset 'lg:ks', legacy_value 'true');
+
+SELECT key, value FROM lg_keyset ORDER BY key;
+
+DELETE FROM lg_keyset WHERE key = 'lg:k1';
+
+-- Gone from the table, and gone from the SET that lists the table's keys.
+-- The second is what a delete folded as a member removal would leave behind.
+SELECT count(*) AS rows_left FROM lg_keyset;
+SELECT num AS keyset_size
+FROM valkey_fdw_test_probe('lg_srv', 0, 'SCARD', 'lg:ks');
+
+-- A NULL element is refused rather than skipped or written as empty. Skipping
+-- would shorten the collection silently, and no byte string means "absent" to
+-- a server that has a member or has not.
+INSERT INTO lg_hash VALUES ('lg:bad', ARRAY['a', NULL]);
+
+-- A hash's array alternates field and value, so an odd count names a field
+-- with no value. Refused at the statement, where the message can still say
+-- which row.
+INSERT INTO lg_hash VALUES ('lg:bad', ARRAY['a', '1', 'c']);
+
+-- THE PACKED ZSET IS STILL REFUSED, and now for a reason of its own: its read
+-- drops the scores deliberately, so an array written back cannot say what any
+-- score should become.
 INSERT INTO lg_zset VALUES ('lg:z2', ARRAY['member']);
 
 SELECT c.relname, pg_relation_is_updatable(c.oid, false) AS mask

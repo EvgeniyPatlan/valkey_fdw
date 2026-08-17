@@ -408,6 +408,15 @@ vfdw_modify_op_begin(VfdwModifyState *st, VfdwOpKind kind)
 	op->kind = kind;
 	op->relid = RelationGetRelid(st->rel);
 	op->tabletype = st->map->tabletype;
+
+	/*
+	 * A PROPERTY OF THE TABLE, stamped here rather than where the payload is
+	 * rendered. A DELETE renders no payload at all - there is no new tuple -
+	 * so a flag set during rendering would be false for exactly the operation
+	 * that most needs it: on a packed table a DELETE removes the KEY, where on
+	 * a mapped list or set it removes a member.
+	 */
+	op->packed_shape = st->map->legacy_value;
 	if (st->target_attrs == NULL)
 		st->target_attrs = vfdw_modify_attr_bitmap(st->target_attnos);
 	op->target_attrs = st->target_attrs;
@@ -583,11 +592,17 @@ vfdw_modify_update(EState *estate, ResultRelInfo *rinfo, TupleTableSlot *slot,
 		vfdw_refuse_no_modify_state();
 
 	/*
-	 * Unreachable: vfdw_map_writability gives a list table an INSERT|DELETE
-	 * mask, so an UPDATE is refused at plan time and again at Begin. Loud
-	 * rather than a silent wrong write if that ever stops being true.
+	 * Unreachable for a MAPPED list: vfdw_map_writability gives one an
+	 * INSERT|DELETE mask, so an UPDATE is refused at plan time and again at
+	 * Begin. Loud rather than a silent wrong write if that ever stops being
+	 * true.
+	 *
+	 * A packed list is a different table. Its row is the key and its array is
+	 * the whole list, so an UPDATE names something neighbours cannot move -
+	 * which is exactly the identity a mapped list row lacks - and the write
+	 * replaces the list rather than editing a member of it.
 	 */
-	if (st->map->tabletype == VFDW_TABLE_LIST)
+	if (st->map->tabletype == VFDW_TABLE_LIST && !st->map->legacy_value)
 		elog(ERROR, "valkey_fdw: UPDATE reached the list write path");
 
 	op = vfdw_modify_op_begin(st, VFDW_OP_UPDATE);

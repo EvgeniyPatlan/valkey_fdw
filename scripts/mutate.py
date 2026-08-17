@@ -427,6 +427,31 @@ MUTATIONS = [
      "\t\tif (false)\n\t\t\treturn 1.0;",
      "standalone", "fetch"),
 
+    # A packed write says what the key holds AFTERWARDS, so the rebuild
+    # empties first. Without the DEL it becomes a merge: a shorter array
+    # leaves the members it did not mention in place, and the row reads back
+    # longer than it was written. legacy updates four elements down to two.
+    ("W1-packedrepl", "src/vfdw_ledger_fold.c",
+     "\tvfdw_ledger_act0(plan, VFDW_ACT_DEL);",
+     "\tif (false)\n\t\tvfdw_ledger_act0(plan, VFDW_ACT_DEL);",
+     "standalone", "legacy"),
+
+    # A packed row IS the key, so deleting one removes the key. Treating a
+    # packed list like a mapped one sends the DELETE down the member path,
+    # where it removes nothing and reports success.
+    ("W2-packeddel", "src/vfdw_ledger.c",
+     "\t\t!op->packed_shape)",
+     "\t\ttrue)",
+     "standalone", "legacy"),
+
+    # A packed hash is field and value alternating, taken two at a time.
+    # Advancing by one writes each value as the next field's name, which keeps
+    # the element count and changes what every pair means.
+    ("W3-packedpair", "src/vfdw_ledger_fold.c",
+     "\tif ((i % 2) != 0 || i + 1 >= op->npacked)",
+     "\tif (i + 1 >= op->npacked)",
+     "standalone", "legacy"),
+
     # A packed zset takes members, not scores. Restoring WITHSCORES makes the
     # array's shape follow the negotiated protocol rather than the data: RESP2
     # returns member and score alternating, RESP3 a nested pair per member

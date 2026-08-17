@@ -200,11 +200,17 @@ SELECT k, v FROM w_legacy ORDER BY k;
 -- suite, which runs only where each of them means something.
 SELECT * FROM w_distance;
 
--- The write direction reaches the same refusal, from PlanForeignModify, which
--- builds the map before it asks whether the table is writable. That order is
--- what keeps an unimplemented shape from being turned away with a message
--- about writes: compare this with the INSERT into w_search above.
-INSERT INTO w_legacy VALUES ('k', ARRAY['v']);
+-- w_legacy is no longer one of these either. A packed row is the key and its
+-- array is the key's whole contents, so a write names the key and says what it
+-- should hold - and the shape that reads is now the shape that writes. What it
+-- does with that array, and the one packed collection still refused, are in the
+-- legacy suite.
+--
+-- The ordering this block was making a point about still holds and is still
+-- asserted: PlanForeignModify builds the map before asking whether the table
+-- is writable, which is what keeps an unimplemented SHAPE from being turned
+-- away with a message about writes. The INSERT into w_search above is the case
+-- that shows it.
 
 -- search_index and index_type stop one step short of the other three: they
 -- raise nothing, and nothing consults them. So the boundary to hold still is

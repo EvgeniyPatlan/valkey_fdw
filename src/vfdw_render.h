@@ -29,6 +29,10 @@ extern void vfdw_modify_render_fields(VfdwModifyState *st,
 /* The expiries a row sets; see the definition for why they are not fields. */
 extern void vfdw_modify_render_ttls(VfdwModifyState *st, TupleTableSlot *slot,
 									VfdwWriteOp *op);
+
+/* A packed row's whole contents; see the definition for the NULL rules. */
+extern void vfdw_modify_render_packed(VfdwModifyState *st,
+									  TupleTableSlot *slot, VfdwWriteOp *op);
 extern void vfdw_modify_render_payload(VfdwModifyState *st,
 									   TupleTableSlot *slot, VfdwWriteOp *op);
 

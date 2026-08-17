@@ -37,7 +37,7 @@ including against a cluster. Vector search does not.
 |---|---|
 | Table types | `string`, `hash`, `list`, `set`, `zset` |
 | List order | a `position` column reports a member's index, so `ORDER BY` can restore the order the list is in |
-| Table shapes | one column per field or member, or `legacy_value 'true'` for the whole collection in one array column (read-only) |
+| Table shapes | one column per field or member, or `legacy_value 'true'` for the whole collection in one array column, written whole |
 | Discovery | keyspace scan, `keyprefix`, `keyset` index, `singleton_key` |
 | Pushdown | `key = 'literal'` answered with a single fetch, including on a `keyset` table |
 | Estimates | `singleton_key` and `keyset` tables are counted at plan time; every other shape needs `ANALYZE`, which is never automatic for a foreign table |
@@ -393,10 +393,24 @@ is a fact about the server rather than about the wrapper. It is reported when
 the statement opens — the first moment there is a server to ask, and before a
 transaction has been told anything was written.
 
-A `legacy_value 'true'` table is in the table above rather than in this
-paragraph: it reads, and only the write is refused. The reason is its own — an
-array of members carries no identity for any member in it, so nothing in such a
-row says which member a write means.
+A `legacy_value 'true'` table is written **whole**. Its row is the key and its
+array is the key's entire contents, so `UPDATE t SET value = ARRAY[…]` says
+what the key should hold afterwards: the write empties the key and rebuilds it
+from the array. A shorter array is therefore a replacement and not a merge, an
+empty array leaves the key gone — Valkey keeps no empty collection — and a
+list's array order becomes the list's order.
+
+That is why the shape can be written at all. The objection was that an array of
+members carries no identity for any member in it, which is true of a write that
+changes one member; a write that replaces all of them names none. It is also
+why a packed list accepts `UPDATE` where a mapped list does not: a mapped list
+row is a member, and members move, while a packed row is the key.
+
+**A packed zset is still refused every write.** Its read drops the scores
+deliberately — `WITHSCORES` is answered differently by the two protocol
+versions, so packing them would make the array's shape depend on the transport
+— and an array of bare members cannot say what any score should become. Map the
+members and scores to columns to write them.
 
 ## Requirements
 

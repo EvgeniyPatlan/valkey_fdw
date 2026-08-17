@@ -26,6 +26,8 @@
 #include "utils/rel.h"
 
 #include "vfdw_render.h"
+
+#include "utils/array.h"
 #include "vfdw_val.h"
 #include "vfdw_wbuf.h"
 
@@ -191,6 +193,143 @@ vfdw_modify_check_position(VfdwModifyState *st, TupleTableSlot *slot)
 	}
 }
 
+/*
+ * Every element of a packed row's array, as the bytes the key should hold.
+ *
+ * ELEMENT BY ELEMENT THROUGH vfdw_val_render, which is the same route each
+ * scalar column's value takes - so an element is checked against the server
+ * encoding when its type is text and kept verbatim when it is bytea (I3),
+ * exactly as the read direction does in reverse.
+ *
+ * A NULL ELEMENT IS REFUSED rather than skipped or written as empty. Skipping
+ * it would silently shorten the collection, and there is no byte string that
+ * means "absent" to Valkey - a member is present or it is not. The read
+ * direction produces a NULL element only for a reply element that carried no
+ * bytes, which a server does not send for a member.
+ *
+ * A NULL ARRAY is a different statement and is left to the fold: it means the
+ * key should hold nothing, which is a deletion.
+ */
+/* The one packed column of a packed table, or NULL. */
+static const VfdwColumn *
+vfdw_modify_packed_column(const VfdwTableMap *map)
+{
+	int			i;
+
+	for (i = 0; i < map->natts; i++)
+	{
+		if (map->cols[i].kind == VFDW_COL_LEGACY_VALUE)
+			return &map->cols[i];
+	}
+	return NULL;
+}
+
+/*
+ * One element of a packed array, as the bytes it should become.
+ *
+ * Through vfdw_val_render, the route every scalar column's value takes, so an
+ * element of a text array is checked against the server encoding and one of a
+ * bytea array is kept verbatim (I3) - the exact inverse of how the read
+ * direction built it.
+ *
+ * A NULL ELEMENT IS REFUSED rather than skipped or written empty. Skipping
+ * would silently shorten the collection, and no byte string means "absent" to
+ * Valkey: a member is there or it is not.
+ */
+static void
+vfdw_modify_pack_element(VfdwModifyState *st, const VfdwColumn *col,
+						 Datum elem, bool isnull, VfdwWriteArg *out, int i)
+{
+	VfdwValue	v;
+
+	if (isnull)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("a packed value may not contain NULL elements"),
+				 errdetail("Element %d of the array is NULL.", i + 1),
+				 errhint("Valkey has no absent member: remove the element "
+						 "instead of nulling it.")));
+
+	vfdw_val_render(&st->vc, &col->packed->col, elem, false, &v);
+	out->data = v.data;
+	out->len = v.len;
+}
+
+/*
+ * A packed hash's array is field and value alternating - what the read
+ * direction produces and what hstore(value) reconstructs - so an odd number of
+ * elements names a field with no value.
+ *
+ * Refused at the STATEMENT rather than in the fold, which runs at pre-commit
+ * where the message could no longer point at the row that caused it.
+ */
+static void
+vfdw_modify_check_pairs(const VfdwTableMap *map, int n)
+{
+	if (map->tabletype != VFDW_TABLE_HASH || (n % 2) == 0)
+		return;
+
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("a packed hash needs an even number of elements"),
+			 errdetail("The array has %d, so its last field has no value.", n),
+			 errhint("The array alternates field and value, which is the shape "
+					 "a read of this table returns.")));
+}
+
+void
+vfdw_modify_render_packed(VfdwModifyState *st, TupleTableSlot *slot,
+						  VfdwWriteOp *op)
+{
+	const VfdwTableMap *map = st->map;
+	const VfdwColumn *col;
+	VfdwWriteArg *args;
+	Datum		d;
+	bool		isnull;
+	ArrayType  *arr;
+	Datum	   *elems;
+	bool	   *nulls;
+	int			n;
+	int			i;
+
+	col = vfdw_modify_packed_column(map);
+	if (col == NULL)
+		return;
+
+	d = slot_getattr(slot, col->attnum, &isnull);
+	if (isnull)
+	{
+		op->packed = NULL;
+		op->npacked = 0;
+		op->has_value = true;	/* the column was assigned; it said "nothing" */
+		return;
+	}
+
+	arr = DatumGetArrayTypeP(d);
+	if (ARR_NDIM(arr) > 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("a packed value must be a one-dimensional array"),
+				 errdetail("This one has %d dimensions.", ARR_NDIM(arr))));
+
+	deconstruct_array(arr, col->packed->col.typid, col->packed->typlen,
+					  col->packed->typbyval, col->packed->typalign,
+					  &elems, &nulls, &n);
+
+	args = (VfdwWriteArg *) MemoryContextAllocZero(vfdw_wbuf_context(),
+												   sizeof(VfdwWriteArg) *
+												   Max(n, 1));
+
+	for (i = 0; i < n; i++)
+		vfdw_modify_pack_element(st, col, elems[i], nulls[i], &args[i], i);
+
+	vfdw_modify_check_pairs(map, n);
+
+	op->packed = args;
+	op->npacked = n;
+	op->has_value = true;
+}
+
 void
 vfdw_modify_render_payload(VfdwModifyState *st, TupleTableSlot *slot,
 						   VfdwWriteOp *op)
@@ -200,6 +339,17 @@ vfdw_modify_render_payload(VfdwModifyState *st, TupleTableSlot *slot,
 	Datum		d;
 	bool		isnull;
 	VfdwValue	v;
+
+	/*
+	 * A packed row is the key's whole contents, whatever collection type it
+	 * is, so it is rendered before the per-type paths rather than inside one
+	 * of them.
+	 */
+	if (map->legacy_value)
+	{
+		vfdw_modify_render_packed(st, slot, op);
+		return;
+	}
 
 	if (map->tabletype == VFDW_TABLE_HASH)
 	{

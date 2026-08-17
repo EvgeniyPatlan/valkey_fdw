@@ -284,4 +284,78 @@ vfdw_ledger_fold_list(VfdwKeyPlan *plan, const VfdwWriteOp *op)
 	m->count++;
 }
 
+/*
+ * One field/value pair of a packed hash, taken two elements at a time.
+ *
+ * The array alternates field and value - what the read direction produces and
+ * what hstore(value) reconstructs - so a walk that advanced by one and read
+ * i + 1 would write each value as the next field's name. The odd-length array
+ * was refused at the statement, so the bound here is belt and braces rather
+ * than the rule.
+ */
+static void
+vfdw_ledger_pack_pair(VfdwKeyPlan *plan, const VfdwWriteOp *op, int i)
+{
+	VfdwLedgerStep *step;
 
+	if ((i % 2) != 0 || i + 1 >= op->npacked)
+		return;
+
+	step = vfdw_ledger_step(VFDW_ACT_HSET, 2);
+	vfdw_ledger_set_arg(step, 0, op->packed[i].data, op->packed[i].len);
+	vfdw_ledger_set_arg(step, 1, op->packed[i + 1].data, op->packed[i + 1].len);
+	vfdw_ledger_add_action(plan, step);
+}
+
+void
+vfdw_ledger_fold_packed(VfdwKeyPlan *plan, const VfdwWriteOp *op)
+{
+	int			i;
+
+	/*
+	 * DELETE FIRST, ALWAYS. A packed write says what the key should hold
+	 * AFTERWARDS, not what to add to it: without the DEL, writing a
+	 * three-member array over a five-member list would leave the last two in
+	 * place and the row would read back longer than it was written. Emptying
+	 * first is also what makes the array's ORDER the key's order for a list,
+	 * rather than an append to whatever was there.
+	 *
+	 * An empty or NULL array therefore leaves just the DEL, which is the right
+	 * answer: Valkey does not keep an empty collection, so a key holding
+	 * nothing and a key that is gone are the same state - the same equivalence
+	 * the README states for emptying a row through the mapped shapes.
+	 */
+	vfdw_ledger_act0(plan, VFDW_ACT_DEL);
+
+	for (i = 0; i < op->npacked; i++)
+	{
+		const VfdwWriteArg *e = &op->packed[i];
+
+		switch (op->tabletype)
+		{
+			case VFDW_TABLE_LIST:
+				vfdw_ledger_act1(plan, VFDW_ACT_RPUSH, e->data, e->len);
+				break;
+
+			case VFDW_TABLE_SET:
+				vfdw_ledger_act1(plan, VFDW_ACT_SADD, e->data, e->len);
+				break;
+
+			case VFDW_TABLE_HASH:
+				vfdw_ledger_pack_pair(plan, op, i);
+				break;
+
+			case VFDW_TABLE_ZSET:
+			case VFDW_TABLE_STRING:
+
+				/*
+				 * Unreachable. A packed zset is refused every write because
+				 * its read drops the scores, and legacy_value with tabletype
+				 * 'string' is refused at CREATE.
+				 */
+				elog(ERROR, "valkey_fdw: packed write for table type %d",
+					 (int) op->tabletype);
+				break;
+		}
+	}
+}

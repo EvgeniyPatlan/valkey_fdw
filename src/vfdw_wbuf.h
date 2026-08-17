@@ -159,6 +159,26 @@ typedef struct VfdwWriteOp
 	VfdwWriteArg *ttls;
 	int			nttls;
 
+	/*
+	 * A packed row's whole contents: every element of the array column, in the
+	 * array's own order, with only `data` and `len` meaningful.
+	 *
+	 * Separate from fields[] and from member/value because it is a different
+	 * KIND of write. Those name one thing inside a key; this names everything
+	 * the key should hold afterwards, which is why it folds into a DEL and a
+	 * rebuild rather than into an edit.
+	 */
+	VfdwWriteArg *packed;
+	int			npacked;
+
+	/*
+	 * Whether this operation is a packed one at all, which packed/npacked
+	 * cannot say: a packed row whose array is NULL or empty has no elements
+	 * and still means "the key should hold nothing", where a non-packed op
+	 * with no elements means nothing of the sort.
+	 */
+	bool		packed_shape;
+
 	/* The overlay's payload (S7); see the HeapTuple note in the file prose. */
 	HeapTuple	newtup;
 

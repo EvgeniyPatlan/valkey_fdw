@@ -462,8 +462,15 @@ vfdw_ledger_fold_key_delete(VfdwKeyPlan *plan, const VfdwWriteOp *op)
 {
 	if (op->kind != VFDW_OP_DELETE)
 		return false;
+	/*
+	 * A packed table joins the two whose DELETE removes the KEY. Elsewhere a
+	 * list, set or zset row is one member, so deleting it is an LREM, SREM or
+	 * ZREM and the key survives its other members - but a packed row IS the
+	 * key, and there is nothing smaller of it to remove.
+	 */
 	if (op->tabletype != VFDW_TABLE_STRING &&
-		op->tabletype != VFDW_TABLE_HASH)
+		op->tabletype != VFDW_TABLE_HASH &&
+		!op->packed_shape)
 		return false;
 
 	vfdw_ledger_act0(plan, VFDW_ACT_DEL);
@@ -490,6 +497,20 @@ vfdw_ledger_note(const VfdwWriteOp *op, Relation rel)
 
 	if (vfdw_ledger_fold_key_delete(plan, op))
 		return;
+
+	/*
+	 * A packed op replaces the key's whole contents, so it does not go through
+	 * the per-type folds at all - those edit one thing inside a key.
+	 */
+	if (op->packed_shape)
+	{
+		vfdw_ledger_fold_packed(plan, op);
+		if (op->kind == VFDW_OP_INSERT)
+			vfdw_ledger_keyset(plan, op, op->key, op->keylen, true);
+		if (plan->state == VFDW_KEY_DELETED)
+			plan->state = VFDW_KEY_LIVE;
+		return;
+	}
 
 	switch (op->tabletype)
 	{

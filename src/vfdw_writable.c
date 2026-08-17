@@ -145,20 +145,26 @@ vfdw_map_write_block(Oid relid, const VfdwWritability *w, const char **hint)
 		*hint = "Remove OPTIONS (readonly 'true') to allow writes.";
 		return "The table is declared read-only.";
 	}
-	if (w->legacy)
+	if (w->legacy && strcmp(w->tabletype, "zset") == 0)
 	{
 		/*
-		 * Read-only, and not merely unimplemented: an array of members carries
-		 * no identity for any member in it, so nothing in a packed row says
-		 * WHICH member an UPDATE changed or whether a shorter array means
-		 * "remove the rest" or "leave them alone". The mapped shapes answer
-		 * that by naming a member or a field per column, which is where a
-		 * write belongs.
+		 * A PACKED ZSET IS THE ONE THAT CANNOT ROUND TRIP. Its read drops the
+		 * scores deliberately - WITHSCORES answers differently under the two
+		 * protocols, so packing them would make the array's shape depend on
+		 * the transport - and a write that has only members cannot say what
+		 * any of their scores should become. Every other packed collection
+		 * carries everything the key holds, so writing the array back says
+		 * exactly what the key should hold.
+		 *
+		 * The objection that used to cover all four was that an array of
+		 * members says nothing about WHICH member a write means. That is true
+		 * of a write that changes one member, and a write that replaces all of
+		 * them names none - which is what a packed row's write is.
 		 */
-		*hint = "Map the members to columns of their own to write them.";
-		return "A legacy_value table reads the whole collection into one "
-			"array, and an array of members says nothing about which member a "
-			"write means.";
+		*hint = "Map the members and scores to columns of their own to write "
+			"them.";
+		return "A packed zset reads its members without their scores, so an "
+			"array written back could not say what the scores should be.";
 	}
 	if (w->search_index)
 	{
@@ -196,7 +202,7 @@ vfdw_map_writability(Oid relid, const char **detail, const char **hint)
 	why = vfdw_map_write_block(relid, &w, &tip);
 	if (why != NULL)
 		mask = 0;
-	else if (strcmp(w.tabletype, "list") == 0)
+	else if (strcmp(w.tabletype, "list") == 0 && !w.legacy)
 	{
 		/*
 		 * A list row has no identity that survives its neighbours moving:
@@ -204,6 +210,12 @@ vfdw_map_writability(Oid relid, const char **detail, const char **hint)
 		 * so there is nothing an UPDATE could name. Rows can be added and
 		 * removed by value, so this is a partial mask with a reason rather
 		 * than a refusal.
+		 *
+		 * NOT a packed list, which is why this asks. There a row is the KEY
+		 * and its array is the whole list, so an UPDATE names the key - which
+		 * neighbours cannot move - and says what the list should be
+		 * afterwards. The identity that a mapped list row lacks is one a
+		 * packed row never needed.
 		 */
 		why = "A list row has no identity that survives its neighbours "
 			"moving: members are removed by value, and a concurrent push "
