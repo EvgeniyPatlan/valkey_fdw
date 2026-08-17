@@ -45,6 +45,7 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 
+#include "vfdw_estimate.h"
 #include "vfdw_map.h"
 #include "vfdw_modify.h"
 #include "vfdw_rowid.h"
@@ -443,7 +444,17 @@ vfdwGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid
 	 * one row for a clause that matches thousands.
 	 */
 	if (baserel->tuples < 0)
-		baserel->tuples = VFDW_DEFAULT_TUPLES;
+	{
+		/*
+		 * Asked of the server, for the two shapes it can answer in one
+		 * command. Everything else keeps the placeholder, which is why this
+		 * does not turn planning into a round trip for every table.
+		 */
+		double		rows = vfdw_estimate_rows(foreigntableid,
+											  (VfdwTableMap *) baserel->fdw_private);
+
+		baserel->tuples = rows >= 0 ? rows : VFDW_DEFAULT_TUPLES;
+	}
 
 	set_baserel_size_estimates(root, baserel);
 }

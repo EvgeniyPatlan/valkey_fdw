@@ -39,7 +39,8 @@ including against a cluster. Vector search does not.
 | List order | a `position` column reports a member's index, so `ORDER BY` can restore the order the list is in |
 | Table shapes | one column per field or member, or `legacy_value 'true'` for the whole collection in one array column (read-only) |
 | Discovery | keyspace scan, `keyprefix`, `keyset` index, `singleton_key` |
-| Pushdown | `key = 'literal'` answered with a single fetch; `ANALYZE` estimates |
+| Pushdown | `key = 'literal'` answered with a single fetch, including on a `keyset` table |
+| Estimates | `singleton_key` and `keyset` tables are counted at plan time; every other shape needs `ANALYZE`, which is never automatic for a foreign table |
 | Writes | `INSERT`, `UPDATE`, `DELETE`, `COPY FROM` — one atomic unit per transaction |
 | Transport | TLS with hostname verification, ACL auth, RESP3 with a tested RESP2 fallback |
 | Cluster | slot discovery, per-node pooling, fan-out scans, `MOVED`/`ASK`, single-slot writes |
@@ -94,6 +95,21 @@ this is not a latency difference — it is that `HGETALL`'s cost grows with the
 `HMGET`'s grows with the *table's*, which the definition fixes. A
 `legacy_value` table still asks for the whole hash, because the whole hash is
 what it returns.
+
+**Two shapes are counted at plan time, and the rest are not.** A
+`singleton_key` table is one key and a `keyset` table's keys are one set, so
+each costs a single `LLEN`, `SCARD`, `ZCARD` or `HLEN` on a connection the
+plan already has. Every other table is a keyspace, and counting a keyspace
+means scanning it — so those keep a placeholder estimate until you run
+`ANALYZE`, which autovacuum never does for a foreign table. A collection's
+size is not always its row count: the same key read one member per row and
+read as one packed array are four rows and one, and only the first is the
+collection's size.
+
+The count is asked for during planning, so `EXPLAIN` on those two shapes
+contacts the server. If it cannot, the placeholder stands and planning
+continues — a server that is down is a problem for the scan, where the error
+can say what was being read, not for a statement that may never run.
 
 `HMGET` cannot say whether a key exists — it answers one entry per field asked
 for and never an empty reply — so a small `HLEN` travels with it in the same

@@ -410,6 +410,23 @@ MUTATIONS = [
      "\treturn false ||",
      "standalone", "fetch"),
 
+    # The two shapes that can be counted are counted. Falling back to the
+    # placeholder is not a wrong ANSWER - the rows are the same either way -
+    # so fetch asserts the estimate against a known collection size.
+    ("E1-estimate", "src/vfdw_estimate.c",
+     "\tif (map->singleton_key != NULL)",
+     "\tif (false && map->singleton_key != NULL)",
+     "standalone", "fetch"),
+
+    # A collection's SIZE is its row count only where the table produces a row
+    # per member. A packed singleton is one row whatever the key holds, and
+    # reporting the member count there is an estimate that is confidently
+    # wrong rather than merely absent.
+    ("E2-multirow", "src/vfdw_estimate.c",
+     "\t\tif (!vfdw_scan_is_multirow(map))\n\t\t\treturn 1.0;",
+     "\t\tif (false)\n\t\t\treturn 1.0;",
+     "standalone", "fetch"),
+
     # A packed zset takes members, not scores. Restoring WITHSCORES makes the
     # array's shape follow the negotiated protocol rather than the data: RESP2
     # returns member and score alternating, RESP3 a nested pair per member

@@ -147,9 +147,67 @@ SELECT count(*) AS rows_from_a_full_scan FROM fx_ks;
 SELECT fx_calls('sscan')     > 0 AS walked_the_set,
        fx_calls('sismember') = 0 AS asked_no_membership;
 
+-- ---------------------------------------------------------------------------
+-- PLAN-TIME ROW ESTIMATES.
+--
+-- Every table planned at a placeholder until someone ran ANALYZE, and
+-- autovacuum never analyzes a foreign table - so a three-member zset and a
+-- two-million-member one produced the same plan forever. Two shapes can be
+-- counted in one command and now are.
+--
+-- The estimate is read out of the plan rather than eyeballed from a cost:
+-- EXPLAIN (COSTS OFF) hides row counts, and leaving costs on would put this
+-- machine's cost constants into an expected file.
+-- ---------------------------------------------------------------------------
+CREATE FUNCTION fx_plan_rows(q text) RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE
+    plan jsonb;
+BEGIN
+    EXECUTE 'EXPLAIN (FORMAT json) ' || q INTO plan;
+    RETURN (plan -> 0 -> 'Plan' ->> 'Plan Rows')::bigint;
+END $$;
+
+SELECT num AS zset_members
+FROM valkey_fdw_test_probe('fx_srv', 0, 'ZADD', 'fx:z',
+                           '1', 'a', '2', 'b', '3', 'c', '4', 'd');
+
+-- A singleton_key table over that zset, one row per member. Seven would be
+-- wrong, 1000 would be wrong, and the server was asked.
+CREATE FOREIGN TABLE fx_one (
+    m text OPTIONS (member 'true'),
+    s text OPTIONS (score 'true')
+) SERVER fx_srv OPTIONS (tabletype 'zset', singleton_key 'fx:z');
+
+SELECT fx_plan_rows('SELECT * FROM fx_one') AS estimated_members;
+
+-- SIZE IS NOT ROW COUNT. The same key read as a packed collection is ONE row,
+-- and asking the server would have said four. This is the distinction that
+-- makes an estimate wrong rather than absent, so it is asserted beside the
+-- case it is easily confused with.
+CREATE FOREIGN TABLE fx_one_packed (k text, v text[]) SERVER fx_srv
+    OPTIONS (tabletype 'zset', singleton_key 'fx:z', legacy_value 'true');
+
+SELECT fx_plan_rows('SELECT * FROM fx_one_packed') AS estimated_packed;
+
+-- A keyset table is its set's size, because each key is one row here.
+SELECT fx_plan_rows('SELECT * FROM fx_ks') AS estimated_keyset;
+
+SELECT num AS keyset_grew
+FROM valkey_fdw_test_probe('fx_srv', 0, 'SADD', 'fx:set', 'fx:m3', 'fx:m4', 'fx:m5');
+
+-- And it MOVES with the set rather than being a constant that happened to
+-- match: a fixed number would have passed the assertion above.
+SELECT fx_plan_rows('SELECT * FROM fx_ks') AS estimated_after_growth;
+
+-- A keyprefix table keeps the placeholder. Counting a keyspace means scanning
+-- it, which is not a trade worth making at plan time - so ANALYZE stays the
+-- answer there, and the README says so.
+SELECT fx_plan_rows('SELECT * FROM fx') AS estimated_keyspace;
+
+DROP FUNCTION fx_plan_rows(text);
 DROP FUNCTION fx_calls(text);
 SELECT num AS keys_removed
 FROM valkey_fdw_test_probe('fx_srv', 0, 'DEL', 'fx:1', 'fx:2',
-                           'fx:set', 'fx:m1', 'fx:stranger');
+                           'fx:set', 'fx:m1', 'fx:stranger', 'fx:z');
 
 DROP SERVER fx_srv CASCADE;
