@@ -25,7 +25,7 @@ CREATE FOREIGN TABLE sessions (
     expires text OPTIONS (field 'exp')
 ) SERVER cache OPTIONS (tabletype 'hash', keyprefix 'sess:');
 
-SELECT user_id FROM sessions WHERE id = 'sess:abc';   -- one HGETALL
+SELECT user_id FROM sessions WHERE id = 'sess:abc';   -- one HMGET
 ```
 
 ## Status
@@ -85,6 +85,22 @@ round trip per key. That batching is the single largest performance
 difference from a per-key client: a page of values costs one flush rather than
 one round trip each, so network latency is paid per page instead of per row
 (see *Performance* below).
+
+**A hash table asks for the fields it maps, not for the whole hash.** A table
+naming two fields of a hundred-thousand-field hash issues `HMGET` for those
+two rather than `HGETALL` for all of them. Both are a single round trip, so
+this is not a latency difference — it is that `HGETALL`'s cost grows with the
+*key's* field count, which nothing in the table definition bounds, while
+`HMGET`'s grows with the *table's*, which the definition fixes. A
+`legacy_value` table still asks for the whole hash, because the whole hash is
+what it returns.
+
+`HMGET` cannot say whether a key exists — it answers one entry per field asked
+for and never an empty reply — so a small `HLEN` travels with it in the same
+batch. That distinction is load-bearing rather than tidy: a key deleted between
+the `SCAN` that named it and the fetch must produce no row, while a key that
+exists holding none of the mapped fields must produce one with those columns
+NULL, and without `HLEN` both look identical.
 
 ![Read path sequence: the executor asks for a tuple; valkey_fdw issues SCAN with a cursor, MATCH prefix and COUNT, receives a cursor and up to n keys, then fetches those values in one pipelined batch bounded by pipeline_batch; each key is checked against the overlay before its tuple is returned. Cursor 0 ends the traversal, and on a cluster only after every primary has been visited.](img/read-path.png)
 

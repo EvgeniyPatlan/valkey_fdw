@@ -162,3 +162,52 @@ vfdw_map_check_implemented(VfdwTableMap *map, TupleDesc tupdesc)
 						NameStr(TupleDescAttr(tupdesc, i)->attname), what)));
 	}
 }
+
+/*
+ * Decide once whether this table's hash reads are HMGET, and assign each field
+ * column its position in that reply.
+ *
+ * ONE WALK, in map order, so the order fields are ASKED for and the order
+ * their answers are READ from are the same order by construction - the same
+ * reason a ttl column's slot is assigned where the ttl columns are counted.
+ *
+ * A ttl column's field is asked for too, even though its expiry comes from
+ * HPTTL and its value is never read. That is what keeps "does this key hold
+ * any of our fields" answerable: HMGET replies with one entry per field asked
+ * for and never with an empty array, so a key that is gone and a key holding
+ * none of the fields both answer all-nil - and a ttl-only field left out of
+ * the question would make a key that holds only that field look like neither.
+ * Duplicates are left in rather than merged: a field named by both a value
+ * column and a ttl column costs one repeated argument, and merging them would
+ * be a second thing to keep in step with the positions.
+ */
+static void
+vfdw_map_plan_hash_fetch(VfdwTableMap *map)
+{
+	int			i;
+
+	map->hmget = false;
+	map->nreq = 0;
+
+	if (map->tabletype != VFDW_TABLE_HASH || map->legacy_value)
+		return;
+
+	for (i = 0; i < map->natts; i++)
+	{
+		VfdwColumn *col = &map->cols[i];
+
+		if (col->kind == VFDW_COL_FIELD)
+			col->field_slot = map->nreq++;
+		else if (col->kind == VFDW_COL_TTL)
+			map->nreq++;
+	}
+
+	/* HMGET with no fields is not a command. */
+	map->hmget = map->nreq > 0;
+}
+
+void
+vfdw_map_check_fetch(VfdwTableMap *map)
+{
+	vfdw_map_plan_hash_fetch(map);
+}

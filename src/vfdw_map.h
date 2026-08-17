@@ -101,6 +101,14 @@ typedef struct VfdwColumn
 	bool		is_domain;
 
 	/*
+	 * VFDW_COL_FIELD only, and only when the map asks for HMGET: which entry
+	 * of that reply is this column's. HMGET answers positionally - values
+	 * alone, in the order the fields were asked for - where HGETALL answers
+	 * with pairs that carry their own names.
+	 */
+	int			field_slot;
+
+	/*
 	 * VFDW_COL_TTL only: which entry of the HPTTL reply is this column's.
 	 *
 	 * Assigned where the ttl columns are counted, so the position a field is
@@ -178,6 +186,28 @@ typedef struct VfdwTableMap
 	 * disagreed with the first would misalign every field after it.
 	 */
 	int			nttl;
+
+	/*
+	 * Fetch the named fields with HMGET instead of the whole hash.
+	 *
+	 * ONE DECISION, READ BY TWO PLACES. The command builder and the row
+	 * decoder must agree about which shape the reply has, and the way they
+	 * would stop agreeing is by each working it out from the map's other
+	 * fields. Deciding once here makes disagreement impossible rather than
+	 * unlikely.
+	 *
+	 * A table mapping two fields of a hundred-thousand-field hash was
+	 * transferring all of it. Both commands are one round trip, so there is no
+	 * latency threshold to tune between them: HGETALL's cost grows with the
+	 * KEY's field count, which this wrapper does not control, and HMGET's with
+	 * the TABLE's, which the definition fixes.
+	 *
+	 * False for a packed table, which is the whole collection by definition,
+	 * and for a table that names no field at all - HMGET with no fields is not
+	 * a command.
+	 */
+	bool		hmget;
+	int			nreq;			/* fields HMGET asks for, when hmget */
 } VfdwTableMap;
 
 /*

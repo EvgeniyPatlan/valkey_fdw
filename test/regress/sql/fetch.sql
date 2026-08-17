@@ -1,0 +1,98 @@
+-- ---------------------------------------------------------------------------
+-- Which command reads a hash, and how much it transfers.
+--
+-- A table mapping two fields of a hundred-field hash used to issue HGETALL and
+-- receive all hundred. The saving is not a latency one - HGETALL and HMGET are
+-- both a single round trip - it is that HGETALL's cost grows with the KEY's
+-- field count, which nothing in the table definition bounds, while HMGET's
+-- grows with the TABLE's, which it fixes.
+--
+-- ASSERTED ON WHAT WAS SENT, not on how long it took. The server counts calls
+-- per command, so CONFIG RESETSTAT before a query and INFO commandstats after
+-- says exactly which verb ran; a wall-clock assertion would be a measurement
+-- of this machine.
+-- ---------------------------------------------------------------------------
+CREATE SERVER fx_srv FOREIGN DATA WRAPPER valkey_fdw
+    OPTIONS (host 'valkey', port '6379');
+CREATE USER MAPPING FOR CURRENT_USER SERVER fx_srv;
+
+-- One key, two fields this table maps and a hundred it does not.
+SELECT num AS fields_set
+FROM valkey_fdw_test_probe('fx_srv', 0, VARIADIC
+    (ARRAY['HSET', 'fx:1', 'title', 'Alpha', 'body', 'Beta']
+     || (SELECT array_agg(x) FROM (
+            SELECT unnest(ARRAY['pad' || i, i::text]) AS x
+            FROM generate_series(1, 100) i) s))::bytea[]);
+
+CREATE FOREIGN TABLE fx (
+    k     text OPTIONS (key 'true'),
+    title text OPTIONS (field 'title'),
+    body  text OPTIONS (field 'body')
+) SERVER fx_srv OPTIONS (tabletype 'hash', keyprefix 'fx:');
+
+-- The same keyspace read as a packed collection, which needs the whole hash
+-- and so must still ask for it. Kept beside the other table because "HMGET is
+-- used" means little without a case in the same suite where it must not be.
+CREATE FOREIGN TABLE fx_packed (k text, v text[]) SERVER fx_srv
+    OPTIONS (tabletype 'hash', keyprefix 'fx:', legacy_value 'true');
+
+-- A helper reading one command's call count out of INFO commandstats. Returns
+-- 0 rather than NULL for a command that was never called, because the
+-- assertions below compare counts and a NULL would make every comparison NULL.
+CREATE FUNCTION fx_calls(cmd text) RETURNS int LANGUAGE sql AS $$
+    SELECT coalesce((
+        SELECT (regexp_match(convert_from(val_part, 'SQL_ASCII'),
+                             'cmdstat_' || cmd || ':calls=(\d+)'))[1]::int
+        FROM valkey_fdw_test_probe('fx_srv', 0, 'INFO', 'commandstats')), 0);
+$$;
+
+-- ---------------------------------------------------------------------------
+-- The mapped table asks for its two fields and nothing else.
+-- ---------------------------------------------------------------------------
+SELECT reply_type AS stats_reset
+FROM valkey_fdw_test_probe('fx_srv', 0, 'CONFIG', 'RESETSTAT');
+
+SELECT k, title, body FROM fx ORDER BY k;
+
+SELECT fx_calls('hmget')   > 0 AS asked_for_named_fields,
+       fx_calls('hgetall') = 0 AS did_not_ask_for_all;
+
+-- ---------------------------------------------------------------------------
+-- The packed table still asks for all of it, because that is what it returns.
+-- ---------------------------------------------------------------------------
+SELECT reply_type AS stats_reset
+FROM valkey_fdw_test_probe('fx_srv', 0, 'CONFIG', 'RESETSTAT');
+
+SELECT k, array_length(v, 1) AS elements FROM fx_packed ORDER BY k;
+
+SELECT fx_calls('hgetall') > 0 AS asked_for_all,
+       fx_calls('hmget')   = 0 AS did_not_ask_for_named;
+
+-- ---------------------------------------------------------------------------
+-- THE BOUNDARY THAT HMGET CANNOT SEE ON ITS OWN.
+--
+-- HMGET answers one entry per field asked for and never an empty array, so a
+-- key that is gone and a key holding none of these fields both answer all-nil.
+-- Those are different answers: the first is a row that must not appear, the
+-- second is a row that must. HLEN is asked alongside, which is what separates
+-- them - and it is asked for every key, so this pair is the assertion that it
+-- is being read rather than merely sent.
+-- ---------------------------------------------------------------------------
+SELECT num AS other_key
+FROM valkey_fdw_test_probe('fx_srv', 0, 'HSET', 'fx:2', 'unmapped', 'x');
+
+-- fx:2 exists and holds no field this table maps: a row, with both NULL.
+SELECT k, title IS NULL AS no_title, body IS NULL AS no_body
+FROM fx ORDER BY k;
+
+-- A key that does not exist is not a row, however it is reached.
+SELECT count(*) AS rows_for_a_missing_key FROM fx WHERE k = 'fx:nope';
+
+-- And the count is the two keys that exist, not one and not three.
+SELECT count(*) AS rows FROM fx;
+
+DROP FUNCTION fx_calls(text);
+SELECT num AS keys_removed
+FROM valkey_fdw_test_probe('fx_srv', 0, 'DEL', 'fx:1', 'fx:2');
+
+DROP SERVER fx_srv CASCADE;

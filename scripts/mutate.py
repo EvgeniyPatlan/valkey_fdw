@@ -356,6 +356,32 @@ MUTATIONS = [
      "\tvar = makeVar(1, attno, attr->atttypid, attr->atttypmod,",
      "standalone+cassert", "dml"),
 
+    # A table asks for the fields it maps, not for the whole hash. Falling
+    # back to HGETALL is not a wrong ANSWER - the rows are identical either
+    # way - which is why fetch asserts on what the server was asked rather
+    # than on what came back.
+    ("H1-hmget", "src/vfdw_map_check.c",
+     "\tmap->hmget = map->nreq > 0;",
+     "\tmap->hmget = false;",
+     "standalone", "fetch"),
+
+    # HMGET cannot tell a key that is gone from a key holding none of these
+    # fields: both answer all-nil, and it never answers empty. HLEN is what
+    # separates them. Ignoring it invents a row of NULLs for a key that does
+    # not exist - the phantom row this wrapper fixed once already.
+    ("H2-hlen", "src/vfdw_scan.c",
+     "\t\treturn state->cur_hlen == 0;",
+     "\t\treturn false;",
+     "standalone", "fetch"),
+
+    # HMGET answers positionally, so a column reads its own slot or another
+    # column's value. Taking every field from slot zero keeps the row shape and
+    # the row count and changes only which value lands where.
+    ("H3-slot", "src/vfdw_row.c",
+     "\t\te = vfdw_reply_child(reply, (size_t) col->field_slot);",
+     "\t\te = vfdw_reply_child(reply, 0);",
+     "standalone", "fetch"),
+
     # A packed zset takes members, not scores. Restoring WITHSCORES makes the
     # array's shape follow the negotiated protocol rather than the data: RESP2
     # returns member and score alternating, RESP3 a nested pair per member

@@ -690,6 +690,7 @@ vfdw_map_build(Relation rel, ForeignTable *table)
 	vfdw_map_resolve_packed(map, tupdesc);
 	vfdw_map_index_roles(map, tupdesc);
 	vfdw_map_check_implemented(map, tupdesc);
+	vfdw_map_check_fetch(map);
 
 	return map;
 }

@@ -62,6 +62,22 @@ typedef struct VfdwScanState
 	VfdwRowCtx	rowctx;
 
 	/*
+	 * The current key's field count, or -1 when nothing asked.
+	 *
+	 * HMGET cannot answer "is this key there". It returns one entry per field
+	 * asked for and never an empty array, so a key deleted between the SCAN
+	 * that named it and the fetch answers all-nil - and so does a key that is
+	 * present and holds none of this table's fields. Those two must not be the
+	 * same answer: the first is a race SCAN's contract permits and yields no
+	 * row, and the second is a row with its mapped columns NULL, which
+	 * test/regress/sql/scan.sql states as a boundary and asserts.
+	 *
+	 * HLEN separates them for one small reply per key, inside the batch that
+	 * was already going, so the saving HMGET exists for is kept.
+	 */
+	int64		cur_hlen;
+
+	/*
 	 * Keys named by the plan, for a strategy that does not discover any.
 	 * These live in scan_cxt, not page_cxt, so they survive the per-page
 	 * reset and a rescan can fetch them again.

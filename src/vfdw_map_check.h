@@ -25,4 +25,10 @@ extern void vfdw_map_check_types(VfdwTableMap *map, TupleDesc tupdesc);
 /* Refuse what the option grammar accepts but the scan cannot yet read. */
 extern void vfdw_map_check_implemented(VfdwTableMap *map, TupleDesc tupdesc);
 
+/*
+ * Decide how this table's hash reads are issued, and record it on the map.
+ * See the definition for why the decision is made once rather than derived.
+ */
+extern void vfdw_map_check_fetch(VfdwTableMap *map);
+
 #endif							/* VFDW_MAP_CHECK_H */

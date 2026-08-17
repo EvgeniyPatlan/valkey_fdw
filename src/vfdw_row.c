@@ -423,14 +423,48 @@ vfdw_row_store_position(VfdwRowCtx *ctx, TupleTableSlot *slot,
 	slot->tts_isnull[col->attnum - 1] = false;
 }
 
+/*
+ * One hash field, from whichever of the two replies this table asks for.
+ *
+ * HGETALL carries the field names beside the values and is walked in pairs;
+ * HMGET carries only values, in the order the fields were asked for, so the
+ * column's own slot is the answer. Which shape arrived is not guessed from the
+ * reply - map->hmget is what asked for it, and vfdw_scan_cmd.c reads the same
+ * flag when it builds the command.
+ */
+static void
+vfdw_row_store_field(VfdwRowCtx *ctx, TupleTableSlot *slot,
+					 const VfdwColumn *col, valkeyReply *reply)
+{
+	const char *data = NULL;
+	size_t		len = 0;
+
+	if (reply->type != VALKEY_REPLY_MAP && reply->type != VALKEY_REPLY_ARRAY)
+		return;
+
+	if (ctx->map->hmget)
+	{
+		const valkeyReply *e;
+
+		if ((size_t) col->field_slot >= reply->elements)
+			return;
+
+		e = vfdw_reply_child(reply, (size_t) col->field_slot);
+		if (e != NULL && e->str != NULL)
+			vfdw_scan_store(ctx, slot, col, e->str, e->len);
+		return;
+	}
+
+	if (vfdw_scan_hash_lookup(reply, col->field, &data, &len))
+		vfdw_scan_store(ctx, slot, col, data, len);
+}
+
 static void
 vfdw_row_fill_column(VfdwRowCtx *ctx, TupleTableSlot *slot,
 					 const VfdwColumn *col, const char *key, size_t keylen,
 					 valkeyReply *reply)
 {
 	VfdwTableMap *map = ctx->map;
-	const char *data = NULL;
-	size_t		len = 0;
 
 	switch (col->kind)
 	{
@@ -444,12 +478,7 @@ vfdw_row_fill_column(VfdwRowCtx *ctx, TupleTableSlot *slot,
 			break;
 
 		case VFDW_COL_FIELD:
-			if (reply->type == VALKEY_REPLY_MAP ||
-				reply->type == VALKEY_REPLY_ARRAY)
-			{
-				if (vfdw_scan_hash_lookup(reply, col->field, &data, &len))
-					vfdw_scan_store(ctx, slot, col, data, len);
-			}
+			vfdw_row_store_field(ctx, slot, col, reply);
 			break;
 
 		case VFDW_COL_LEGACY_VALUE:

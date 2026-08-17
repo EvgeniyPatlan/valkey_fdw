@@ -36,6 +36,45 @@
 /*
  * The command that reads one key's value, by table type.
  */
+/*
+ * The command that reads one hash key: HMGET of the named fields, or HGETALL.
+ *
+ * See VfdwTableMap.hmget for why the choice is made once at map build rather
+ * than worked out here - the row decoder has to reach the same answer, and the
+ * way two derivations stop agreeing is silently.
+ */
+static void
+vfdw_scan_hash_command(VfdwScanState *state, VfdwCmd *cmd,
+					   const char *key, size_t keylen)
+{
+	int			i;
+
+	if (!state->map->hmget)
+	{
+		vfdw_cmd_add_cstr(cmd, "HGETALL");
+		vfdw_cmd_add_bytes(cmd, key, keylen);
+		return;
+	}
+
+	vfdw_cmd_add_cstr(cmd, "HMGET");
+	vfdw_cmd_add_bytes(cmd, key, keylen);
+
+	for (i = 0; i < state->map->natts; i++)
+	{
+		const VfdwColumn *c = &state->map->cols[i];
+
+		if (c->kind != VFDW_COL_FIELD && c->kind != VFDW_COL_TTL)
+			continue;
+
+		/*
+		 * Map order, which is the order vfdw_map_check_fetch assigned the
+		 * slots in. The reply is positional, so a different order here would
+		 * give every column after the difference another column's value.
+		 */
+		vfdw_cmd_add_bytes(cmd, c->field, strlen(c->field));
+	}
+}
+
 static void
 vfdw_scan_value_command(VfdwScanState *state, VfdwCmd *cmd,
 						const char *key, size_t keylen)
@@ -45,9 +84,9 @@ vfdw_scan_value_command(VfdwScanState *state, VfdwCmd *cmd,
 	switch (state->map->tabletype)
 	{
 		case VFDW_TABLE_HASH:
-			vfdw_cmd_add_cstr(cmd, "HGETALL");
-			vfdw_cmd_add_bytes(cmd, key, keylen);
+			vfdw_scan_hash_command(state, cmd, key, keylen);
 			break;
+
 		case VFDW_TABLE_LIST:
 			vfdw_cmd_add_cstr(cmd, "LRANGE");
 			vfdw_cmd_add_bytes(cmd, key, keylen);
@@ -106,6 +145,14 @@ vfdw_scan_queue_page(VfdwScanState *state)
 		 * tuple is built from, field by field, while the tuple is assembled.
 		 * Only one of those can be the one that has to survive.
 		 */
+		if (state->map->hmget)
+		{
+			vfdw_cmd_reset(&cmd);
+			vfdw_cmd_add_cstr(&cmd, "HLEN");
+			vfdw_cmd_add_bytes(&cmd, state->keys[i], state->keylens[i]);
+			vfdw_batch_add(state->batch, &cmd);
+		}
+
 		if (state->map->nttl > 0)
 		{
 			vfdw_ttl_command(&cmd, state->map, state->keys[i], state->keylens[i]);
@@ -129,6 +176,22 @@ vfdw_scan_take_replies(VfdwScanState *state)
 	 * A batch reply is valid only until the next is taken, which is why these
 	 * integers are copied out now and the value reply is the one returned.
 	 */
+	state->cur_hlen = -1;
+	if (state->map->hmget)
+	{
+		const valkeyReply *r = vfdw_batch_next(state->batch);
+
+		/*
+		 * Only an integer is an answer. A WRONGTYPE against a key holding
+		 * something other than a hash, or a server that refused the read,
+		 * arrives as an error here and is left to the value reply queued
+		 * behind it - which reports it with the key in hand, the way it did
+		 * before this command existed.
+		 */
+		if (r != NULL && r->type == VALKEY_REPLY_INTEGER)
+			state->cur_hlen = r->integer;
+	}
+
 	if (state->map->nttl > 0)
 		vfdw_ttl_take(state->map, vfdw_batch_next(state->batch),
 					  state->rowctx.ttl_ms);

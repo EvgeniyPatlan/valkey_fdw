@@ -385,6 +385,27 @@ vfdw_scan_reply_is_absent(const VfdwScanState *state, const valkeyReply *reply)
 		reply->type != VALKEY_REPLY_SET)
 		return false;
 
+	/*
+	 * HMGET NEVER ANSWERS WITH AN EMPTY ARRAY. It returns one entry per field
+	 * asked for, nil where the field is not there, so the rule below cannot
+	 * read it: a key deleted between the SCAN that named it and the fetch
+	 * answers all-nil, and so does a key that is present and holds none of
+	 * this table's fields.
+	 *
+	 * READING ALL-NIL AS ABSENT WOULD BE WRONG, and wrong against a boundary
+	 * this tree states and asserts: a hash that exists holding only fields the
+	 * table does not map is a row, with those columns NULL. That is the
+	 * far side of the phantom-row defect - a row must not be invented for a
+	 * key that is gone, and must not be withheld from a key that is there.
+	 *
+	 * HLEN is what tells them apart, asked in the same batch. Its answer is
+	 * this key's field count; zero is the empty hash Valkey does not keep, so
+	 * zero means the key is gone. -1 is "nothing asked", which no HMGET table
+	 * reaches and which reads as present.
+	 */
+	if (state->map->hmget)
+		return state->cur_hlen == 0;
+
 	return reply->elements == 0;
 }
 
@@ -599,6 +620,8 @@ vfdw_scan_state_create(Relation rel, MemoryContext parent)
 		vfdw_ttl_require(state->vconn);
 
 	vfdw_row_ctx_init(&state->rowctx, state->map, scan_cxt);
+
+	state->cur_hlen = -1;
 
 	state->batch_cxt = AllocSetContextCreate(scan_cxt, "valkey_fdw scan batch",
 											 ALLOCSET_SMALL_SIZES);
