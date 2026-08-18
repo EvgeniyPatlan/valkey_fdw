@@ -37,6 +37,7 @@
 #include "utils/lsyscache.h"
 
 #include "vfdw_cmd.h"
+#include "vfdw_filter.h"
 #include "vfdw_row.h"
 #include "vfdw_scan_internal.h"
 #include "vfdw_vec.h"
@@ -95,14 +96,30 @@ vfdw_search_qvec(const VfdwKnnScan *knn, size_t *lenp)
  * results arrive already ranked. A design copied from RediSearch's
  * documentation would have sent a command this server refuses.
  */
-static void
+static bool
 vfdw_search_add_query(VfdwCmd *cmd, const VfdwKnnScan *knn,
 					  const char *qvec, size_t qlen)
 {
 	StringInfoData q;
 
 	initStringInfo(&q);
-	appendStringInfo(&q, "*=>[KNN %d @%s $q AS %s]",
+
+	/*
+	 * The filter goes BEFORE the arrow, which is what makes it a pre-filter:
+	 * the spike measured @tag:{b}=>[KNN 2 ...] returning one row out of three
+	 * where two were asked for, so k applies to the filtered set. A `*` stands
+	 * in when there is nothing to filter by.
+	 */
+	if (!vfdw_filter_render(knn->terms, knn->econtext, knn->bounds, &q))
+	{
+		pfree(q.data);
+		return false;
+	}
+
+	if (q.len == 0)
+		appendStringInfoChar(&q, '*');
+
+	appendStringInfo(&q, "=>[KNN %d @%s $q AS %s]",
 					 knn->k, knn->field, VFDW_SEARCH_DIST_ALIAS);
 
 	vfdw_cmd_add_cstr(cmd, "FT.SEARCH");
@@ -122,6 +139,26 @@ vfdw_search_add_query(VfdwCmd *cmd, const VfdwKnnScan *knn,
 	 * answered "Invalid filter format" about a string that was correct when
 	 * it was built. The page context owns it and releases it with the pass.
 	 */
+	return true;
+}
+
+/*
+ * A NULL bound: no row can satisfy the query, so nothing is asked.
+ *
+ * The FT.INFO already queued is still READ, for two reasons. A reply left in
+ * the batch would be handed to whoever takes from it next, which is the class
+ * of bug that gives one command another's answer. And it is worth reading on
+ * its own merits: a table whose index disagrees with it should say so rather
+ * than quietly return nothing, which is the same answer a correct empty filter
+ * gives.
+ */
+static void
+vfdw_search_unsatisfiable(VfdwScanState *state, size_t qlen)
+{
+	vfdw_search_verify(&state->knn, vfdw_batch_next(state->batch), qlen);
+
+	state->knn.empty = true;
+	state->knn.ran = true;
 }
 
 void
@@ -152,7 +189,12 @@ vfdw_search_run(VfdwScanState *state)
 	vfdw_batch_add(state->batch, &cmd);
 
 	vfdw_cmd_reset(&cmd);
-	vfdw_search_add_query(&cmd, knn, qvec, qlen);
+	if (!vfdw_search_add_query(&cmd, knn, qvec, qlen))
+	{
+		MemoryContextSwitchTo(old);
+		vfdw_search_unsatisfiable(state, qlen);
+		return;
+	}
 	vfdw_batch_add(state->batch, &cmd);
 
 	MemoryContextSwitchTo(old);
@@ -192,6 +234,7 @@ vfdw_search_adopt(VfdwScanState *state, ForeignScan *plan)
 	state->knn.field = pstrdup(vfdw_plan_knn_field(plan->fdw_private));
 	state->knn.metric = pstrdup(vfdw_plan_knn_metric(plan->fdw_private));
 	state->knn.k = vfdw_plan_knn_k(plan->fdw_private);
+	state->knn.terms = vfdw_filter_decode(vfdw_plan_knn_filter(plan->fdw_private));
 
 	MemoryContextSwitchTo(old);
 }
@@ -208,8 +251,15 @@ vfdw_search_init(VfdwScanState *state, ForeignScanState *node)
 {
 	ForeignScan *plan = (ForeignScan *) node->ss.ps.plan;
 
-	state->knn.qvec = ExecInitExpr((Expr *) linitial(plan->fdw_exprs),
-								   (PlanState *) node);
+	List	   *states = ExecInitExprList(plan->fdw_exprs, (PlanState *) node);
+
+	/*
+	 * Element zero is the query vector and the rest are the filter's bounds,
+	 * in the order vfdw_filter_encode appended them. Paired by position, which
+	 * is why one walk built both halves.
+	 */
+	state->knn.qvec = (ExprState *) linitial(states);
+	state->knn.bounds = list_delete_first(states);
 	state->knn.econtext = node->ss.ps.ps_ExprContext;
 }
 
@@ -241,6 +291,10 @@ vfdw_search_next(VfdwScanState *state, TupleTableSlot *slot)
 
 	vfdw_search_run(state);
 
+	/* A NULL bound made the query unsatisfiable; nothing was asked. */
+	if (knn->empty)
+		return slot;
+
 	keyat = (size_t) knn->row * 2 + 1;
 	if (keyat + 1 >= knn->reply->elements)
 		return slot;			/* exhausted, and genuinely so */
@@ -268,4 +322,5 @@ vfdw_search_reset(VfdwKnnScan *knn)
 	knn->reply = NULL;
 	knn->row = 0;
 	knn->ran = false;
+	knn->empty = false;
 }

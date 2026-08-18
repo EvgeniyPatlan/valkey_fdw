@@ -44,6 +44,16 @@ typedef struct VfdwKnnPlan
 	const char *metric;
 	Expr	   *qvec;
 	int			k;
+
+	/*
+	 * The WHERE clause, compiled into the search's own filter language. NIL
+	 * when the query has no restriction clauses at all.
+	 *
+	 * A List of VfdwFilterTerm; see src/vfdw_filter.h for why a clause that
+	 * cannot be compiled refuses the whole query rather than being left to the
+	 * executor.
+	 */
+	List	   *filter;
 } VfdwKnnPlan;
 
 /*

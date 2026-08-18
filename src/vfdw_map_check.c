@@ -31,6 +31,8 @@
 
 #include "vfdw_map_check.h"
 
+#include "vfdw_filter.h"
+
 /*
  * A position column belongs to a list and nothing else. A set has no order at
  * all, and a zset's order is its scores - which a score column already
@@ -44,6 +46,40 @@ vfdw_map_position_conflict(VfdwTableMap *map, VfdwColumn *col)
 	if (getBaseType(col->typid) != INT4OID &&
 		getBaseType(col->typid) != INT8OID)
 		return "position columns must be of type integer or bigint";
+	return NULL;
+}
+
+/*
+ * A field column, and what a vector table asks of its name.
+ *
+ * A vector table's rows are hash keys too - FT.SEARCH over an ON HASH index
+ * returns their fields - so a field column means the same thing there as it
+ * does on a hash table.
+ *
+ * BUT A FIELD NAME IS PART OF A SEARCH QUERY. On a vector table the name goes
+ * into the query string - `@name:[1 1]` for a filter, `@name` in the KNN
+ * clause - so a name carrying the query language's own punctuation asks
+ * something else. The server accepts `@a:[1 1] @b:{x}` written as one name
+ * without complaint and applies both terms; test/regress/sql/vfilter.sql
+ * records it.
+ *
+ * Refused rather than escaped, because valkey-search's grammar is not this
+ * tree's to model and a wrong escape is a query that silently means something
+ * different. On a hash table the same name is an argument rather than syntax,
+ * so nothing is refused there.
+ */
+static const char *
+vfdw_map_field_conflict(VfdwTableMap *map, VfdwColumn *col)
+{
+	if (map->tabletype != VFDW_TABLE_HASH &&
+		map->tabletype != VFDW_TABLE_VECTOR)
+		return "field columns require tabletype 'hash' or 'vector'";
+
+	if (map->tabletype == VFDW_TABLE_VECTOR &&
+		!vfdw_filter_name_is_safe(col->field))
+		return "field names on a vector table may hold only letters, digits, "
+			"'_', '-' and '.', because they become part of the search query";
+
 	return NULL;
 }
 
@@ -85,16 +121,7 @@ vfdw_map_column_conflict(VfdwTableMap *map, VfdwColumn *col)
 	{
 		case VFDW_COL_FIELD:
 			map->nfields++;
-
-			/*
-			 * A vector table's rows are hash keys too - FT.SEARCH over an
-			 * ON HASH index returns their fields - so a field column means
-			 * the same thing there as it does on a hash table.
-			 */
-			if (map->tabletype != VFDW_TABLE_HASH &&
-				map->tabletype != VFDW_TABLE_VECTOR)
-				return "field columns require tabletype 'hash' or 'vector'";
-			return NULL;
+			return vfdw_map_field_conflict(map, col);
 
 		case VFDW_COL_SCORE:
 			if (map->tabletype != VFDW_TABLE_ZSET)

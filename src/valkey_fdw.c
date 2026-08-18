@@ -46,6 +46,7 @@
 #include "utils/rel.h"
 
 #include "vfdw_estimate.h"
+#include "vfdw_filter.h"
 #include "vfdw_knn.h"
 #include "vfdw_map.h"
 #include "vfdw_modify.h"
@@ -600,12 +601,27 @@ vfdwGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 static void
 vfdwExplainKnn(List *private, ExplainState *es)
 {
+	List	   *filter;
+
+
 	ExplainPropertyText("Valkey Search Field",
 						vfdw_plan_knn_field(private), es);
 	ExplainPropertyText("Valkey Search Metric",
 						vfdw_plan_knn_metric(private), es);
 	ExplainPropertyInteger("Valkey Search K", NULL,
 						   vfdw_plan_knn_k(private), es);
+
+	/*
+	 * And the pre-filter, if there is one. Shown as a shape with `$` for each
+	 * bound, because the bounds may be Params and are not plan-time facts -
+	 * and shown at all because a filter pushed wrongly returns k rows in order
+	 * and looks exactly like one pushed rightly.
+	 */
+	filter = vfdw_plan_knn_filter(private);
+	if (filter != NIL)
+		ExplainPropertyText("Valkey Search Filter",
+							vfdw_filter_describe(vfdw_filter_decode(filter)),
+							es);
 }
 
 /*

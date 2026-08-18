@@ -1,0 +1,292 @@
+-- ---------------------------------------------------------------------------
+-- What valkey-search's filter language actually does.
+--
+-- Kept and recorded rather than deleted, for the reason the Phase 4 fallback
+-- was deleted unwritten: this file is the EVIDENCE for a design decision, and
+-- the decision is one where being wrong is a wrong answer. If valkey-search
+-- ever changes any of these answers, the pushdown built on them is wrong and
+-- this suite is the only thing that would say so.
+--
+-- Nothing here goes through a foreign table. Every query is sent as an argv
+-- through the probe, because what is being established is what the SERVER
+-- does - a foreign table would be asserting this wrapper's reading of it.
+--
+-- Four documents, whose vectors are along one axis so that KNN order is
+-- arithmetic anyone can check: f:1 at [1,0], f:2 at [2,0], f:3 at [3,0],
+-- f:4 at [4,0], all searched from [1,0].
+-- ---------------------------------------------------------------------------
+CREATE SERVER vf FOREIGN DATA WRAPPER valkey_fdw
+    OPTIONS (host 'valkey', port '6379');
+CREATE USER MAPPING FOR CURRENT_USER SERVER vf;
+SELECT valkey_fdw_test_flush('vf') AS cleared;
+ cleared 
+---------
+ flushed
+(1 row)
+
+SELECT reply_type FROM valkey_fdw_test_probe('vf', 0,
+    'FT.CREATE', 'vfx', 'ON', 'HASH', 'PREFIX', '1', 'vf:', 'SCHEMA',
+    'emb', 'VECTOR', 'FLAT', '6', 'TYPE', 'FLOAT32', 'DIM', '2',
+    'DISTANCE_METRIC', 'L2',
+    'tg', 'TAG', 'num', 'NUMERIC');
+ reply_type 
+------------
+ status
+(1 row)
+
+-- tg holds one tag on f:1 and TWO on f:2, which is the case the whole tag
+-- finding below turns on: the field's text is "a,b" and the index's default
+-- SEPARATOR is a comma.
+SELECT num AS seeded_1 FROM valkey_fdw_test_probe('vf', 0, 'HSET', 'vf:1',
+    'emb', valkey_fdw_test_vec_from_text('[1,0]'), 'tg', 'a', 'num', '1');
+ seeded_1 
+----------
+        3
+(1 row)
+
+SELECT num AS seeded_2 FROM valkey_fdw_test_probe('vf', 0, 'HSET', 'vf:2',
+    'emb', valkey_fdw_test_vec_from_text('[2,0]'), 'tg', 'a,b', 'num', '5');
+ seeded_2 
+----------
+        3
+(1 row)
+
+SELECT num AS seeded_3 FROM valkey_fdw_test_probe('vf', 0, 'HSET', 'vf:3',
+    'emb', valkey_fdw_test_vec_from_text('[3,0]'), 'tg', 'has space',
+    'num', '10');
+ seeded_3 
+----------
+        3
+(1 row)
+
+SELECT num AS seeded_4 FROM valkey_fdw_test_probe('vf', 0, 'HSET', 'vf:4',
+    'emb', valkey_fdw_test_vec_from_text('[4,0]'), 'tg', 'plain', 'num', '-3');
+ seeded_4 
+----------
+        3
+(1 row)
+
+DO $$
+DECLARE n text;
+BEGIN
+    FOR i IN 1..100 LOOP
+        SELECT convert_from(coalesce(key_part, val_part), 'UTF8') INTO n
+        FROM valkey_fdw_test_probe('vf', 0, 'FT.INFO', 'vfx') WHERE ordinal = 10;
+        EXIT WHEN n = '4';
+        PERFORM pg_sleep(0.1);
+    END LOOP;
+END $$;
+-- One helper, so every question below differs only in its filter.
+--
+-- convert_to rather than a bytea cast, so a backslash in a query reaches the
+-- server as a backslash rather than being read as a bytea escape.
+--
+-- The keys are the EVEN elements from 2 onwards: FT.SEARCH answers with the
+-- match count at element 0 and then alternating key and field-array. The odd
+-- elements are the field arrays, which this suite does not read - what it is
+-- establishing is WHICH documents a filter selects.
+CREATE FUNCTION vf_keys(q text) RETURNS TABLE(key text) AS $$
+    SELECT convert_from(coalesce(p.key_part, p.val_part), 'UTF8')
+    FROM valkey_fdw_test_probe('vf', 0, 'FT.SEARCH'::bytea, 'vfx'::bytea,
+             convert_to(q, 'UTF8'), 'PARAMS'::bytea, '2'::bytea, 'q'::bytea,
+             valkey_fdw_test_vec_from_text('[1,0]'),
+             'DIALECT'::bytea, '2'::bytea) p
+    WHERE p.ordinal >= 2 AND p.ordinal % 2 = 0
+      AND coalesce(p.key_part, p.val_part) IS NOT NULL
+    ORDER BY p.ordinal
+$$ LANGUAGE sql;
+CREATE FUNCTION vf_error(q text) RETURNS text AS $$
+    SELECT convert_from(coalesce(p.key_part, p.val_part), 'UTF8')
+    FROM valkey_fdw_test_probe('vf', 0, 'FT.SEARCH'::bytea, 'vfx'::bytea,
+             convert_to(q, 'UTF8'), 'PARAMS'::bytea, '2'::bytea, 'q'::bytea,
+             valkey_fdw_test_vec_from_text('[1,0]'),
+             'DIALECT'::bytea, '2'::bytea) p
+    WHERE p.reply_type = 'error'
+$$ LANGUAGE sql;
+-- ---------------------------------------------------------------------------
+-- NUMERIC, which is exactly expressible and is therefore what gets pushed.
+--
+-- Every SQL comparison this wrapper pushes down has a filter here that means
+-- the same thing, which is the property the pushdown rests on: a filter that
+-- were merely CLOSE would return k rows chosen from the wrong set.
+-- ---------------------------------------------------------------------------
+-- Inclusive at both ends: num BETWEEN 1 AND 5.
+SELECT * FROM vf_keys('@num:[1 5]=>[KNN 4 @emb $q AS d]');
+ key  
+------
+ vf:1
+ vf:2
+(2 rows)
+
+-- Exclusive lower: num > 1 AND num <= 5.
+SELECT * FROM vf_keys('@num:[(1 5]=>[KNN 4 @emb $q AS d]');
+ key  
+------
+ vf:2
+(1 row)
+
+-- Exclusive upper: num >= 1 AND num < 5.
+SELECT * FROM vf_keys('@num:[1 (5]=>[KNN 4 @emb $q AS d]');
+ key  
+------
+ vf:1
+(1 row)
+
+-- Both exclusive.
+SELECT * FROM vf_keys('@num:[(1 (10]=>[KNN 4 @emb $q AS d]');
+ key  
+------
+ vf:2
+(1 row)
+
+-- One-sided, which is what a bare < or > compiles to. Both infinities work
+-- and both are spelled, because a missing bound is not the same as a bound of
+-- zero.
+SELECT * FROM vf_keys('@num:[5 +inf]=>[KNN 4 @emb $q AS d]');
+ key  
+------
+ vf:2
+ vf:3
+(2 rows)
+
+SELECT * FROM vf_keys('@num:[-inf 0]=>[KNN 4 @emb $q AS d]');
+ key  
+------
+ vf:4
+(1 row)
+
+-- Equality is a degenerate range, not a separate syntax.
+SELECT * FROM vf_keys('@num:[1 1]=>[KNN 4 @emb $q AS d]');
+ key  
+------
+ vf:1
+(1 row)
+
+-- AND is a space. Two terms, and the KNN clause after them.
+SELECT * FROM vf_keys('@tg:{a} @num:[1 1]=>[KNN 4 @emb $q AS d]');
+ key  
+------
+ vf:1
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- TAG, WHICH IS NOT EXPRESSIBLE AS SQL EQUALITY. This is the finding.
+--
+-- A TAG field is TOKENISED on its separator, and the default separator is a
+-- comma. vf:2's field holds the six bytes "a,b", so the index holds it as two
+-- tags - and @tg:{a} matches it.
+--
+-- SQL `tg = 'a'` compares the whole field, so it is TRUE for vf:1 and FALSE
+-- for vf:2. The filter is therefore WEAKER than the qual, and weaker is the
+-- direction that cannot be recovered from: the server returns the k nearest
+-- of a SUPERSET, the recheck above the scan drops vf:2, and the answer is
+-- fewer than k rows that are not the k nearest matching ones. With k = 1 and
+-- vf:2 nearer than vf:1, the answer would be no rows at all where the correct
+-- answer is vf:1.
+--
+-- So tag equality is refused rather than pushed, and this pair of queries is
+-- why. Fixing it properly means over-fetching and re-ranking until k rows
+-- survive the recheck, which is a different algorithm and not this slice.
+-- ---------------------------------------------------------------------------
+-- Matches BOTH: the one whose field is "a", and the one whose field is "a,b".
+SELECT * FROM vf_keys('@tg:{a}=>[KNN 4 @emb $q AS d]');
+ key  
+------
+ vf:1
+ vf:2
+(2 rows)
+
+-- And the second tag of that same field is separately matchable, which is the
+-- same fact from the other side.
+SELECT * FROM vf_keys('@tg:{b}=>[KNN 4 @emb $q AS d]');
+ key  
+------
+ vf:2
+(1 row)
+
+-- Asking for the literal string "a,b" matches nothing at all: the comma is a
+-- separator inside the braces too, so there is no way to spell the field's
+-- whole value as one tag.
+SELECT * FROM vf_keys('@tg:{a,b}=>[KNN 4 @emb $q AS d]');
+ key 
+-----
+(0 rows)
+
+-- A space inside the braces is literal and needs no escaping, which is worth
+-- recording because it is the opposite of what RediSearch's documentation
+-- would lead a reader to write.
+SELECT * FROM vf_keys('@tg:{has space}=>[KNN 4 @emb $q AS d]');
+ key  
+------
+ vf:3
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- What the server itself refuses, which is the net under this wrapper's own
+-- checks rather than a substitute for them.
+-- ---------------------------------------------------------------------------
+-- A field the index does not have.
+SELECT vf_error('@nosuch:[1 1]=>[KNN 4 @emb $q AS d]');
+                                        vf_error                                        
+----------------------------------------------------------------------------------------
+ Invalid filter expression: `@nosuch:[1 1]`. `nosuch` is not indexed as a numeric field
+(1 row)
+
+-- The right field, the wrong kind of filter, both ways round.
+SELECT vf_error('@num:{1}=>[KNN 4 @emb $q AS d]');
+                                  vf_error                                  
+----------------------------------------------------------------------------
+ Invalid filter expression: `@num:{1}`. `num` is not indexed as a tag field
+(1 row)
+
+SELECT vf_error('@tg:[1 1]=>[KNN 4 @emb $q AS d]');
+                                    vf_error                                    
+--------------------------------------------------------------------------------
+ Invalid filter expression: `@tg:[1 1]`. `tg` is not indexed as a numeric field
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- A FIELD NAME IS PART OF THE QUERY STRING, so a name carrying the query
+-- language's own punctuation changes what is asked.
+--
+-- This is why field names used in a filter or in the KNN clause are checked
+-- against a conservative set of characters before they are put in one. The
+-- name comes from a table definition rather than from a query, so this is not
+-- an escalation - but it is a search that is not the search the table
+-- declared, and nothing else would notice.
+-- ---------------------------------------------------------------------------
+-- Two terms written as though they were one field name. The server catches
+-- this one only because the injected field does not exist; a name naming a
+-- real field would simply add a filter nobody asked for.
+SELECT vf_error('@num:[1 1] @nope:[0 0]=>[KNN 4 @emb $q AS d]');
+                                           vf_error                                            
+-----------------------------------------------------------------------------------------------
+ Invalid filter expression: `@num:[1 1] @nope:[0 0]`. `nope` is not indexed as a numeric field
+(1 row)
+
+-- The same shape with a field that DOES exist, which the server accepts
+-- without complaint. The result is one row, filtered by a term the query
+-- never meant to contain.
+SELECT * FROM vf_keys('@num:[1 1] @tg:{a}=>[KNN 4 @emb $q AS d]');
+ key  
+------
+ vf:1
+(1 row)
+
+DROP FUNCTION vf_keys(text);
+DROP FUNCTION vf_error(text);
+SELECT reply_type AS dropped FROM valkey_fdw_test_probe('vf', 0,
+    'FT.DROPINDEX', 'vfx');
+ dropped 
+---------
+ status
+(1 row)
+
+SELECT valkey_fdw_test_flush('vf') AS cleaned_up;
+ cleaned_up 
+------------
+ flushed
+(1 row)
+
+DROP SERVER vf CASCADE;
+NOTICE:  drop cascades to user mapping for vfdw on server vf

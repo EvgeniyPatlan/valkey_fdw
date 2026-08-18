@@ -589,13 +589,22 @@ MUTATIONS = [
      "\tif (false)",
      "search", "knn"),
 
-    # A WHERE clause takes rows away AFTER the search counted them towards k,
-    # so the answer is fewer than k rows and not the k nearest matching ones.
-    # Accepting one is the wrong answer 6.4 exists to make right.
+    # A WHERE clause that cannot be compiled must refuse the QUERY.
+    #
+    # This mutation used to patch the line that refused every WHERE outright;
+    # 6.4 replaced it with a compiler, and the old anchor went with it -
+    # PATTERN-NOT-FOUND is what said so. What it guards now is the same
+    # property one step later: vfdw_filter_compile reports why it could not
+    # compile a clause, and ignoring that report accepts the query with an
+    # EMPTY filter. The search then returns the k globally nearest and the
+    # executor applies the WHERE above it, which subtracts - fewer than k rows,
+    # and not the k nearest matching ones. knnplan asserts each refusal.
     ("K5-where", "src/vfdw_knn.c",
-     "\tif (baserel->baserestrictinfo != NIL || baserel->joininfo != NIL)\n"
-     "\t\treturn false;\n\n\tfor (rti = 1;",
-     "\tfor (rti = 1;",
+     "\tout->filter = vfdw_filter_compile(root, baserel, map,\n"
+     "\t\t\t\t\t\t\t\t\t  vfdw_knn_clauses(baserel), &why);\n"
+     "\tif (why != NULL)\n\t\treturn false;",
+     "\tout->filter = vfdw_filter_compile(root, baserel, map,\n"
+     "\t\t\t\t\t\t\t\t\t  vfdw_knn_clauses(baserel), &why);",
      "standalone", "knnplan"),
 
     # DESC is the FARTHEST k, and no reversal of a k-row result answers it:
@@ -637,6 +646,66 @@ MUTATIONS = [
      "\tif (!opts.cluster)\n\t\treturn;",
      "\treturn;",
      "cluster", "cluster"),
+
+    # A WHERE clause must be compiled into the search or refuse the query.
+    #
+    # Letting one through to be applied above the scan is the wrong answer
+    # 6.4 exists to prevent: the server has already cut the result to k, so a
+    # filter applied afterwards SUBTRACTS - the answer is fewer than k rows,
+    # and they are not the k nearest matching ones. knn asks for k = 1 with a
+    # filter that excludes the nearest document, where the right answer is one
+    # row and the local-filter answer is none.
+    ("F1-nofilter", "src/vfdw_search.c",
+     "\tif (!vfdw_filter_render(knn->terms, knn->econtext, knn->bounds, &q))",
+     "\tif (false)",
+     "search", "knn"),
+
+    # Which END of the range a bound is.
+    #
+    # Reversing it turns `n > 10` into `n < 10` and returns k rows, in order,
+    # with distances that are all correct - for the wrong set. Nothing about
+    # the reply says which filter produced it.
+    ("F2-endswap", "src/vfdw_filter.c",
+     "\t\tif (term->both)\n"
+     "\t\t\tappendStringInfo(out, \"%s %s\", num.data, num.data);\n"
+     "\t\telse if (term->lower)",
+     "\t\tif (term->both)\n"
+     "\t\t\tappendStringInfo(out, \"%s %s\", num.data, num.data);\n"
+     "\t\telse if (!term->lower)",
+     "search", "knn"),
+
+    # Whether a bound is itself included.
+    #
+    # `n > 10` becoming `n >= 10` admits one extra document, which the recheck
+    # above the scan then removes - so the count is short by one and the rows
+    # that are there are right. The most invisible failure in this path.
+    ("F3-exclusive", "src/vfdw_filter.c",
+     "\t\t\tappendStringInfo(out, \"%s%s +inf\",\n"
+     "\t\t\t\t\t\t\t term->exclusive ? \"(\" : \"\", num.data);",
+     "\t\t\tappendStringInfo(out, \"%s%s +inf\",\n"
+     "\t\t\t\t\t\t\t \"\", num.data);",
+     "search", "knn"),
+
+    # A type whose values do not survive being a double.
+    #
+    # bigint is refused because a value beyond 2^53 rounds on the way into the
+    # index, so a row the qual excludes can match the filter. Accepting it is
+    # a pushdown that is right for small numbers and silently wrong for large
+    # ones; knnplan declares such a column and asserts the refusal.
+    ("F4-inexact", "src/vfdw_filter.c",
+     "\t\tcase FLOAT8OID:\n\t\t\treturn true;",
+     "\t\tcase FLOAT8OID:\n\t\tcase INT8OID:\n\t\t\treturn true;",
+     "standalone", "knnplan"),
+
+    # A field name becomes part of the query string.
+    #
+    # Without the check, a name carrying the query language's punctuation adds
+    # terms the table never declared - the server applies them without
+    # complaint, which vfilter records.
+    ("F5-fieldname", "src/vfdw_map_check.c",
+     "\t\t!vfdw_filter_name_is_safe(col->field))",
+     "\t\tfalse)",
+     "standalone", "knnplan"),
 ]
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

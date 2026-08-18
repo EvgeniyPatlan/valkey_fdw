@@ -25,6 +25,8 @@ CREATE FOREIGN TABLE kp (
     emb  vector(4)        OPTIONS (field 'emb', index_type 'vector'),
     tag  text             OPTIONS (field 'tag', index_type 'tag'),
     tagv vector(4)        OPTIONS (field 'tagv', index_type 'tag'),
+    n    integer          OPTIONS (field 'n', index_type 'numeric'),
+    big  bigint           OPTIONS (field 'big', index_type 'numeric'),
     dist double precision OPTIONS (distance 'true')
 ) SERVER kp_srv OPTIONS (tabletype 'vector', search_index 'kpidx');
 
@@ -132,10 +134,94 @@ EXECUTE p(5);
 RESET plan_cache_mode;
 DEALLOCATE p;
 
--- A WHERE clause. The rows it removes were already counted towards k, so the
--- answer would be fewer than k rows and not the k nearest matching ones.
--- Pushing it into the query language is 6.4.
+-- ---------------------------------------------------------------------------
+-- A WHERE clause is compiled into the search, or the query is refused.
+--
+-- Applying one above the scan instead would subtract rows from a set the
+-- server already cut to k, so the answer would be fewer than k rows and not
+-- the k nearest matching ones. The clauses stay in the plan as rechecks, which
+-- is safe only because each pushed term means EXACTLY what its clause means -
+-- test/regress/sql/vfilter.sql is where that exactness was measured.
+--
+-- The plan shows the filter's SHAPE with `$` for each bound, because a bound
+-- may be a Param and is not a plan-time fact. It is shown because a filter
+-- pushed wrongly returns k rows in order and looks exactly like one pushed
+-- rightly.
+-- ---------------------------------------------------------------------------
+EXPLAIN (COSTS OFF)
+SELECT k FROM kp WHERE n >= 3
+ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 5;
+
+EXPLAIN (COSTS OFF)
+SELECT k FROM kp WHERE n > 3
+ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 5;
+
+EXPLAIN (COSTS OFF)
+SELECT k FROM kp WHERE n < 3
+ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 5;
+
+EXPLAIN (COSTS OFF)
+SELECT k FROM kp WHERE n = 3
+ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 5;
+
+-- Two clauses become two terms, ANDed by the space between them.
+EXPLAIN (COSTS OFF)
+SELECT k FROM kp WHERE n >= 1 AND n < 10
+ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 5;
+
+-- The constant on the left. Which side the column is on decides which END of
+-- the range the bound is, and getting that backwards is a filter that returns
+-- rows nobody asked for.
+EXPLAIN (COSTS OFF)
+SELECT k FROM kp WHERE 3 < n
+ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 5;
+
+-- A parameterised bound, which is why the bounds travel as expressions.
+PREPARE pf(int) AS
+    SELECT k FROM kp WHERE n < $1
+    ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 5;
+SET plan_cache_mode = force_generic_plan;
+EXPLAIN (COSTS OFF) EXECUTE pf(5);
+RESET plan_cache_mode;
+DEALLOCATE pf;
+
+-- ---------------------------------------------------------------------------
+-- And what is not pushed, each refused rather than applied locally.
+-- ---------------------------------------------------------------------------
+
+-- A TAG field. The index tokenises it on its separator, so @tag:{a} matches a
+-- document whose field holds "a,b" while SQL `tag = 'a'` does not - a filter
+-- that is a SUPERSET, which is the direction the recheck cannot recover from.
 SELECT k FROM kp WHERE tag = 'a'
+ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 5;
+
+-- A bigint. A valkey-search NUMERIC is a double, so a value beyond 2^53 is
+-- rounded on the way into the index and two distinct values become one. The
+-- bound being small does not help: it is the STORED values that round.
+SELECT k FROM kp WHERE big = 3
+ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 5;
+
+-- <> has no range that means it.
+SELECT k FROM kp WHERE n <> 3
+ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 5;
+
+-- OR, which a space-separated list of terms cannot express.
+SELECT k FROM kp WHERE n = 1 OR n = 2
+ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 5;
+
+-- IS NULL, which is not a comparison a range can hold.
+SELECT k FROM kp WHERE n IS NULL
+ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 5;
+
+-- The KEY column, which is the most natural clause to write and is still
+-- refused: the index has no attribute for it, and narrowing by key is what
+-- the ordinary key path does on a table that is not a vector one.
+SELECT k FROM kp WHERE k = 'kp:1'
+ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 5;
+
+-- A bound that depends on the table itself would be a different filter per
+-- row, which one query string cannot express.
+SELECT k FROM kp WHERE n < dist
 ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 5;
 
 -- A join. The LIMIT bounds the join's output, not this scan's.
@@ -177,12 +263,37 @@ SELECT k FROM kp ORDER BY emb <-> emb LIMIT 5;
 -- scan of the target is planned, so all three now say what is wrong with the
 -- write.
 -- ---------------------------------------------------------------------------
-INSERT INTO kp VALUES ('v:1', '[1,0,0,0]', 'a', '[0,0,0,0]', 1.0);
+INSERT INTO kp VALUES ('v:1', '[1,0,0,0]', 'a', '[0,0,0,0]', 1, 1, 1.0);
 UPDATE kp SET tag = 'b';
 DELETE FROM kp;
 
 SELECT c.relname, pg_relation_is_updatable(c.oid, false) AS mask
 FROM pg_class c WHERE c.relname = 'kp';
+
+-- ---------------------------------------------------------------------------
+-- A FIELD NAME BECOMES PART OF THE QUERY, so one carrying the query
+-- language's punctuation is refused at the table rather than escaped.
+--
+-- The server accepts `@n:[1 1] @tag:{a}` written as one field name without
+-- complaint and applies both terms, so a name like this would ask something
+-- the table never declared. Refused rather than escaped, because
+-- valkey-search's grammar is not this tree's to model and a wrong escape is
+-- silent. On a hash table the same name is an argument rather than syntax, so
+-- nothing is refused there.
+-- ---------------------------------------------------------------------------
+CREATE FOREIGN TABLE kp_badname (
+    k text      OPTIONS (key 'true'),
+    e vector(4) OPTIONS (field 'emb} @n:[0 0', index_type 'vector')
+) SERVER kp_srv OPTIONS (tabletype 'vector', search_index 'kpidx');
+
+SELECT k FROM kp_badname ORDER BY e <-> '[1,0,0,0]'::vector LIMIT 1;
+
+CREATE FOREIGN TABLE kp_badname_hash (
+    k text OPTIONS (key 'true'),
+    e text OPTIONS (field 'emb} @n:[0 0')
+) SERVER kp_srv OPTIONS (tabletype 'hash', keyprefix 'kp:');
+
+EXPLAIN (COSTS OFF) SELECT * FROM kp_badname_hash;
 
 -- ---------------------------------------------------------------------------
 -- A table without index_type 'vector' has no column a search could rank by,

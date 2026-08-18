@@ -118,7 +118,7 @@ suites_for_topology() {
         fault)      echo "smoke fault wfault resp wbuf overlay script dml" ;;
 
         cluster)    echo "smoke cluster" ;;
-        search)     echo "smoke vsearch knn" ;;
+        search)     echo "smoke vsearch vfilter knn" ;;
 
         # tls, acl and search bring their topology up and confirm the
         # extension loads against it, but have no feature suite yet: the

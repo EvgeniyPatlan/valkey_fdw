@@ -27,6 +27,7 @@
  */
 #include "vfdw_scan.h"
 
+#include "vfdw_filter.h"
 #include "vfdw_knn.h"
 
 #include "catalog/pg_operator_d.h"
@@ -560,18 +561,53 @@ vfdw_pattern_node(char *pattern)
  */
 static List *
 vfdw_plan_private(VfdwScanStrategy strategy, List *keys, Node *pattern,
-				  const VfdwKnnPlan *knn)
+				  const VfdwKnnPlan *knn, List *filter)
 {
 	List	   *priv;
 
-	/* list_make5 is as wide as the macros go; the sixth is appended. */
+	/* list_make5 is as wide as the macros go; the rest are appended. */
 	priv = list_make5(makeInteger((int) strategy),
 					  keys,
 					  pattern,
 					  knn != NULL ? (Node *) makeString(pstrdup(knn->field)) : NULL,
 					  knn != NULL ? (Node *) makeString(pstrdup(knn->metric)) : NULL);
 
-	return lappend(priv, makeInteger(knn != NULL ? knn->k : 0));
+	priv = lappend(priv, makeInteger(knn != NULL ? knn->k : 0));
+	return lappend(priv, filter);
+}
+
+/*
+ * A vector table's whole access-path choice: the search, or a refusal.
+ *
+ * There is no keyspace to walk, no key to look up, and no qual that merely
+ * narrows - the WHERE is part of the search or the query is refused.
+ *
+ * Matched a second time here, having already been matched in GetForeignPaths
+ * to decide whether the path could claim an ordering. The matcher reads root,
+ * the relation and the map and nothing else, and none of the three change
+ * between the two callbacks, so the two calls cannot disagree. The alternative
+ * - carrying the result on the path - would put a non-Node struct in a field
+ * the planner copies.
+ */
+static List *
+vfdw_plan_search(PlannerInfo *root, RelOptInfo *baserel, VfdwTableMap *map,
+				 List **fdw_exprs)
+{
+	VfdwKnnPlan knn;
+	List	   *filter;
+
+	if (!vfdw_knn_match(root, baserel, map, &knn))
+		vfdw_knn_refuse(root, baserel, map);
+
+	/*
+	 * The query vector FIRST and the filter bounds after it, because the
+	 * executor pairs them back by position: element zero is the vector, and
+	 * what follows lines up with the encoded terms.
+	 */
+	*fdw_exprs = list_make1(knn.qvec);
+	filter = vfdw_filter_encode(knn.filter, fdw_exprs);
+
+	return vfdw_plan_private(VFDW_SCAN_KNN, NIL, NULL, &knn, filter);
 }
 
 List *
@@ -579,30 +615,11 @@ vfdw_scan_plan(PlannerInfo *root, RelOptInfo *baserel, VfdwTableMap *map,
 			   List *clauses, List **fdw_exprs)
 {
 	List	   *keys = NIL;
-	VfdwKnnPlan knn;
 
 	*fdw_exprs = NIL;
 
-	/*
-	 * A vector table answers one shape and refuses the rest, so this is the
-	 * whole of its access-path choice: no keyspace to walk, no key to look
-	 * up, and nothing a qual could narrow.
-	 *
-	 * Matched a second time here, having already been matched in
-	 * GetForeignPaths to decide whether the path could claim an ordering.
-	 * The matcher reads root, the relation and the map and nothing else, and
-	 * none of the three change between the two callbacks, so the two calls
-	 * cannot disagree. The alternative - carrying the result on the path -
-	 * would put a non-Node struct in a field the planner copies.
-	 */
 	if (map->tabletype == VFDW_TABLE_VECTOR)
-	{
-		if (!vfdw_knn_match(root, baserel, map, &knn))
-			vfdw_knn_refuse(root, baserel, map);
-
-		*fdw_exprs = list_make1(knn.qvec);
-		return vfdw_plan_private(VFDW_SCAN_KNN, NIL, NULL, &knn);
-	}
+		return vfdw_plan_search(root, baserel, map, fdw_exprs);
 
 	/*
 	 * A singleton table already names its key, and no qual may displace it.
@@ -613,7 +630,7 @@ vfdw_scan_plan(PlannerInfo *root, RelOptInfo *baserel, VfdwTableMap *map,
 	if (map->singleton_key != NULL)
 		return vfdw_plan_private(VFDW_SCAN_SINGLETON,
 								 list_make1(makeString(pstrdup(map->singleton_key))),
-								 NULL, NULL);
+								 NULL, NULL, NIL);
 
 	/*
 	 * Whether a named key belongs to a keyset table is a question only the
@@ -627,12 +644,12 @@ vfdw_scan_plan(PlannerInfo *root, RelOptInfo *baserel, VfdwTableMap *map,
 	 * does not bound.
 	 */
 	if (vfdw_plan_find_keys(baserel, map, clauses, &keys))
-		return vfdw_plan_private(VFDW_SCAN_KEYS, keys, NULL, NULL);
+		return vfdw_plan_private(VFDW_SCAN_KEYS, keys, NULL, NULL, NIL);
 
 	return vfdw_plan_private(VFDW_SCAN_KEYSPACE, NIL,
 							 vfdw_pattern_node(vfdw_plan_scan_pattern(map,
 																	  vfdw_plan_find_like_prefix(baserel, map, clauses))),
-							 NULL);
+							 NULL, NIL);
 }
 
 List *
@@ -680,6 +697,12 @@ int
 vfdw_plan_knn_k(List *fdw_private)
 {
 	return intVal(list_nth(fdw_private, VFDW_PRIV_KNN_K));
+}
+
+List *
+vfdw_plan_knn_filter(List *fdw_private)
+{
+	return (List *) list_nth(fdw_private, VFDW_PRIV_KNN_FILTER);
 }
 
 const char *

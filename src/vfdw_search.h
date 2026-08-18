@@ -55,6 +55,24 @@ typedef struct VfdwKnnScan
 	ExprState  *qvec;			/* the query vector, evaluated when run */
 	ExprContext *econtext;
 
+	/*
+	 * The WHERE clause, compiled at plan time and rendered per pass.
+	 *
+	 * terms and bounds are the same length and are paired by position: the
+	 * terms came from fdw_private and the bounds from fdw_exprs, because a
+	 * bound may be a Param and only fdw_exprs is renumbered.
+	 */
+	List	   *terms;
+	List	   *bounds;
+
+	/*
+	 * A bound evaluated to NULL, so the comparison is NULL for every row and
+	 * the query has no rows at all. Not the same state as an exhausted search
+	 * and not spelled the same way, but it reaches the same end: no tuple,
+	 * ever, and no command sent (invariant I5).
+	 */
+	bool		empty;
+
 	valkeyReply *reply;
 	int			row;			/* rows already emitted */
 	bool		ran;

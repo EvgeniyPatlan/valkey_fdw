@@ -385,7 +385,7 @@ anything that would need two is refused when it is issued — not discovered at
 | `PREPARE TRANSACTION` for a transaction that wrote | `0A000` |
 | `TRUNCATE` | core's "cannot truncate foreign table" |
 | `MERGE` | core's own refusal |
-| A query against a `tabletype 'vector'` table that is not the one search shape | `0A000` |
+| A query against a `tabletype 'vector'` table whose shape or `WHERE` a search cannot express | `0A000` |
 | Any write to a `tabletype 'vector'` table, and `ANALYZE` of one | `0A000` |
 | A search against a server declared `cluster 'true'` | `0A000` |
 
@@ -605,20 +605,50 @@ ORDER BY emb <-> '[0.1, 0.2, ...]'::vector
 LIMIT 10;
 ```
 
-**That is the whole of the shape it answers**, and every other query against
-such a table is refused with a message naming the part that is missing: no
-`ORDER BY`, an `ORDER BY` that is not a distance, `DESC`, no `LIMIT`, a `LIMIT`
-that is not a plan-time constant, a `WHERE`, a join, or a second table in the
-`FROM` list.
+**That is the shape it answers**, and every other query against such a table
+is refused with a message naming the part that is missing: no `ORDER BY`, an
+`ORDER BY` that is not a distance, `DESC`, no `LIMIT`, a `LIMIT` that is not a
+plan-time constant, a join, or a second table in the `FROM` list.
 
 The narrowness is the point. A top-K query is a **ranking**, not a filter, so
-`k` only means anything if the scan's rows go straight to the `LIMIT`. A
-`WHERE` applied after the search would return fewer than `k` rows, and not the
-`k` nearest *matching* ones — the rows needed to answer that were never
-fetched. valkey-search can pre-filter inside the query language, which is the
-correct place for it; that is not implemented, so a query with a `WHERE` is
-refused rather than answered wrongly. `OFFSET` is fine: it is folded into `k`
-and the rows are discarded above the scan.
+`k` only means anything if the scan's rows go straight to the `LIMIT`.
+`OFFSET` is fine: it is folded into `k` and the rows are discarded above the
+scan.
+
+#### A `WHERE` clause is compiled into the search, or the query is refused
+
+valkey-search applies a filter **before** the nearest-neighbour search, so the
+`k` rows it returns are the `k` nearest of the *filtered* set. A clause this
+wrapper cannot compile therefore fails the whole query, because applying it
+above the scan instead subtracts rows from a set that was already cut to `k` —
+the answer would be fewer than `k` rows, and not the `k` nearest matching ones.
+
+```sql
+SELECT key, dist FROM doc_knn
+WHERE score >= 10 AND score < 100          -- pushed into the search
+ORDER BY emb <-> :q LIMIT 10;
+```
+
+What compiles: `=`, `<`, `<=`, `>`, `>=` against a column that declares
+`index_type 'numeric'` and is of type `smallint`, `integer`, `real` or
+`double precision`. The bound may be a parameter. Several clauses become
+several terms, ANDed. `EXPLAIN` shows the filter's shape with `$` for each
+bound, which is the only place a pushdown is visible at all.
+
+What is refused, and why each one is not merely unimplemented:
+
+| Refused | Because |
+|---|---|
+| `=` on a `tag` column | A `TAG` field is tokenised on its separator, so `@tag:{a}` matches a document whose field holds `a,b` while SQL `tag = 'a'` does not. The filter would be a **superset**, and a superset is the direction a recheck cannot recover from |
+| `bigint` and `numeric` columns | A valkey-search `NUMERIC` is a double, so a value beyond 2⁵³ rounds on the way into the index and two distinct values become one. A small bound does not help — it is the *stored* values that round |
+| `<>`, `OR`, `IS NULL`, functions | No range means them |
+| A bound referring to the table itself | That is a different filter per row, which one query string cannot express |
+
+A field name used on a vector table may hold only letters, digits, `_`, `-`
+and `.`, because it becomes part of the query string: the server accepts
+`@a:[1 1] @b:{x}` written as one field name and applies both terms. Refused
+rather than escaped — valkey-search's grammar is not this wrapper's to model,
+and a wrong escape is a query that silently means something else.
 
 **pgvector is not required and not linked.** The three operators are
 recognised by NAME — `<->` is L2, `<=>` is COSINE, `<#>` is inner product —
@@ -807,7 +837,7 @@ it on is not.
 | `position` | boolean | `false` | Column holds the member's zero-based index in its list; read-only, needs `tabletype 'list'` and `integer` or `bigint` | no |
 | `ttl` | boolean | `false` | Column holds the paired field's time to live, as an `interval`; needs `tabletype 'hash'`, a `field`, and Valkey 9+ | no |
 | `distance` | boolean | `false` | Column receives the search's distance for the row; needs `tabletype 'vector'` | no |
-| `index_type` | enum | — | `tag`, `numeric` or `vector`; `vector` marks the column a KNN query may rank by. `tag` and `numeric` are accepted and not yet consulted | no |
+| `index_type` | enum | — | `tag`, `numeric` or `vector`. `vector` marks the column a KNN query may rank by; `numeric` marks one a `WHERE` may be pushed down on. `tag` is accepted and not yet consulted | no |
 
 <!-- options:end -->
 

@@ -74,6 +74,7 @@ typedef enum VfdwScanStrategy
 #define VFDW_PRIV_KNN_FIELD	3	/* String, the indexed vector attribute */
 #define VFDW_PRIV_KNN_METRIC 4	/* String, what the OPERATOR measures */
 #define VFDW_PRIV_KNN_K		5	/* Integer, rows to ask the server for */
+#define VFDW_PRIV_KNN_FILTER 6	/* List, the compiled WHERE terms */
 
 /*
  * Choose the access path and encode it for the executor and for EXPLAIN.
@@ -90,6 +91,7 @@ extern const char *vfdw_plan_pattern(List *fdw_private);
 extern const char *vfdw_plan_knn_field(List *fdw_private);
 extern const char *vfdw_plan_knn_metric(List *fdw_private);
 extern int	vfdw_plan_knn_k(List *fdw_private);
+extern List *vfdw_plan_knn_filter(List *fdw_private);
 
 /*
  * The MATCH glob a table is confined to, before any qual narrows it further.

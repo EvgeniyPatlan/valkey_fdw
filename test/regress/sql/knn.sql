@@ -24,7 +24,7 @@ SELECT reply_type FROM valkey_fdw_test_probe('kn_srv', 0,
     'FT.CREATE', 'knidx', 'ON', 'HASH', 'PREFIX', '1', 'kn:', 'SCHEMA',
     'emb', 'VECTOR', 'FLAT', '6', 'TYPE', 'FLOAT32', 'DIM', '4',
     'DISTANCE_METRIC', 'L2',
-    'tag', 'TAG');
+    'tag', 'TAG', 'n', 'NUMERIC');
 
 -- ---------------------------------------------------------------------------
 -- Seeded through the SERVER, not through a table.
@@ -45,13 +45,13 @@ SELECT valkey_fdw_test_vec_from_text('[1,0,0,0]') = '\x0000803f00000000000000000
 
 SELECT num AS fields_set_1 FROM valkey_fdw_test_probe('kn_srv', 0, 'HSET',
     'kn:1', 'emb', valkey_fdw_test_vec_from_text('[1,0,0,0]'), 'tag', 'a',
-    'note', 'nearest');
+    'note', 'nearest', 'n', '10');
 SELECT num AS fields_set_2 FROM valkey_fdw_test_probe('kn_srv', 0, 'HSET',
     'kn:2', 'emb', valkey_fdw_test_vec_from_text('[2,0,0,0]'), 'tag', 'a',
-    'note', 'middle');
+    'note', 'middle', 'n', '20');
 SELECT num AS fields_set_3 FROM valkey_fdw_test_probe('kn_srv', 0, 'HSET',
     'kn:3', 'emb', valkey_fdw_test_vec_from_text('[5,0,0,0]'), 'tag', 'b',
-    'note', 'far');
+    'note', 'far', 'n', '30');
 
 -- The index is populated asynchronously, so the suite waits for it to say so
 -- rather than sleeping for a guess. num_docs is element 10 of FT.INFO.
@@ -72,6 +72,7 @@ CREATE FOREIGN TABLE kn (
     emb  vector(4)        OPTIONS (field 'emb', index_type 'vector'),
     tag  text             OPTIONS (field 'tag', index_type 'tag'),
     note text             OPTIONS (field 'note'),
+    n    integer          OPTIONS (field 'n', index_type 'numeric'),
     dist double precision OPTIONS (distance 'true')
 ) SERVER kn_srv OPTIONS (tabletype 'vector', search_index 'knidx');
 
@@ -112,6 +113,60 @@ SELECT count(*) AS rows_returned FROM (
 -- OFFSET, which was folded into k at plan time: the server is asked for five
 -- and the Limit node above discards the first two.
 SELECT k FROM kn ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 3 OFFSET 2;
+
+-- ---------------------------------------------------------------------------
+-- A PRE-FILTER, which is the case the whole of 6.4 turns on.
+--
+-- The filter runs BEFORE the search, so k applies to the filtered set. The
+-- numbers below are what makes that visible rather than assumed: n = 10, 20
+-- and 30 on the documents at distance 0, 1 and 16.
+-- ---------------------------------------------------------------------------
+
+-- k = 2 with a filter that admits two documents returns those two, and their
+-- distances are the distances within the filtered set - not two of the three
+-- global nearest.
+SELECT k, n, dist FROM kn WHERE n >= 20
+ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 2;
+
+-- THE CASE A LOCAL FILTER WOULD GET WRONG. k = 1 and a filter that excludes
+-- the nearest document: pushed down, the answer is the nearest of the rest.
+-- Applied above the scan it would be no rows at all, because the one row the
+-- server returned would be the one the filter removes.
+SELECT k, n, dist FROM kn WHERE n > 10
+ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 1;
+
+-- Every operator, against a keyspace small enough to check by reading.
+SELECT k, n FROM kn WHERE n = 20
+ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 3;
+SELECT k, n FROM kn WHERE n < 30
+ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 3;
+SELECT k, n FROM kn WHERE n <= 20
+ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 3;
+SELECT k, n FROM kn WHERE n >= 20 AND n < 30
+ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 3;
+
+-- The constant on the left, which decides which END of the range it is.
+SELECT k, n FROM kn WHERE 20 < n
+ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 3;
+
+-- A filter that admits nothing is an empty result, not an error.
+SELECT k, n FROM kn WHERE n > 99
+ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 3;
+
+-- A parameterised bound, evaluated when the scan runs. Two executions of one
+-- generic plan, two filters, two answers.
+PREPARE qf(int) AS
+    SELECT k, n FROM kn WHERE n >= $1
+    ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 3;
+SET plan_cache_mode = force_generic_plan;
+EXECUTE qf(10);
+EXECUTE qf(30);
+
+-- A NULL bound makes the comparison NULL for every row, so the query has no
+-- rows - and nothing is sent, because there is no filter that means "nothing".
+EXECUTE qf(NULL);
+RESET plan_cache_mode;
+DEALLOCATE qf;
 
 -- ---------------------------------------------------------------------------
 -- The query vector as a parameter, which is the case the design was written

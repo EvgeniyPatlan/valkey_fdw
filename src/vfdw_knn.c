@@ -55,6 +55,7 @@
 #include "foreign/foreign.h"
 #include "utils/lsyscache.h"
 
+#include "vfdw_filter.h"
 #include "vfdw_option.h"
 
 /*
@@ -263,11 +264,13 @@ vfdw_knn_scan_owns_limit(PlannerInfo *root, RelOptInfo *baserel)
 		return false;
 
 	/*
-	 * Every restriction clause on this relation is applied above the scan and
-	 * would take rows out of the k the server returned. 6.4 pushes what it
-	 * can into the query language; until then having any is a refusal.
+	 * A join clause is still a refusal: it is applied above the scan by
+	 * definition, and the rows it removes were already counted towards k. The
+	 * relation's OWN clauses are a different matter - they are compiled into
+	 * the search itself, or the query is refused - and that is decided by
+	 * vfdw_filter_compile rather than here.
 	 */
-	if (baserel->baserestrictinfo != NIL || baserel->joininfo != NIL)
+	if (baserel->joininfo != NIL)
 		return false;
 
 	for (rti = 1; rti < root->simple_rel_array_size; rti++)
@@ -284,15 +287,46 @@ vfdw_knn_scan_owns_limit(PlannerInfo *root, RelOptInfo *baserel)
 	return root->limit_tuples >= 1 && root->limit_tuples <= (double) INT_MAX;
 }
 
+/*
+ * The relation's own restriction clauses, as bare expressions.
+ *
+ * From baserestrictinfo rather than from GetForeignPlan's scan_clauses,
+ * because the matcher runs in GetForeignPaths too and there is no plan yet.
+ * The two are the same clauses; only the wrapper differs.
+ */
+static List *
+vfdw_knn_clauses(RelOptInfo *baserel)
+{
+	List	   *out = NIL;
+	ListCell   *lc;
+
+	foreach(lc, baserel->baserestrictinfo)
+		out = lappend(out, ((RestrictInfo *) lfirst(lc))->clause);
+
+	return out;
+}
+
 bool
 vfdw_knn_match(PlannerInfo *root, RelOptInfo *baserel, VfdwTableMap *map,
 			   VfdwKnnPlan *out)
 {
+	const char *why;
+
 	if (map->tabletype != VFDW_TABLE_VECTOR)
 		return false;
 	if (!vfdw_knn_scan_owns_limit(root, baserel))
 		return false;
 	if (!vfdw_knn_match_order(root, baserel, map, out))
+		return false;
+
+	/*
+	 * The filter last, because a query with no ORDER BY is not a search
+	 * whatever its WHERE says. An empty clause list compiles to NIL terms,
+	 * which is not a failure - NULL with a reason is.
+	 */
+	out->filter = vfdw_filter_compile(root, baserel, map,
+									  vfdw_knn_clauses(baserel), &why);
+	if (why != NULL)
 		return false;
 
 	out->k = (int) root->limit_tuples;
@@ -310,6 +344,7 @@ static const char *
 vfdw_knn_missing(PlannerInfo *root, RelOptInfo *baserel, VfdwTableMap *map)
 {
 	VfdwKnnPlan scratch;
+	const char *why;
 
 	if (root->query_pathkeys == NIL)
 		return "the query has no ORDER BY, so there is no query vector to "
@@ -319,9 +354,14 @@ vfdw_knn_missing(PlannerInfo *root, RelOptInfo *baserel, VfdwTableMap *map)
 		return "the ORDER BY is not \"<vector column> <-> <expression>\" "
 			"ascending, using a column that declares index_type 'vector'";
 
-	if (baserel->baserestrictinfo != NIL || baserel->joininfo != NIL)
-		return "the query has a WHERE clause, which would remove rows the "
-			"search already counted towards k";
+	if (baserel->joininfo != NIL)
+		return "the query joins this table to another, so the LIMIT bounds "
+			"the join's output rather than this scan's";
+
+	(void) vfdw_filter_compile(root, baserel, map, vfdw_knn_clauses(baserel),
+							   &why);
+	if (why != NULL)
+		return why;
 
 	if (root->parse->commandType != CMD_SELECT)
 		return "only SELECT reads a vector table";
