@@ -452,6 +452,22 @@ MUTATIONS = [
      "\tif (i + 1 >= op->npacked)",
      "standalone", "legacy"),
 
+    # A bulk DELETE reads through the write buffer its own rows are going
+    # into, so the overlay index over that buffer must be extended rather than
+    # thrown away. Rebuilding whenever the buffer moved - which every append
+    # does - made the scan rebuild an index over every operation so far, once
+    # per row: 16000 rows took 25 seconds and 20000 exceeded the command
+    # timeout, while the same INSERT stayed in milliseconds.
+    #
+    # bulk counts rebuilds rather than timing the statement, so this goes red
+    # on the mechanism instead of on how fast the machine is.
+    ("B1-overlay", "src/vfdw_overlay.c",
+     "\tif (vfdw_overlay_have &&\n"
+     "\t\tvfdw_overlay_built_shrink_gen == vfdw_wbuf_shrink_generation())",
+     "\tif (false &&\n"
+     "\t\tvfdw_overlay_built_shrink_gen == vfdw_wbuf_shrink_generation())",
+     "standalone", "bulk"),
+
     # A packed zset takes members, not scores. Restoring WITHSCORES makes the
     # array's shape follow the negotiated protocol rather than the data: RESP2
     # returns member and score alternating, RESP3 a nested pair per member

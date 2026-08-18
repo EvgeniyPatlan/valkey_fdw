@@ -19,7 +19,7 @@ OBJS = $(SRCS:.c=.o)
 
 # Regression suites. Each is test/regress/sql/<name>.sql with expected output
 # in test/regress/expected/<name>.out.
-REGRESS = smoke probe options ddl mapping scan fetch legacy position ttl ttl_absent io pool leak val wbuf modify script dml overlay tls probe_tls acl probe_acl wfault resp cluster vsearch priv
+REGRESS = smoke probe options ddl mapping scan fetch legacy position ttl ttl_absent io bulk pool leak val wbuf modify script dml overlay tls probe_tls acl probe_acl wfault resp cluster vsearch priv
 #
 # Both extension names are written out rather than interpolated from
 # $(EXTENSION). PGXS expands this variable into the pg_regress command line

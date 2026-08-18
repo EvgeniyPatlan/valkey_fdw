@@ -559,3 +559,14 @@ REVOKE ALL ON FUNCTION valkey_fdw_test_flush(text) FROM PUBLIC;
 
 COMMENT ON FUNCTION valkey_fdw_test_flush(text)
 IS 'FLUSHDB, but only on a server this harness marked as disposable';
+
+CREATE FUNCTION valkey_fdw_test_overlay_stats(
+    OUT rebuilds bigint,
+    OUT extends  bigint)
+RETURNS record
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT VOLATILE;
+REVOKE ALL ON FUNCTION valkey_fdw_test_overlay_stats() FROM PUBLIC;
+
+COMMENT ON FUNCTION valkey_fdw_test_overlay_stats()
+IS 'How many times the overlay index was rebuilt from scratch, and how many times extended in place';

@@ -46,6 +46,21 @@ static VfdwWriteOp *vfdw_wbuf_head = NULL;
 static VfdwWriteOp *vfdw_wbuf_tail = NULL;
 static int	vfdw_wbuf_nlive = 0;
 static uint64 vfdw_wbuf_gen = 0;
+
+/*
+ * Bumped only when the operation list SHRINKS - a subtransaction rollback that
+ * unlinks operations, or a reset that drops them all.
+ *
+ * The overlay caches an index keyed on vfdw_wbuf_gen, which advances on every
+ * append too, so a reader could tell that the buffer had moved but not how.
+ * "It only grew" is the case that matters: the index can then be extended from
+ * where it stopped instead of thrown away, which is the difference between one
+ * pass over a DELETE's rows and one pass per row.
+ *
+ * A shrink, by contrast, may have unlinked operations the index still points
+ * at, so nothing short of a rebuild is safe there.
+ */
+static uint64 vfdw_wbuf_shrink_gen = 0;
 static VfdwWriteUnit vfdw_wbuf_unit;
 
 /*
@@ -426,7 +441,10 @@ vfdw_wbuf_subxact(SubXactEvent event, SubTransactionId mySubid,
 				dropped = true;
 			}
 			if (dropped)
+			{
 				vfdw_wbuf_gen++;
+				vfdw_wbuf_shrink_gen++;
+			}
 			vfdw_wbuf_rebind_after_truncate(curlevel);
 			vfdw_ledger_rebuild();
 			vfdw_overlay_rebuild();
@@ -477,6 +495,7 @@ vfdw_wbuf_reset(void)
 	vfdw_wbuf_unit.bound = false;
 	vfdw_wbuf_unit.level = 0;
 	vfdw_wbuf_gen++;
+	vfdw_wbuf_shrink_gen++;
 
 	/*
 	 * The ledger points into the buffer and must go first: resetting the
@@ -518,6 +537,12 @@ vfdw_wbuf_generation(void)
 	return vfdw_wbuf_gen;
 }
 
+uint64
+vfdw_wbuf_shrink_generation(void)
+{
+	return vfdw_wbuf_shrink_gen;
+}
+
 const VfdwWriteUnit *
 vfdw_wbuf_get_unit(void)
 {
@@ -528,4 +553,10 @@ const VfdwWriteOp *
 vfdw_wbuf_first(void)
 {
 	return vfdw_wbuf_head;
+}
+
+const VfdwWriteOp *
+vfdw_wbuf_last(void)
+{
+	return vfdw_wbuf_tail;
 }

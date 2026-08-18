@@ -102,7 +102,7 @@ suites_for_topology() {
         # priv runs last: it drops and re-creates valkey_fdw_test to assert the
         # split between the two extensions, so anything after it would be
         # running against a catalog this suite briefly emptied.
-        standalone) echo "smoke probe options ddl mapping scan fetch legacy position ${ttl_suite} io pool leak val wbuf modify script dml overlay priv" ;;
+        standalone) echo "smoke probe options ddl mapping scan fetch legacy position ${ttl_suite} io pool leak val wbuf modify script dml overlay bulk priv" ;;
         # smoke is no longer topology-neutral: now that it really scans, it
         # needs a server it can reach in plaintext. The tls suite covers the
         # load-and-connect path for this topology itself.

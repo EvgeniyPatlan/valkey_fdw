@@ -258,7 +258,11 @@ suite green is reported as a failure of the check, not a success of the code.
 `COPY FROM` buffers the whole transaction in memory and applies it as one
 unit, so a single `COPY` of a very large file is bounded by `write_max_ops`
 (10000 by default) and `write_max_bytes` (64 MB), and will be refused with
-`54000` rather than partially applied. Chunk large loads into transactions:
+`54000` rather than partially applied — nothing is sent, so a refusal never
+leaves a load half-applied. Raise `write_max_ops` on the server if you want
+larger units; a 20000-row load and a 20000-row `DELETE` are each one round
+trip and a few hundred milliseconds. Otherwise chunk large loads into
+transactions:
 
 ```sql
 -- one transaction per chunk; each is atomic on its own

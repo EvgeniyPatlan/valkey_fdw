@@ -257,6 +257,16 @@ extern bool vfdw_wbuf_is_empty(void);
 extern int	vfdw_wbuf_live_ops(void);
 extern uint64 vfdw_wbuf_alloc_bytes(void);
 extern uint64 vfdw_wbuf_generation(void);
+
+/*
+ * Advances only when the list SHRINKS. A reader whose cached index survives
+ * appends can use this to tell "only grew" from "operations went away", which
+ * is what lets it extend rather than rebuild. See the definition.
+ */
+extern uint64 vfdw_wbuf_shrink_generation(void);
+
+/* The newest live operation, or NULL. */
+extern const VfdwWriteOp *vfdw_wbuf_last(void);
 extern const VfdwWriteUnit *vfdw_wbuf_get_unit(void);
 
 /* Diagnostics only: walk with op->next. */

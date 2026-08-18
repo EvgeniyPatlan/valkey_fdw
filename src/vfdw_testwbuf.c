@@ -43,6 +43,7 @@
 #include "vfdw_ledger.h"
 #include "vfdw_opcode.h"
 #include "vfdw_script.h"
+#include "vfdw_overlay.h"
 #include "vfdw_wbuf.h"
 
 PG_FUNCTION_INFO_V1(valkey_fdw_test_wbuf_stats);
@@ -349,6 +350,36 @@ valkey_fdw_test_wbuf_targets(PG_FUNCTION_ARGS)
 	}
 
 	return (Datum) 0;
+}
+
+/*
+ * valkey_fdw_test_overlay_stats() -> how the read-your-own-writes index moved
+ *
+ * The property a bulk write has to hold is that its scan does not throw the
+ * index away per row. That is a COUNT rather than a duration: asserting the
+ * wall clock would be asserting something about this machine, and the same
+ * quadratic would pass on a fast one.
+ */
+PG_FUNCTION_INFO_V1(valkey_fdw_test_overlay_stats);
+
+Datum
+valkey_fdw_test_overlay_stats(PG_FUNCTION_ARGS)
+{
+	Datum		values[2];
+	bool		nulls[2] = {false, false};
+	TupleDesc	tupdesc;
+	uint64		rebuilds;
+	uint64		extends;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "valkey_fdw_test_overlay_stats: return type is not a record");
+	tupdesc = BlessTupleDesc(tupdesc);
+
+	vfdw_overlay_index_stats(&rebuilds, &extends);
+	values[0] = Int64GetDatum((int64) rebuilds);
+	values[1] = Int64GetDatum((int64) extends);
+
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
 
 Datum

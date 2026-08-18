@@ -116,4 +116,11 @@ extern HeapTuple vfdw_overlay_iter_next(VfdwOverlayIter *it,
 /* Dropped with the buffer; see vfdw_wbuf_reset. */
 extern void vfdw_overlay_reset(void);
 
+/*
+ * How many times the index was rebuilt from scratch, and how many times it was
+ * extended in place. A bulk DELETE's scan must not rebuild per row; see the
+ * definition of vfdw_overlay_build.
+ */
+extern void vfdw_overlay_index_stats(uint64 *rebuilds, uint64 *extends);
+
 #endif							/* VFDW_OVERLAY_H */

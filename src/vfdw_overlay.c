@@ -54,6 +54,25 @@ typedef struct VfdwOverlayEntry
 static MemoryContext vfdw_overlay_cxt = NULL;
 static HTAB *vfdw_overlay_tab = NULL;
 static uint64 vfdw_overlay_built_gen = 0;
+
+/*
+ * What the index was built against, beyond the generation: the shrink counter
+ * that says whether anything indexed can have gone away, and the last
+ * operation recorded, which is where an extension resumes.
+ */
+static uint64 vfdw_overlay_built_shrink_gen = 0;
+static const VfdwWriteOp *vfdw_overlay_built_tail = NULL;
+
+/*
+ * How the index has been brought up to date, counted for the suites.
+ *
+ * The property worth asserting is not how long a bulk DELETE takes - that is a
+ * measurement of the machine - but how many times its scan threw the index
+ * away. One rebuild and n extensions is linear; n rebuilds is the quadratic
+ * this counter exists to make visible.
+ */
+static uint64 vfdw_overlay_rebuilds = 0;
+static uint64 vfdw_overlay_extends = 0;
 static bool vfdw_overlay_have = false;
 
 static uint32
@@ -90,6 +109,8 @@ vfdw_overlay_reset(void)
 	vfdw_overlay_tab = NULL;
 	vfdw_overlay_have = false;
 	vfdw_overlay_built_gen = 0;
+	vfdw_overlay_built_shrink_gen = 0;
+	vfdw_overlay_built_tail = NULL;
 }
 
 /*
@@ -138,12 +159,24 @@ vfdw_overlay_record(const VfdwWriteOp *op)
 }
 
 /*
- * Build the index, if the buffer has moved since it was last built.
+ * Bring the index up to date with the buffer.
  *
- * Keyed off vfdw_wbuf_generation rather than rebuilt on every append: the
- * generation advances when the operation list changes, which is exactly when
- * this is stale, and a savepoint rollback advances it too. Rebuilding per
- * scan call would be correct and quadratic.
+ * Keyed off vfdw_wbuf_generation, which advances whenever the operation list
+ * changes - including on every append, because an index that stayed "fresh"
+ * across a DELETE's own appends let the next statement read a keyspace view
+ * that predated them.
+ *
+ * THAT CORRECTNESS FIX MADE THIS QUADRATIC, which is the reason for the second
+ * generation. A DELETE appends an operation per row and its scan consults the
+ * overlay per row, so "the buffer moved, throw the index away" rebuilt an
+ * index over every operation so far, once per row: 4000 rows took 18 seconds
+ * and 10000 exceeded the command timeout, while the same INSERT stayed at
+ * milliseconds because nothing reads through the overlay on the way in.
+ *
+ * So a buffer that only GREW is extended from where the last build stopped,
+ * which is one pass over the operations in total. Only a shrink - a
+ * subtransaction rollback, or a reset - can invalidate what is already
+ * indexed, and vfdw_wbuf_shrink_generation is what says one happened.
  */
 static void
 vfdw_overlay_build(void)
@@ -154,6 +187,26 @@ vfdw_overlay_build(void)
 	if (vfdw_overlay_have &&
 		vfdw_overlay_built_gen == vfdw_wbuf_generation())
 		return;
+
+	/*
+	 * Only appends since the last build: extend rather than rebuild. The tail
+	 * recorded then is still linked, because nothing has been unlinked, so its
+	 * successor is the first operation this index has not seen.
+	 */
+	if (vfdw_overlay_have &&
+		vfdw_overlay_built_shrink_gen == vfdw_wbuf_shrink_generation())
+	{
+		for (op = (vfdw_overlay_built_tail != NULL
+				   ? vfdw_overlay_built_tail->next
+				   : vfdw_wbuf_first());
+			 op != NULL; op = op->next)
+			vfdw_overlay_record(op);
+
+		vfdw_overlay_built_tail = vfdw_wbuf_last();
+		vfdw_overlay_built_gen = vfdw_wbuf_generation();
+		vfdw_overlay_extends++;
+		return;
+	}
 
 	vfdw_overlay_reset();
 
@@ -175,7 +228,17 @@ vfdw_overlay_build(void)
 		vfdw_overlay_record(op);
 
 	vfdw_overlay_built_gen = vfdw_wbuf_generation();
+	vfdw_overlay_built_shrink_gen = vfdw_wbuf_shrink_generation();
+	vfdw_overlay_built_tail = vfdw_wbuf_last();
 	vfdw_overlay_have = true;
+	vfdw_overlay_rebuilds++;
+}
+
+void
+vfdw_overlay_index_stats(uint64 *rebuilds, uint64 *extends)
+{
+	*rebuilds = vfdw_overlay_rebuilds;
+	*extends = vfdw_overlay_extends;
 }
 
 bool
