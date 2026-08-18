@@ -1,0 +1,17 @@
+-- valkey_fdw 0.1 -> 0.2
+--
+-- NO CATALOG CHANGE, deliberately, and the file exists anyway.
+--
+-- Everything 0.2 does differently it does in the shared library: a hash table
+-- fetches the fields it maps rather than the whole hash, a keyset point lookup
+-- is one SISMEMBER, singleton and keyset tables are counted at plan time, a
+-- ttl column reads and writes a field's expiry, a packed row is written whole,
+-- and a list member's position is readable. None of that is a catalog object.
+-- The wrapper's five functions are the same five, with the same signatures.
+--
+-- An empty upgrade script is not a missing one. Without it `ALTER EXTENSION
+-- valkey_fdw UPDATE` has no path from 0.1 and fails, so an installation that
+-- took 0.1 would have to be dropped and recreated - which for a foreign data
+-- wrapper means dropping every server, user mapping and foreign table defined
+-- on it. The script that changes nothing is what makes that a version bump
+-- rather than a migration.

@@ -12,7 +12,17 @@ MODULE_big = valkey_fdw
 EXTENSION  = valkey_fdw valkey_fdw_test
 PGFILEDESC = "valkey_fdw - foreign data wrapper for Valkey"
 
-DATA = sql/valkey_fdw--0.1.sql sql/valkey_fdw_test--0.1.sql
+# Every version's full install script, and every upgrade step between them.
+#
+# The full scripts are what CREATE EXTENSION runs; the --A--B ones are what
+# ALTER EXTENSION ... UPDATE runs. Both are listed because both have to be
+# installed: an upgrade script that is not shipped leaves an existing
+# installation with no path forward, and for a foreign data wrapper that means
+# dropping every server, user mapping and foreign table to move version.
+DATA = sql/valkey_fdw--0.1.sql sql/valkey_fdw--0.2.sql \
+       sql/valkey_fdw--0.1--0.2.sql \
+       sql/valkey_fdw_test--0.1.sql sql/valkey_fdw_test--0.2.sql \
+       sql/valkey_fdw_test--0.1--0.2.sql
 
 SRCS = $(sort $(wildcard src/*.c))
 OBJS = $(SRCS:.c=.o)

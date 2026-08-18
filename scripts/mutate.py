@@ -387,7 +387,7 @@ MUTATIONS = [
     # their host from $VALKEY_HOST and a FLUSHDB aimed at a real cache is
     # silent and total. Ungated it flushes anything it is pointed at, which
     # probe provokes deliberately by removing the mark first.
-    ("S1-flushguard", "sql/valkey_fdw_test--0.1.sql",
+    ("S1-flushguard", "sql/valkey_fdw_test--0.2.sql",
      "\n    IF NOT marked THEN",
      "\n    IF false THEN",
      "standalone", "probe"),

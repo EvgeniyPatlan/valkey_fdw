@@ -30,7 +30,7 @@ SELECT user_id FROM sessions WHERE id = 'sess:abc';   -- one HMGET
 
 ## Status
 
-**Version 0.1, and there has been no release.** Reads and writes work,
+**Version 0.2, and there has been no release.** Reads and writes work,
 including against a cluster. Vector search does not.
 
 | Area | State |
@@ -415,6 +415,20 @@ deliberately — `WITHSCORES` is answered differently by the two protocol
 versions, so packing them would make the array's shape depend on the transport
 — and an array of bare members cannot say what any score should become. Map the
 members and scores to columns to write them.
+
+## Upgrading
+
+Each version ships its full install script and the upgrade step from the one
+before, so an existing installation moves with `ALTER EXTENSION`:
+
+```sql
+ALTER EXTENSION valkey_fdw UPDATE;
+```
+
+That matters more here than for most extensions: dropping and recreating a
+foreign data wrapper means dropping every server, user mapping and foreign
+table defined on it. An upgrade step that changes no catalog object is still
+shipped for exactly that reason.
 
 ## Requirements
 

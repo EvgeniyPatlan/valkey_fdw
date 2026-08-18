@@ -1,3 +1,15 @@
+valkey-fdw (0.2-1) unstable; urgency=medium
+
+  * Field expiry: a ttl column reads and writes a hash field's time to live.
+  * A list member's position is readable, so ORDER BY can restore list order.
+  * A packed (legacy_value) row is written whole.
+  * A hash table fetches the fields it maps rather than the whole hash, and a
+    keyset point lookup is one SISMEMBER rather than a walk.
+  * singleton_key and keyset tables are counted at plan time.
+  * A bulk write no longer rebuilds its read-your-own-writes index per row.
+
+ -- Evgeniy Patlan <evgeniy.patlan@percona.com>  Tue, 18 Aug 2026 00:00:00 +0000
+
 valkey-fdw (0.1-1) unstable; urgency=medium
 
   * Initial package.

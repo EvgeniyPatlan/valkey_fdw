@@ -121,6 +121,108 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# BOTH INSTALL PATHS MUST LAND THE SAME CATALOG.
+#
+# A user arrives at the current version one of two ways: CREATE EXTENSION at
+# it, or CREATE EXTENSION at an older one and ALTER EXTENSION ... UPDATE. Those
+# run different files - the full script, or the base plus every upgrade step -
+# and nothing but this compares what they produce.
+#
+# The way they drift is ordinary: a function is added to the full script and
+# the upgrade step is forgotten, so a fresh install has it and an upgraded one
+# does not. Both installations then call themselves the same version, which is
+# the part that makes it hard to diagnose from a bug report.
+#
+# Compared as the catalog rather than as the files: what matters is the objects
+# a user ends up with, and two scripts that differ in comments or ordering
+# produce the same ones.
+#
+# The BODY is compared as well as the signature. A function defined in both the
+# full script and an upgrade step - which is how a plpgsql helper ends up when
+# a version adds one - can drift in body while keeping its arguments, and a
+# signature-only comparison would call the two installations identical.
+# ---------------------------------------------------------------------------
+catalog_of() {
+    q "SELECT string_agg(sig, E'\n' ORDER BY sig) FROM (
+           SELECT p.proname || '(' || pg_get_function_identity_arguments(p.oid)
+                  || ') -> ' || pg_get_function_result(p.oid)
+                  || ' :: ' || md5(p.prosrc) AS sig
+           FROM pg_depend d
+           JOIN pg_extension e ON e.oid = d.refobjid
+           JOIN pg_proc p ON p.oid = d.objid
+           WHERE d.refclassid = 'pg_extension'::regclass
+             AND d.classid = 'pg_proc'::regclass
+             AND e.extname = '$1') s"
+}
+
+for ext in valkey_fdw valkey_fdw_test; do
+    oldest="$(ls sql/${ext}--*.sql | grep -v -- '--.*--'               | sed -E "s|sql/${ext}--(.+)\.sql|\1|" | sort -V | head -1)"
+    newest="$(grep -oP "default_version\s*=\s*'\K[^']+" ${ext}.control)"
+
+    if [[ "$oldest" == "$newest" ]]; then
+        pass "${ext} has one version (${newest}); nothing to compare"
+        continue
+    fi
+
+    q "DROP EXTENSION IF EXISTS valkey_fdw_test CASCADE" >/dev/null
+    q "DROP EXTENSION IF EXISTS valkey_fdw CASCADE" >/dev/null
+    q "CREATE EXTENSION valkey_fdw" >/dev/null
+    [[ "$ext" == valkey_fdw_test ]] && q "CREATE EXTENSION valkey_fdw_test" >/dev/null
+    fresh="$(catalog_of "$ext")"
+
+    q "DROP EXTENSION IF EXISTS valkey_fdw_test CASCADE" >/dev/null
+    q "DROP EXTENSION IF EXISTS valkey_fdw CASCADE" >/dev/null
+    q "CREATE EXTENSION valkey_fdw VERSION '${oldest}'" >/dev/null
+    if [[ "$ext" == valkey_fdw_test ]]; then
+        q "CREATE EXTENSION valkey_fdw_test VERSION '${oldest}'" >/dev/null
+        q "ALTER EXTENSION valkey_fdw_test UPDATE TO '${newest}'" >/dev/null
+    else
+        q "ALTER EXTENSION valkey_fdw UPDATE TO '${newest}'" >/dev/null
+    fi
+    upgraded="$(catalog_of "$ext")"
+
+    if [[ "$fresh" == "$upgraded" ]]; then
+        pass "${ext}: a fresh ${newest} and ${oldest} upgraded to ${newest} agree"
+    else
+        fail "${ext}: fresh ${newest} and upgraded ${oldest} differ:
+$(diff <(echo "$fresh") <(echo "$upgraded") | head -20)"
+    fi
+done
+
+# ---------------------------------------------------------------------------
+# META.json must describe the version that is actually shipped.
+#
+# PGXN reads this file, not the control file, so a stale version here publishes
+# a release whose name does not match what installing it produces - and the
+# file it names has to be the full script for that version, because that is
+# what a PGXN install runs.
+#
+# The two spellings differ on purpose: the control file's default_version is
+# what CREATE EXTENSION takes, and PGXN wants semver, so 0.2 there is 0.2.0
+# here. Compared on the parts they share rather than as strings.
+# ---------------------------------------------------------------------------
+meta_version="$(python3 -c "import json;print(json.load(open('META.json'))['version'])")"
+meta_file="$(python3 -c "import json;print(json.load(open('META.json'))['provides']['valkey_fdw']['file'])")"
+
+if [[ "${meta_version%.*}" == "$control_version" ]]; then
+    pass "META.json version ${meta_version} matches the control file's ${control_version}"
+else
+    fail "META.json says ${meta_version}, control file says ${control_version}"
+fi
+
+if [[ -f "$meta_file" && "$meta_file" == "sql/valkey_fdw--${control_version}.sql" ]]; then
+    pass "META.json ships the full script for ${control_version}"
+else
+    fail "META.json names ${meta_file}, which is not the full script for ${control_version}"
+fi
+
+# Leave the catalog as the rest of this file expects to find it.
+q "DROP EXTENSION IF EXISTS valkey_fdw_test CASCADE" >/dev/null
+q "DROP EXTENSION IF EXISTS valkey_fdw CASCADE" >/dev/null
+q "CREATE EXTENSION valkey_fdw" >/dev/null
+q "CREATE EXTENSION valkey_fdw_test" >/dev/null
+
+# ---------------------------------------------------------------------------
 # Value handling: src/vfdw_val.c, src/vfdw_score.c, src/vfdw_slot.c
 #
 # S2 builds the write direction before any write path exists, which is only

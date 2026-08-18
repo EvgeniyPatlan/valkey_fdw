@@ -52,7 +52,7 @@
 %global libvalkey_ref %{?libvalkey_ref}%{!?libvalkey_ref:0.5.0}
 
 Name:           valkey_fdw_%{pgmajor}
-Version:        %{?vfdw_version}%{!?vfdw_version:0.1}
+Version:        %{?vfdw_version}%{!?vfdw_version:0.2}
 Release:        1%{?dist}
 Summary:        PostgreSQL foreign data wrapper for Valkey
 
@@ -177,5 +177,13 @@ rm -f %{buildroot}%{pgsharedir}/extension/valkey_fdw_test.control \
 %{pgsharedir}/extension/valkey_fdw--*.sql
 
 %changelog
+* Tue Aug 18 2026 Evgeniy Patlan <evgeniy.patlan@percona.com> - 0.2-1
+- Field expiry: a ttl column reads and writes a hash field's time to live
+- A list member's position is readable, so ORDER BY can restore list order
+- A packed (legacy_value) row is written whole
+- A hash table fetches the fields it maps; a keyset point lookup is one SISMEMBER
+- singleton_key and keyset tables are counted at plan time
+- A bulk write no longer rebuilds its read-your-own-writes index per row
+
 * Mon Aug 10 2026 Evgeniy Patlan <evgeniy.patlan@percona.com> - 0.1-1
 - Initial package.

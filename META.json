@@ -1,0 +1,50 @@
+{
+   "name": "valkey_fdw",
+   "abstract": "PostgreSQL foreign data wrapper for Valkey",
+   "description": "Maps Valkey keys onto SQL tables with typed, per-field columns. Strings, hashes, lists, sets and sorted sets; keyspace, keyprefix, keyset and singleton_key discovery; TLS with hostname verification, ACL authentication and cluster support. Writes are buffered and applied atomically by a single script at pre-commit, so a transaction that commits in PostgreSQL has been accepted by Valkey in full or not at all.",
+   "version": "0.2.0",
+   "maintainer": [
+      "Evgeniy Patlan <evgeniy.patlan@percona.com>"
+   ],
+   "license": "postgresql",
+   "provides": {
+      "valkey_fdw": {
+         "abstract": "PostgreSQL foreign data wrapper for Valkey",
+         "file": "sql/valkey_fdw--0.2.sql",
+         "docfile": "README.md",
+         "version": "0.2.0"
+      }
+   },
+   "resources": {
+      "homepage": "https://github.com/EvgeniyPatlan/valkey_fdw",
+      "bugtracker": {
+         "web": "https://github.com/EvgeniyPatlan/valkey_fdw/issues"
+      },
+      "repository": {
+         "url": "https://github.com/EvgeniyPatlan/valkey_fdw.git",
+         "web": "https://github.com/EvgeniyPatlan/valkey_fdw",
+         "type": "git"
+      }
+   },
+   "generated_by": "The valkey_fdw contributors",
+   "meta-spec": {
+      "version": "1.0.0",
+      "url": "https://pgxn.org/meta/spec.txt"
+   },
+   "tags": [
+      "valkey",
+      "redis",
+      "fdw",
+      "foreign data wrapper",
+      "key value",
+      "cache"
+   ],
+   "prereqs": {
+      "runtime": {
+         "requires": {
+            "PostgreSQL": "16.0.0"
+         }
+      }
+   },
+   "release_status": "unstable"
+}

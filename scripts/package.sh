@@ -24,7 +24,7 @@ set -euo pipefail
 
 PG_MAJOR=${PG_MAJOR:-17}
 ARCH=${ARCH:-$(uname -m)}
-VERSION=${VERSION:-0.1}
+VERSION=${VERSION:-0.2}
 TARGETS_ALL="el-8 el-9 el-10 amazon-2023 debian-12 debian-13 ubuntu-24.04 ubuntu-26.04"
 TARGETS=""
 

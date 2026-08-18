@@ -1,5 +1,5 @@
 # valkey_fdw extension
 comment = 'Foreign data wrapper for Valkey'
-default_version = '0.1'
+default_version = '0.2'
 module_pathname = '$libdir/valkey_fdw'
 relocatable = true
