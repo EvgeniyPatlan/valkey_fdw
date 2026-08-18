@@ -40,6 +40,10 @@ FROM debian:bookworm-slim
 ARG PG_MAJOR=17
 ARG PG_VERSION=17.5
 ARG LIBVALKEY_REF=0.5.0
+# Matches the pgvector the PGDG package installs in docker/Dockerfile.build.
+# The two images must agree: a suite recorded against one and run against the
+# other would diff on whatever changed between the versions.
+ARG PGVECTOR_REF=v0.8.6
 ARG UID=1000
 ARG GID=1000
 
@@ -105,6 +109,21 @@ RUN set -eux; \
     cmake --install /tmp/libvalkey/build >/dev/null; \
     ldconfig; \
     rm -rf /tmp/libvalkey
+
+# pgvector, for the KNN suites and for nothing else - the same reason
+# docker/Dockerfile.build installs the PGDG package, recorded in full there.
+# Built from source because this image's PostgreSQL is built from source and
+# lives in /usr/local/pgsql, where no distribution package would put it.
+#
+# After the PostgreSQL layer, so it invalidates neither that nor libvalkey.
+RUN set -eux; \
+    git clone --depth 1 --branch "${PGVECTOR_REF}" \
+        https://github.com/pgvector/pgvector.git /tmp/pgvector; \
+    make -C /tmp/pgvector PG_CONFIG=/usr/local/pgsql/bin/pg_config \
+        -j"$(nproc)" >/dev/null; \
+    make -C /tmp/pgvector PG_CONFIG=/usr/local/pgsql/bin/pg_config \
+        install >/dev/null; \
+    rm -rf /tmp/pgvector
 
 # Symlinked into a directory a login shell always has on PATH. run_in_build
 # uses `bash -lc`, which sources /etc/profile and rebuilds PATH - so the ENV

@@ -30,6 +30,7 @@
 #include "vfdw_cluster.h"
 #include "vfdw_row.h"
 #include "vfdw_scan.h"
+#include "vfdw_search.h"
 
 typedef struct VfdwScanState
 {
@@ -180,6 +181,9 @@ typedef struct VfdwScanState
 	 * nothing it can see.
 	 */
 	int64		pages;
+
+	/* VFDW_SCAN_KNN only; zeroed and unused for every other strategy. */
+	VfdwKnnScan knn;
 } VfdwScanState;
 
 /*

@@ -46,6 +46,7 @@
 #include "utils/rel.h"
 
 #include "vfdw_estimate.h"
+#include "vfdw_knn.h"
 #include "vfdw_map.h"
 #include "vfdw_modify.h"
 #include "vfdw_rowid.h"
@@ -473,13 +474,52 @@ vfdwGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid
 	set_baserel_size_estimates(root, baserel);
 }
 
+/*
+ * The ordering this path produces, and the row count that goes with it.
+ *
+ * A vector table has exactly two answers: a search, which returns k rows in
+ * the index's order, or a refusal. There is no third path to compare it
+ * against, so this does not choose between them - it decides whether there is
+ * one at all, and raises if there is not.
+ *
+ * The refusal lands here rather than at map build, which is where 6.2 put it.
+ * A map is built by ANALYZE and by every write callback as well as by a
+ * query, and refusing there meant a vector table could not be described
+ * without meeting the read path's objection to it. It is a fact about the
+ * QUERY, so it belongs where the query is known.
+ */
+static List *
+vfdwKnnPathkeys(PlannerInfo *root, RelOptInfo *baserel, double *rows)
+{
+	VfdwTableMap *map = (VfdwTableMap *) baserel->fdw_private;
+	VfdwKnnPlan knn;
+
+	if (map->tabletype != VFDW_TABLE_VECTOR)
+		return NIL;
+
+	if (!vfdw_knn_match(root, baserel, map, &knn))
+		vfdw_knn_refuse(root, baserel, map);
+
+	/*
+	 * k rows, not the relation's estimate. The search returns at most that
+	 * many by construction, and saying otherwise would price the path as
+	 * though the LIMIT above it had work left to do.
+	 */
+	*rows = knn.k;
+	return root->query_pathkeys;
+}
+
 static void
 vfdwGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
 {
 	Cost		startup_cost;
 	Cost		total_cost;
+	double		rows = baserel->rows;
+	List	   *pathkeys;
 
 	(void) foreigntableid;
+
+	pathkeys = vfdwKnnPathkeys(root, baserel, &rows);
 
 	/*
 	 * One round trip to get going, then one per page of keys plus the usual
@@ -487,18 +527,18 @@ vfdwGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
 	 * actually does; real numbers arrive with AnalyzeForeignTable.
 	 */
 	startup_cost = 10;
-	total_cost = startup_cost + baserel->rows * cpu_tuple_cost;
+	total_cost = startup_cost + rows * cpu_tuple_cost;
 
 	add_path(baserel, (Path *)
 			 create_foreignscan_path(root, baserel,
 									 NULL,	/* default pathtarget */
-									 baserel->rows,
+									 rows,
 #if PG_VERSION_NUM >= 180000
 									 0, /* no disabled nodes */
 #endif
 									 startup_cost,
 									 total_cost,
-									 NIL,	/* no pathkeys */
+									 pathkeys,
 									 NULL,	/* no outer rel */
 									 NULL,	/* no extra plan */
 #if PG_VERSION_NUM >= 170000
@@ -513,6 +553,7 @@ vfdwGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 				   Plan *outer_plan)
 {
 	List	   *fdw_private;
+	List	   *fdw_exprs;
 
 	(void) foreigntableid;
 	(void) best_path;
@@ -528,14 +569,43 @@ vfdwGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 
 	fdw_private = vfdw_scan_plan(root, baserel,
 								 (VfdwTableMap *) baserel->fdw_private,
-								 scan_clauses);
+								 scan_clauses, &fdw_exprs);
 
+	/*
+	 * fdw_exprs holds the query vector of a search and nothing otherwise. It
+	 * goes here rather than in fdw_private because setrefs.c and the
+	 * expression walkers only reach this field: a Param left in fdw_private
+	 * would never be renumbered, and a generic plan would search for whatever
+	 * the first execution's parameter happened to be.
+	 */
 	return make_foreignscan(tlist, scan_clauses, baserel->relid,
-							NIL,	/* no expressions to evaluate */
+							fdw_exprs,
 							fdw_private,
 							NIL,	/* no custom tlist */
 							NIL,	/* no remote quals */
 							outer_plan);
+}
+
+/*
+ * The three numbers a search is wrong by if any of them is wrong, and none of
+ * them visible anywhere else.
+ *
+ * k matters most: it is derived from LIMIT plus OFFSET rather than written by
+ * the user, so a plan that took the wrong one returns k rows in order and
+ * looks entirely correct.
+ *
+ * The metric is what the OPERATOR means, not what the index measures. The two
+ * are compared when the scan opens, against FT.INFO.
+ */
+static void
+vfdwExplainKnn(List *private, ExplainState *es)
+{
+	ExplainPropertyText("Valkey Search Field",
+						vfdw_plan_knn_field(private), es);
+	ExplainPropertyText("Valkey Search Metric",
+						vfdw_plan_knn_metric(private), es);
+	ExplainPropertyInteger("Valkey Search K", NULL,
+						   vfdw_plan_knn_k(private), es);
 }
 
 /*
@@ -573,6 +643,8 @@ vfdwExplainForeignScan(ForeignScanState *node, ExplainState *es)
 	else if (strategy == VFDW_SCAN_KEYS)
 		ExplainPropertyInteger("Valkey Keys", NULL,
 							   list_length(vfdw_plan_keys(private)), es);
+	else if (strategy == VFDW_SCAN_KNN)
+		vfdwExplainKnn(private, es);
 
 	if (es->analyze)
 	{
@@ -625,7 +697,26 @@ static bool
 vfdwAnalyzeForeignTable(Relation relation, AcquireSampleRowsFunc *func,
 						BlockNumber *totalpages)
 {
-	(void) relation;
+	/*
+	 * A vector table has no keyspace of its own to sample. The sampler walks
+	 * keys, and this table's rows are whatever an index returned for one
+	 * query - so a sample of it would be a sample of some other table's keys,
+	 * and the row estimate it produced would be applied to searches that
+	 * return exactly k rows regardless.
+	 *
+	 * Refused rather than answered with zero: "declining to analyze" is
+	 * false, and a statistic nobody can act on is worse than none.
+	 */
+	if (vfdw_map_build_for_relid(RelationGetRelid(relation))->tabletype ==
+		VFDW_TABLE_VECTOR)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot ANALYZE a Valkey \"vector\" table"),
+				 errdetail("Its rows come from a search rather than from a "
+						   "keyspace, and a search returns the k rows one "
+						   "query asked for."),
+				 errhint("ANALYZE the tabletype 'hash' table over the same "
+						 "keys, if there is one.")));
 
 	*func = vfdw_scan_acquire_sample_rows;
 	*totalpages = 0;

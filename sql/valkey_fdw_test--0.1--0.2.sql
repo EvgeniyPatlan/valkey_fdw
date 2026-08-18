@@ -80,3 +80,21 @@ REVOKE ALL ON FUNCTION valkey_fdw_test_leak_stats() FROM PUBLIC;
 
 COMMENT ON FUNCTION valkey_fdw_test_leak_stats()
 IS 'Scan batch contexts against rescan resets, and flush batches opened against closed - two pairings that must stay balanced';
+
+CREATE FUNCTION valkey_fdw_test_vec_to_text(bytea)
+RETURNS text
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+REVOKE ALL ON FUNCTION valkey_fdw_test_vec_to_text(bytea) FROM PUBLIC;
+
+COMMENT ON FUNCTION valkey_fdw_test_vec_to_text(bytea)
+IS 'Raw little-endian FLOAT32 as a vector literal';
+
+CREATE FUNCTION valkey_fdw_test_vec_from_text(text)
+RETURNS bytea
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+REVOKE ALL ON FUNCTION valkey_fdw_test_vec_from_text(text) FROM PUBLIC;
+
+COMMENT ON FUNCTION valkey_fdw_test_vec_from_text(text)
+IS 'A vector literal as raw little-endian FLOAT32';

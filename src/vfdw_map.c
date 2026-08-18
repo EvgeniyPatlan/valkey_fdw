@@ -119,6 +119,34 @@ vfdw_map_check_single_source(bool is_key, bool is_member, bool is_score,
 }
 
 /*
+ * The index_type option as an enum.
+ *
+ * Spelled out rather than taken as the validator's ordinal, which would be
+ * one line: the ordinal is a position in an array in another file, and the
+ * two orderings would then have to be kept in step by nobody in particular.
+ * Getting that wrong does not fail - it calls a tag column a vector one.
+ *
+ * vfdw_parse_enum still runs, so the accepted set is still the option table's
+ * and this chain cannot widen it. It is a mapping, not a second validator,
+ * and the last branch is unreachable by construction.
+ */
+static VfdwIndexType
+vfdw_map_index_type(const VfdwOptionDef *def, const char *value)
+{
+	(void) vfdw_parse_enum(def, value);
+
+	if (strcmp(value, "tag") == 0)
+		return VFDW_INDEX_TAG;
+	if (strcmp(value, "numeric") == 0)
+		return VFDW_INDEX_NUMERIC;
+	if (strcmp(value, "vector") == 0)
+		return VFDW_INDEX_VECTOR;
+
+	elog(ERROR, "valkey_fdw: index_type \"%s\" passed the validator and is "
+		 "not one of the three", value);
+}
+
+/*
  * Read the per-column options into a partially-filled VfdwColumn.
  *
  * Only records what was asked for; whether the request makes sense for this
@@ -161,7 +189,8 @@ vfdw_map_read_column_options(VfdwColumn *col, List *options)
 			is_position = vfdw_parse_bool(def, value);
 		else if (strcmp(def->name, "distance") == 0)
 			is_distance = vfdw_parse_bool(def, value);
-		/* index_type is consumed by the search planner, not here */
+		else if (strcmp(def->name, "index_type") == 0)
+			col->index_type = vfdw_map_index_type(def, value);
 	}
 
 	col->field = field;

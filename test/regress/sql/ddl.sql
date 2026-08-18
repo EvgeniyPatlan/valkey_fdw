@@ -216,8 +216,10 @@ CREATE FOREIGN TABLE w_vector (
     d double precision OPTIONS (distance 'true')
 ) SERVER w_srv OPTIONS (tabletype 'vector', search_index 'idx');
 
--- Refused for being a vector table, not for the distance column it also has.
--- The message a user can act on is the one about the table.
+-- Refused for the QUERY rather than for the table: a vector table reads, and
+-- what it cannot do is answer a query that names no vector to search for.
+-- Each message says which part of the shape is missing - the whole set is in
+-- the knnplan suite, which has pgvector's operators to write them with.
 SELECT * FROM w_vector;
 SELECT k FROM w_vector WHERE k = 'ddl:v:1';
 SELECT count(*) FROM w_vector;
@@ -227,11 +229,10 @@ SELECT count(*) FROM w_vector;
 CREATE FOREIGN TABLE w_vector_noindex (k text, v text) SERVER w_srv
     OPTIONS (tabletype 'vector');
 
--- Writes reach the SAME refusal, which is not the write-side reason
--- vfdw_map_writability holds for a vector table: planning happens before the
--- executor consults the updatable mask, so the shape refusal is what a user
--- sees. The mask is asserted below on its own, because it is what
--- information_schema reports and nothing else would notice it changing.
+-- Writes get the write-side reason, which names the way out. They used to get
+-- the read one, because the refusal was raised while building the map and
+-- every caller met it; it is an access-path decision now, and a write plans
+-- no scan of its target.
 INSERT INTO w_vector VALUES ('ddl:v:1', 'x', 1.0);
 UPDATE w_vector SET t = 'y';
 DELETE FROM w_vector;

@@ -55,6 +55,24 @@ typedef enum VfdwTableType
 	VFDW_TABLE_VECTOR
 } VfdwTableType;
 
+/*
+ * What a column is indexed AS, from the index_type option.
+ *
+ * A fact about the valkey-search index rather than about the key, which is
+ * why it is not one of the column KINDS: a field column is still a field
+ * column, and this says what a search may do with it. Only the vector one is
+ * consulted today - it is how the KNN matcher tells the indexed vector field
+ * from every other field of the same hash - and the other two are what 6.4's
+ * pre-filter pushdown will read.
+ */
+typedef enum VfdwIndexType
+{
+	VFDW_INDEX_NONE = 0,		/* no index_type option */
+	VFDW_INDEX_TAG,
+	VFDW_INDEX_NUMERIC,
+	VFDW_INDEX_VECTOR
+} VfdwIndexType;
+
 typedef enum VfdwColKind
 {
 	VFDW_COL_DROPPED = 0,		/* attisdropped; never filled */
@@ -75,6 +93,7 @@ typedef struct VfdwColumn
 {
 	AttrNumber	attnum;
 	VfdwColKind kind;
+	VfdwIndexType index_type;
 	const char *field;			/* VFDW_COL_FIELD / VFDW_COL_TTL */
 	Oid			typid;
 	int32		typmod;

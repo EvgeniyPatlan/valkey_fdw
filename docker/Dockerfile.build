@@ -22,6 +22,14 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # ---------------------------------------------------------------------------
 # Base toolchain and the PGDG repository.
 # ---------------------------------------------------------------------------
+# pgvector is here for the KNN suite and for no other reason. valkey_fdw does
+# not link it, does not require it at runtime, and recognises its operators by
+# NAME rather than by OID - which is the whole point, because the OIDs are
+# assigned by CREATE EXTENSION and differ in every database. But a KNN query
+# cannot be WRITTEN without an operator of that name, so a suite that asserts
+# the wrapper recognises one has to have a real one to hand. Recognising an
+# operator this tree also defines would prove nothing about the case users are
+# actually in.
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
@@ -37,6 +45,7 @@ https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
         "postgresql-${PG_MAJOR}" \
         "postgresql-server-dev-${PG_MAJOR}" \
         "postgresql-client-${PG_MAJOR}" \
+        "postgresql-${PG_MAJOR}-pgvector" \
         build-essential \
         clang \
         clang-tidy \

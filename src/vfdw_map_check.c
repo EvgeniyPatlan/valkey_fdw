@@ -162,66 +162,23 @@ vfdw_map_check_types(VfdwTableMap *map, TupleDesc tupdesc)
 /*
  * Refuse what the option grammar accepts but the scan cannot yet read.
  *
- * These shapes are part of the design and their options validate, but nothing
- * fills their columns yet. Leaving them to return NULL would be a plausible
- * empty result - the failure mode this wrapper exists to avoid - so they are
- * refused at plan time until the phase that implements them lands. Checked
- * after validity, so a table that is both malformed and unimplemented is
- * reported as malformed, which is the more useful of the two.
+ * EMPTY, and kept rather than deleted. Every shape that used to be listed
+ * here now reads: ttl asks the server whether it can, and distance arrives
+ * from the search that a tabletype 'vector' table is planned as. The function
+ * stays because the RULE it enforces is the one this tree keeps returning to
+ * - a column nothing fills must raise rather than return NULL, because a
+ * plausible empty result is the failure with no symptom - and the next option
+ * accepted ahead of its implementation belongs here on the day it is added,
+ * not in a new place someone has to find.
+ *
+ * Checked after validity, so a table that is both malformed and unimplemented
+ * is reported as malformed, which is the more useful of the two.
  */
 void
 vfdw_map_check_implemented(VfdwTableMap *map, TupleDesc tupdesc)
 {
-	int			i;
-
-	/*
-	 * A VECTOR TABLE IS REFUSED WHOLE, not column by column.
-	 *
-	 * Its rows come from FT.SEARCH and nothing here issues one, so there is no
-	 * query shape it can answer - not a KNN query, and not a plain SELECT
-	 * either. The alternative would be to fall back to walking the keyspace,
-	 * which answers the plain SELECT correctly and answers the KNN query with
-	 * rows in the wrong order and no k applied. Refusing both is the honest
-	 * state, and it is what makes declaring the shape ahead of the feature
-	 * safe: the definition is accepted, and nothing pretends to serve it.
-	 *
-	 * Before the per-column loop, so a vector table is refused for being one
-	 * rather than for the distance column it probably also has. The message a
-	 * user needs is about the table.
-	 */
-	if (map->tabletype == VFDW_TABLE_VECTOR)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("tabletype 'vector' cannot be queried yet"),
-				 errdetail("A vector table is answered by FT.SEARCH against "
-						   "index \"%s\", which is not implemented.",
-						   map->search_index),
-				 errhint("The definition is accepted so a table can be written "
-						 "ahead of the feature. Use tabletype 'hash' to read "
-						 "the same keys through the ordinary key path.")));
-
-	for (i = 0; i < map->natts; i++)
-	{
-		const char *what = NULL;
-
-		/*
-		 * ttl has left this list. It is read, by a second command per key, and
-		 * what it needs from the server is asked of the server rather than
-		 * decided here - see vfdw_ttl.h. A server without per-field expiry is
-		 * refused when the scan opens, which is the first moment there is a
-		 * server to ask.
-		 */
-		if (map->cols[i].kind == VFDW_COL_DISTANCE)
-			what = "distance";
-
-		if (what == NULL)
-			continue;
-
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("column \"%s\" reads %s, which is not implemented yet",
-						NameStr(TupleDescAttr(tupdesc, i)->attname), what)));
-	}
+	(void) map;
+	(void) tupdesc;
 }
 
 /*

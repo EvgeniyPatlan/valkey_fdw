@@ -87,6 +87,15 @@ extern int	vfdw_scan_member_stride(VfdwTableType type, const valkeyReply *reply)
  */
 extern Datum vfdw_row_datum_from_bytes(VfdwRowCtx *ctx, const VfdwColumn *col,
 									   const char *data, size_t len);
+
+/*
+ * Find a field's value in a reply of alternating names and values.
+ *
+ * Returns the bytes as the server sent them; *data may be NULL, which is how
+ * libvalkey reports a nil and is not the same as an empty value.
+ */
+extern bool vfdw_scan_hash_lookup(const valkeyReply *reply, const char *field,
+								  const char **data, size_t *len);
 extern void vfdw_scan_fill(VfdwRowCtx *ctx, TupleTableSlot *slot,
 						   const char *key, size_t keylen, valkeyReply *reply);
 

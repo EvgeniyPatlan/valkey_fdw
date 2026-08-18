@@ -543,6 +543,79 @@ MUTATIONS = [
      "\tbool\t\tindexed = false;",
      "\tbool\t\tindexed = true;",
      "standalone", "ddl"),
+
+    # The operator's metric against the index's own.
+    #
+    # THE MOST DANGEROUS MUTATION IN THIS FILE. Removing the check does not
+    # fail, does not warn, and does not change the row COUNT: the query runs,
+    # returns k rows in order, and every distance in them is measured the way
+    # the index measures rather than the way the operator asked. knn queries
+    # an L2 index with <=> and with <#>, both of which must be refused.
+    ("K1-metric", "src/vfdw_search_info.c",
+     "\tif (metric == NULL || strcmp(metric, knn->metric) != 0)",
+     "\tif (metric == NULL)",
+     "search", "knn"),
+
+    # A query vector of the wrong dimension is a point in a different space.
+    ("K2-dims", "src/vfdw_search_info.c",
+     "\tif (dims > 0 && qbytes != (size_t) dims * 4)",
+     "\tif (false)",
+     "search", "knn"),
+
+    # k is what the server is asked for, and nothing downstream would notice
+    # it being wrong: a LIMIT 3 over a k of 1 returns one row, in order, and
+    # looks like a table with one matching document.
+    ("K3-k", "src/vfdw_search.c",
+     "\t\t\t\t\t knn->k, knn->field, VFDW_SEARCH_DIST_ALIAS);",
+     "\t\t\t\t\t 1, knn->field, VFDW_SEARCH_DIST_ALIAS);",
+     "search", "knn"),
+
+    # A stored vector is raw little-endian FLOAT32 and not text. Without the
+    # conversion the bytes go to the column's input function as they are,
+    # which for pgvector's vector is a syntax error - but the mutation is
+    # here rather than assumed harmless, because the same bytes into a text
+    # column would be accepted and unreadable.
+    ("K4-vecread", "src/vfdw_row.c",
+     "\tif (col->index_type == VFDW_INDEX_VECTOR)",
+     "\tif (false)",
+     "search", "knn"),
+
+    # A WHERE clause takes rows away AFTER the search counted them towards k,
+    # so the answer is fewer than k rows and not the k nearest matching ones.
+    # Accepting one is the wrong answer 6.4 exists to make right.
+    ("K5-where", "src/vfdw_knn.c",
+     "\tif (baserel->baserestrictinfo != NIL || baserel->joininfo != NIL)\n"
+     "\t\treturn false;\n\n\tfor (rti = 1;",
+     "\tfor (rti = 1;",
+     "standalone", "knnplan"),
+
+    # DESC is the FARTHEST k, and no reversal of a k-row result answers it:
+    # the rows needed are the ones the search did not return.
+    #
+    # This mutation came back GREEN first time. The suite only had plain DESC,
+    # which implies NULLS FIRST, so the null-placement rule refused it and the
+    # direction check was never what the assertion rested on. knnplan now
+    # spells DESC NULLS LAST as well, which reaches this line and nothing
+    # else - and that is the whole reason for running the mutation.
+    ("K6-desc", "src/vfdw_knn.c",
+     "\tif (!VFDW_PK_IS_ASC(pk) || pk->pk_nulls_first)",
+     "\tif (pk->pk_nulls_first)",
+     "standalone", "knnplan"),
+
+    # One base relation. With a join above it the LIMIT bounds the join's
+    # output and not this scan's, so k is a number about some other operator.
+    ("K7-join", "src/vfdw_knn.c",
+     "\tif (nbase != 1)",
+     "\tif (false)",
+     "standalone", "knnplan"),
+
+    # A vector is bytes, and a zero element is four NUL bytes. Refusing the
+    # empty one is what keeps both directions agreeing about the vector no
+    # index has.
+    ("K8-vecempty", "src/vfdw_vec.c",
+     "\tif (len == 0)",
+     "\tif (false)",
+     "standalone", "vec"),
 ]
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

@@ -265,20 +265,22 @@ CREATE FOREIGN TABLE w_vector (
     t text OPTIONS (field 'tag', index_type 'tag'),
     d double precision OPTIONS (distance 'true')
 ) SERVER w_srv OPTIONS (tabletype 'vector', search_index 'idx');
--- Refused for being a vector table, not for the distance column it also has.
--- The message a user can act on is the one about the table.
+-- Refused for the QUERY rather than for the table: a vector table reads, and
+-- what it cannot do is answer a query that names no vector to search for.
+-- Each message says which part of the shape is missing - the whole set is in
+-- the knnplan suite, which has pgvector's operators to write them with.
 SELECT * FROM w_vector;
-ERROR:  tabletype 'vector' cannot be queried yet
-DETAIL:  A vector table is answered by FT.SEARCH against index "idx", which is not implemented.
-HINT:  The definition is accepted so a table can be written ahead of the feature. Use tabletype 'hash' to read the same keys through the ordinary key path.
+ERROR:  this query cannot be answered by a vector search
+DETAIL:  A tabletype 'vector' table is read only by FT.SEARCH against index "idx", and the query has no ORDER BY, so there is no query vector to search for and no order to return rows in.
+HINT:  The shape that runs is: SELECT ... FROM t ORDER BY <vector column> <-> <query vector> LIMIT <constant>, with no WHERE and no join.
 SELECT k FROM w_vector WHERE k = 'ddl:v:1';
-ERROR:  tabletype 'vector' cannot be queried yet
-DETAIL:  A vector table is answered by FT.SEARCH against index "idx", which is not implemented.
-HINT:  The definition is accepted so a table can be written ahead of the feature. Use tabletype 'hash' to read the same keys through the ordinary key path.
+ERROR:  this query cannot be answered by a vector search
+DETAIL:  A tabletype 'vector' table is read only by FT.SEARCH against index "idx", and the query has no ORDER BY, so there is no query vector to search for and no order to return rows in.
+HINT:  The shape that runs is: SELECT ... FROM t ORDER BY <vector column> <-> <query vector> LIMIT <constant>, with no WHERE and no join.
 SELECT count(*) FROM w_vector;
-ERROR:  tabletype 'vector' cannot be queried yet
-DETAIL:  A vector table is answered by FT.SEARCH against index "idx", which is not implemented.
-HINT:  The definition is accepted so a table can be written ahead of the feature. Use tabletype 'hash' to read the same keys through the ordinary key path.
+ERROR:  this query cannot be answered by a vector search
+DETAIL:  A tabletype 'vector' table is read only by FT.SEARCH against index "idx", and the query has no ORDER BY, so there is no query vector to search for and no order to return rows in.
+HINT:  The shape that runs is: SELECT ... FROM t ORDER BY <vector column> <-> <query vector> LIMIT <constant>, with no WHERE and no join.
 -- A vector table with no index has nothing to search and no keyspace of its
 -- own to fall back to, so it is refused at CREATE rather than at the query.
 CREATE FOREIGN TABLE w_vector_noindex (k text, v text) SERVER w_srv
@@ -286,23 +288,22 @@ CREATE FOREIGN TABLE w_vector_noindex (k text, v text) SERVER w_srv
 ERROR:  tabletype "vector" requires the search_index option
 DETAIL:  A vector table's rows come from a search index. Without one it names no keys at all, where every other table type names them by prefix, by set or by being a single key.
 HINT:  Add OPTIONS (search_index 'name'), or use a table type that walks the keyspace.
--- Writes reach the SAME refusal, which is not the write-side reason
--- vfdw_map_writability holds for a vector table: planning happens before the
--- executor consults the updatable mask, so the shape refusal is what a user
--- sees. The mask is asserted below on its own, because it is what
--- information_schema reports and nothing else would notice it changing.
+-- Writes get the write-side reason, which names the way out. They used to get
+-- the read one, because the refusal was raised while building the map and
+-- every caller met it; it is an access-path decision now, and a write plans
+-- no scan of its target.
 INSERT INTO w_vector VALUES ('ddl:v:1', 'x', 1.0);
-ERROR:  tabletype 'vector' cannot be queried yet
-DETAIL:  A vector table is answered by FT.SEARCH against index "idx", which is not implemented.
-HINT:  The definition is accepted so a table can be written ahead of the feature. Use tabletype 'hash' to read the same keys through the ordinary key path.
+ERROR:  cannot insert into a Valkey "vector" table
+DETAIL:  A vector table is read through a search index, and writing one is not implemented.
+HINT:  Write the underlying hash keys through a tabletype 'hash' table over the same keyspace.
 UPDATE w_vector SET t = 'y';
-ERROR:  tabletype 'vector' cannot be queried yet
-DETAIL:  A vector table is answered by FT.SEARCH against index "idx", which is not implemented.
-HINT:  The definition is accepted so a table can be written ahead of the feature. Use tabletype 'hash' to read the same keys through the ordinary key path.
+ERROR:  cannot update a Valkey "vector" table
+DETAIL:  A vector table is read through a search index, and writing one is not implemented.
+HINT:  Write the underlying hash keys through a tabletype 'hash' table over the same keyspace.
 DELETE FROM w_vector;
-ERROR:  tabletype 'vector' cannot be queried yet
-DETAIL:  A vector table is answered by FT.SEARCH against index "idx", which is not implemented.
-HINT:  The definition is accepted so a table can be written ahead of the feature. Use tabletype 'hash' to read the same keys through the ordinary key path.
+ERROR:  cannot delete from a Valkey "vector" table
+DETAIL:  A vector table is read through a search index, and writing one is not implemented.
+HINT:  Write the underlying hash keys through a tabletype 'hash' table over the same keyspace.
 SELECT c.relname, pg_relation_is_updatable(c.oid, false) AS mask
 FROM pg_class c WHERE c.relname = 'w_vector';
  relname  | mask 

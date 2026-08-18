@@ -41,7 +41,17 @@ typedef enum VfdwScanStrategy
 {
 	VFDW_SCAN_KEYSPACE = 0,		/* SCAN, or SSCAN over a keyset */
 	VFDW_SCAN_KEYS,				/* a known list of keys: fetch just those */
-	VFDW_SCAN_SINGLETON			/* singleton_key: one fixed key */
+	VFDW_SCAN_SINGLETON,		/* singleton_key: one fixed key */
+
+	/*
+	 * FT.SEARCH: the rows come from an index, in the order it ranked them.
+	 *
+	 * The odd one out, and deliberately so. Every other strategy discovers
+	 * keys and then reads them, so its rows are a SET that quals may narrow.
+	 * This one produces a ranked LIST of exactly k rows, which is only the
+	 * right answer for the query that asked for that k - see vfdw_knn.c.
+	 */
+	VFDW_SCAN_KNN
 } VfdwScanStrategy;
 
 /*
@@ -53,14 +63,33 @@ typedef enum VfdwScanStrategy
 #define VFDW_PRIV_PATTERN	2	/* String, the SCAN MATCH glob, or NULL */
 
 /*
+ * VFDW_SCAN_KNN only; NULL or 0 for every other strategy.
+ *
+ * The query vector is NOT here. It may be a Param, so it is an expression
+ * rather than a value until the scan runs, and it travels in the plan's
+ * fdw_exprs where setrefs.c and the expression walkers can reach it - which
+ * is what makes a re-planned generic plan evaluate the new parameter instead
+ * of the one the first execution saw.
+ */
+#define VFDW_PRIV_KNN_FIELD	3	/* String, the indexed vector attribute */
+#define VFDW_PRIV_KNN_METRIC 4	/* String, what the OPERATOR measures */
+#define VFDW_PRIV_KNN_K		5	/* Integer, rows to ask the server for */
+
+/*
  * Choose the access path and encode it for the executor and for EXPLAIN.
  * Defined in vfdw_plan.c.
  */
 extern List *vfdw_scan_plan(PlannerInfo *root, RelOptInfo *baserel,
-							VfdwTableMap *map, List *clauses);
+							VfdwTableMap *map, List *clauses,
+							List **fdw_exprs);
 
 extern List *vfdw_plan_keys(List *fdw_private);
 extern const char *vfdw_plan_pattern(List *fdw_private);
+
+/* The three KNN slots, or NULL/0 when the plan is not a search. */
+extern const char *vfdw_plan_knn_field(List *fdw_private);
+extern const char *vfdw_plan_knn_metric(List *fdw_private);
+extern int	vfdw_plan_knn_k(List *fdw_private);
 
 /*
  * The MATCH glob a table is confined to, before any qual narrows it further.

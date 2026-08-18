@@ -19,6 +19,9 @@
  */
 #include "vfdw_row.h"
 
+#include "vfdw_search.h"
+#include "vfdw_vec.h"
+
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
 #include "mb/pg_wchar.h"
@@ -66,6 +69,39 @@ vfdw_row_ctx_init(VfdwRowCtx *ctx, VfdwTableMap *map, MemoryContext cxt)
 }
 
 /*
+ * Valkey's bytes verbatim, for a column declared bytea.
+ *
+ * The one branch that copies rather than converts, which is what makes a
+ * value written verbatim readable verbatim: NUL bytes and byte sequences that
+ * are not valid in the server encoding both survive (invariant I3).
+ */
+static Datum
+vfdw_row_bytea_datum(VfdwRowCtx *ctx, const VfdwColumn *col,
+					 const char *data, size_t len)
+{
+	bytea	   *b = (bytea *) palloc(VARHDRSZ + len);
+	Datum		d;
+
+	SET_VARSIZE(b, VARHDRSZ + len);
+	memcpy(VARDATA(b), data, len);
+	d = PointerGetDatum(b);
+
+	/*
+	 * A domain over bytea is binary too, so it never reaches its own input
+	 * function and would otherwise carry its CHECK constraints in name only.
+	 * The cached DomainIOData is what keeps this from costing a syscache
+	 * lookup and an expression compile per value.
+	 */
+	if (col->is_domain)
+		domain_check(d, false, col->typid,
+					 ctx->domain_extra != NULL
+					 ? &ctx->domain_extra[col->attnum - 1] : NULL,
+					 ctx->cache_cxt);
+
+	return d;
+}
+
+/*
  * Bytes from Valkey to a Datum of the column's declared type.
  *
  * Lengths travel with the data all the way in (invariant I3): nothing here
@@ -78,26 +114,30 @@ vfdw_row_datum_from_bytes(VfdwRowCtx *ctx, const VfdwColumn *col,
 	int			idx = col->attnum - 1;
 
 	if (col->is_binary)
+		return vfdw_row_bytea_datum(ctx, col, data, len);
+
+	/*
+	 * A VECTOR FIELD IS NOT TEXT AND NOT THIS COLUMN'S BYTES. valkey-search
+	 * stores it as raw little-endian FLOAT32, which is neither valid in the
+	 * server encoding nor anything a vector type's input function would
+	 * accept, so it is turned into the literal form first. See vfdw_vec.c for
+	 * why the text form is the join between the two ends.
+	 *
+	 * Only when the column is not bytea, which is the branch above: a bytea
+	 * column asked for the bytes and gets them. That is the one declaration
+	 * under which the raw form is the answer rather than an encoding.
+	 *
+	 * The field name identifies it in any error, rather than the PostgreSQL
+	 * column name, which VfdwColumn does not carry - and which is the less
+	 * useful of the two here anyway, since what is malformed is what the
+	 * index holds.
+	 */
+	if (col->index_type == VFDW_INDEX_VECTOR)
 	{
-		bytea	   *b = (bytea *) palloc(VARHDRSZ + len);
-		Datum		d;
+		char	   *lit = vfdw_vec_to_text(data, len, col->field);
 
-		SET_VARSIZE(b, VARHDRSZ + len);
-		memcpy(VARDATA(b), data, len);
-		d = PointerGetDatum(b);
-
-		/*
-		 * A domain over bytea is binary too, so it never reaches its own
-		 * input function and would otherwise carry its CHECK constraints in
-		 * name only. The cached DomainIOData is what keeps this from costing
-		 * a syscache lookup and an expression compile per value.
-		 */
-		if (col->is_domain)
-			domain_check(d, false, col->typid,
-						 ctx->domain_extra != NULL ? &ctx->domain_extra[idx] : NULL,
-						 ctx->cache_cxt);
-
-		return d;
+		return InputFunctionCall(&ctx->infuncs[idx], lit,
+								 col->typioparam, col->typmod);
 	}
 
 	/*
@@ -217,8 +257,13 @@ vfdw_row_store_packed(VfdwRowCtx *ctx, TupleTableSlot *slot,
  * The pair walk indexes element[] from the server's own element count, so
  * every child is taken through vfdw_reply_child, whose guard is what keeps an
  * element the reply declared and did not carry from becoming a heap overflow.
+ *
+ * Exported because FT.SEARCH answers with the very same shape - a key and
+ * then the hash's own field/value pairs - and because FT.INFO is three of
+ * them nested. A second implementation of a pair walk would be a second place
+ * for the missing-bytes guard above to be forgotten.
  */
-static bool
+bool
 vfdw_scan_hash_lookup(const valkeyReply *reply, const char *field,
 					  const char **data, size_t *len)
 {
@@ -385,6 +430,47 @@ vfdw_row_store_ttl(VfdwRowCtx *ctx, TupleTableSlot *slot,
 }
 
 /*
+ * A list, set or zset member, at the element index the scan is up to.
+ *
+ * A zset's pair is asked for by table type rather than by looking at the
+ * reply, because that is the same question vfdw_scan_member_stride answers
+ * when it decides how far the index advances - and the two have to agree.
+ */
+static void
+vfdw_row_store_member(VfdwRowCtx *ctx, TupleTableSlot *slot,
+					  const VfdwColumn *col, valkeyReply *reply)
+{
+	const valkeyReply *m = NULL;
+	const valkeyReply *sc = NULL;
+
+	if (vfdw_scan_member_at(reply, ctx->cur_elem,
+							ctx->map->tabletype == VFDW_TABLE_ZSET, &m, &sc))
+		vfdw_scan_store(ctx, slot, col, m->str, m->len);
+}
+
+/*
+ * The distance a search ranked this row by.
+ *
+ * Not computed here and not derivable from the row: the ordering the server
+ * applied is the only place it exists, and recomputing it would need the
+ * query vector, the metric and an implementation of all three metrics - three
+ * chances to disagree with the number the rows were actually sorted by.
+ */
+static void
+vfdw_row_store_distance(VfdwRowCtx *ctx, TupleTableSlot *slot,
+						const VfdwColumn *col, valkeyReply *reply)
+{
+	const char *data = NULL;
+	size_t		len = 0;
+
+	if (reply->type != VALKEY_REPLY_MAP && reply->type != VALKEY_REPLY_ARRAY)
+		return;
+
+	if (vfdw_scan_hash_lookup(reply, VFDW_SEARCH_DIST_ALIAS, &data, &len))
+		vfdw_scan_store(ctx, slot, col, data, len);
+}
+
+/*
  * A zset member's score, which is the second half of the pair the member came
  * from and so is found the same way rather than by a parallel index.
  */
@@ -464,8 +550,6 @@ vfdw_row_fill_column(VfdwRowCtx *ctx, TupleTableSlot *slot,
 					 const VfdwColumn *col, const char *key, size_t keylen,
 					 valkeyReply *reply)
 {
-	VfdwTableMap *map = ctx->map;
-
 	switch (col->kind)
 	{
 		case VFDW_COL_KEY:
@@ -486,16 +570,8 @@ vfdw_row_fill_column(VfdwRowCtx *ctx, TupleTableSlot *slot,
 			break;
 
 		case VFDW_COL_MEMBER:
-		{
-			const valkeyReply *m = NULL;
-			const valkeyReply *sc = NULL;
-
-			if (vfdw_scan_member_at(reply, ctx->cur_elem,
-									map->tabletype == VFDW_TABLE_ZSET,
-									&m, &sc))
-				vfdw_scan_store(ctx, slot, col, m->str, m->len);
+			vfdw_row_store_member(ctx, slot, col, reply);
 			break;
-		}
 
 		case VFDW_COL_SCORE:
 			vfdw_row_store_score(ctx, slot, col, reply);
@@ -509,8 +585,18 @@ vfdw_row_fill_column(VfdwRowCtx *ctx, TupleTableSlot *slot,
 			vfdw_row_store_position(ctx, slot, col);
 			break;
 
+		case VFDW_COL_DISTANCE:
+
+			/*
+			 * FT.SEARCH returns the KNN score as one more field of the row,
+			 * under the alias the query gave it - so it is found the same way
+			 * every other field is, and is NULL on any reply that does not
+			 * carry it rather than zero, which would read as "identical".
+			 */
+			vfdw_row_store_distance(ctx, slot, col, reply);
+			break;
+
 		default:
-			/* distance arrives with the phase that fills it. */
 			break;
 	}
 }

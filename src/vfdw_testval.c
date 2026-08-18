@@ -40,6 +40,7 @@
 
 #include "vfdw_row.h"
 #include "vfdw_val.h"
+#include "vfdw_vec.h"
 
 /*
  * One column of a given type, wired to both I/O directions.
@@ -523,4 +524,45 @@ valkey_fdw_test_hashtag(PG_FUNCTION_ARGS)
 	vfdw_val_hashtag(VARDATA_ANY(in), VARSIZE_ANY_EXHDR(in), &tag, &taglen);
 
 	PG_RETURN_BYTEA_P(vfdw_test_bytea(tag, taglen));
+}
+
+/*
+ * valkey_fdw_test_vec_to_text(bytea) -> text
+ *
+ * Valkey's bytes as a vector type's input function would see them.
+ *
+ * bytea in, so a vector containing 0.0f - four NUL bytes, and the ordinary
+ * case rather than an edge one - arrives here intact. A probe taking text
+ * could not present one at all.
+ */
+PG_FUNCTION_INFO_V1(valkey_fdw_test_vec_to_text);
+Datum
+valkey_fdw_test_vec_to_text(PG_FUNCTION_ARGS)
+{
+	bytea	   *in = PG_GETARG_BYTEA_PP(0);
+	char	   *out;
+
+	out = vfdw_vec_to_text(VARDATA_ANY(in), (size_t) VARSIZE_ANY_EXHDR(in),
+						   "the probe's argument");
+
+	PG_RETURN_TEXT_P(cstring_to_text(out));
+}
+
+/*
+ * valkey_fdw_test_vec_from_text(text) -> bytea
+ *
+ * The write direction: what would go on the wire for this vector literal.
+ * bytea out for the same reason the other direction takes it in.
+ */
+PG_FUNCTION_INFO_V1(valkey_fdw_test_vec_from_text);
+Datum
+valkey_fdw_test_vec_from_text(PG_FUNCTION_ARGS)
+{
+	char	   *in = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *out;
+	size_t		len;
+
+	out = vfdw_vec_from_text(in, "the probe's argument", &len);
+
+	PG_RETURN_BYTEA_P(vfdw_test_bytea(out, len));
 }

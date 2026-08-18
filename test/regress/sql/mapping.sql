@@ -202,9 +202,9 @@ CREATE FOREIGN TABLE map_distance (
 EXPLAIN (COSTS OFF) SELECT * FROM map_distance;
 
 -- A field column on a vector table is accepted: a vector search answers with
--- the hash the index indexed, so its fields are the row's columns. The table
--- is refused for being unimplemented, not for the column being wrong, which
--- is the distinction this pair is here to hold.
+-- the hash the index indexed, so its fields are the row's columns. What is
+-- refused is the QUERY - this one names no vector to search for - and not the
+-- column, which is the distinction this pair is here to hold.
 CREATE FOREIGN TABLE map_vector_field (
     k text,
     f text OPTIONS (field 'f')

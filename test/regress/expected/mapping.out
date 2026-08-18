@@ -276,17 +276,17 @@ EXPLAIN (COSTS OFF) SELECT * FROM map_distance;
 ERROR:  column "d" cannot be used with tabletype "hash"
 DETAIL:  distance columns require tabletype 'vector'.
 -- A field column on a vector table is accepted: a vector search answers with
--- the hash the index indexed, so its fields are the row's columns. The table
--- is refused for being unimplemented, not for the column being wrong, which
--- is the distinction this pair is here to hold.
+-- the hash the index indexed, so its fields are the row's columns. What is
+-- refused is the QUERY - this one names no vector to search for - and not the
+-- column, which is the distinction this pair is here to hold.
 CREATE FOREIGN TABLE map_vector_field (
     k text,
     f text OPTIONS (field 'f')
 ) SERVER map_srv OPTIONS (tabletype 'vector', search_index 'idx');
 EXPLAIN (COSTS OFF) SELECT * FROM map_vector_field;
-ERROR:  tabletype 'vector' cannot be queried yet
-DETAIL:  A vector table is answered by FT.SEARCH against index "idx", which is not implemented.
-HINT:  The definition is accepted so a table can be written ahead of the feature. Use tabletype 'hash' to read the same keys through the ordinary key path.
+ERROR:  this query cannot be answered by a vector search
+DETAIL:  A tabletype 'vector' table is read only by FT.SEARCH against index "idx", and the query has no ORDER BY, so there is no query vector to search for and no order to return rows in.
+HINT:  The shape that runs is: SELECT ... FROM t ORDER BY <vector column> <-> <query vector> LIMIT <constant>, with no WHERE and no join.
 DROP SERVER map_srv CASCADE;
 NOTICE:  drop cascades to 24 other objects
 DETAIL:  drop cascades to user mapping for vfdw on server map_srv

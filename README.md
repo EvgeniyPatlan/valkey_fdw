@@ -45,7 +45,7 @@ including against a cluster. Vector search does not.
 | Transport | TLS with hostname verification, ACL auth, RESP3 with a tested RESP2 fallback |
 | Cluster | slot discovery, per-node pooling, fan-out scans, `MOVED`/`ASK`, single-slot writes |
 | Field expiry | a `ttl` column reads and writes a hash field's time to live as an `interval`, on a server that has per-field expiry (Valkey 9+) |
-| Accepted, then refused | `tabletype 'vector'` tables. The definition is taken so a table can be written ahead of the feature; every query and every write against one raises `0A000` |
+| Vector search | `tabletype 'vector'` answers `ORDER BY <col> <-> <vector> LIMIT k` from a valkey-search index, with the distance in a column. One query shape; every other one is refused rather than approximated |
 | Declared, not routed | `prefer_replica` marks a server a replica and refuses writes through it. It sends no read anywhere else |
 
 Three qualifications, stated once here rather than repeated below.
@@ -57,14 +57,16 @@ not yet had to hold still for anyone else. An option that turns out to be the
 wrong idea will be changed rather than carried for compatibility with a version
 nobody ran.
 
-**A shape in the *accepted, then refused* row is a definition you may write and
-a query you may not run.** `tabletype 'vector'` is that shape: it names an
-index, it takes `field`, `index_type` and `distance` columns, and it answers
-nothing. On any other table type `search_index` and `index_type` stop one step
-short of even that — accepted, raising nothing, consulted by nothing, with no
-qual reaching an index and no write allowed through such a table. Vector
-similarity search is therefore absent rather than partial. No date is attached
-to it.
+**Vector search answers exactly one query shape.** A `tabletype 'vector'`
+table serves `ORDER BY <vector column> <-> <query vector> LIMIT <constant>`
+with no `WHERE` and no join, and refuses everything else naming which part of
+the shape is missing. That is narrow on purpose: a top-K query is a ranking
+rather than a filter, so a `WHERE` applied after the search returns fewer than
+`k` rows and not the `k` nearest matching ones — pushing filters into the
+query language is not implemented, and a query with one is refused rather than
+answered wrongly. Vector tables are also read-only. On any other table type
+`search_index` and `index_type` are accepted, raise nothing and are consulted
+by nothing.
 
 **Every claim of working behaviour above is a suite rather than a sentence.**
 `harness.sh ci` runs those suites across three PostgreSQL majors, two Valkey
@@ -383,19 +385,20 @@ anything that would need two is refused when it is issued — not discovered at
 | `PREPARE TRANSACTION` for a transaction that wrote | `0A000` |
 | `TRUNCATE` | core's "cannot truncate foreign table" |
 | `MERGE` | core's own refusal |
-| Any query or write against a `tabletype 'vector'` table | `0A000` |
+| A query against a `tabletype 'vector'` table that is not the one search shape | `0A000` |
+| Any write to a `tabletype 'vector'` table, and `ANALYZE` of one | `0A000` |
 
 Two further refusals arrive from the server at `COMMIT`, because they are
 facts about the keyspace rather than about the statement: a key that already
 exists where one is being created (`23505`), and a key holding a different
 Valkey type than its table declares (`42804`).
 
-The last row is refused in both directions rather than only on write, and
-at the first plan over the table rather than at `COMMIT`. It is the
-unimplemented shape described under *Usage*, and the refusal is what stands in
-for it: a vector table's rows come from `FT.SEARCH`, and walking its keyspace
-instead would answer a plain `SELECT` correctly and a nearest-neighbour query
-with the wrong rows in the wrong order.
+The two vector rows are refused while planning rather than at `COMMIT`, and
+each names what is wrong with the query rather than with the table. What they
+stand for is described under *Usage*: a vector table answers one query shape,
+and walking its keyspace for the others would answer a plain `SELECT`
+correctly and a nearest-neighbour query with the wrong rows in the wrong
+order.
 
 A `ttl` column is refused only when the server has no per-field expiry, which
 is a fact about the server rather than about the wrapper. It is reported when
@@ -580,36 +583,73 @@ all; here the query supplies the schema and the table supplies the bytes.
 - `tabletype 'string'` is refused with it: a string holds one value and has no
   members, and `(key, value text)` already reads it.
 
-### `tabletype 'vector'`, declared and not implemented
+### `tabletype 'vector'` — nearest-neighbour search
 
-One shape in the option tables below may be written into a table definition and
-cannot yet be queried. A vector table names a valkey-search index instead of a
-keyspace:
+A vector table names a valkey-search index instead of a keyspace. Its rows are
+the documents that index returns, and its `distance` column is the distance
+the search ranked them by.
 
 ```sql
 CREATE FOREIGN TABLE doc_knn (
-  key text            OPTIONS (key 'true'),
-  title text          OPTIONS (field 'title'),
-  tag text            OPTIONS (field 'tag', index_type 'tag'),
-  dist double precision OPTIONS (distance 'true')
+  key   text             OPTIONS (key 'true'),
+  emb   vector(768)      OPTIONS (field 'emb', index_type 'vector'),
+  title text             OPTIONS (field 'title'),
+  tag   text             OPTIONS (field 'tag', index_type 'tag'),
+  dist  double precision OPTIONS (distance 'true')
 ) SERVER cache OPTIONS (tabletype 'vector', search_index 'doc_idx');
+
+SELECT key, title, dist
+FROM doc_knn
+ORDER BY emb <-> '[0.1, 0.2, ...]'::vector
+LIMIT 10;
 ```
 
-The definition is accepted. Every query and every write against it raises
-`0A000`, naming the table type. `search_index` is required rather than
-optional here — a vector table's rows come only from its index, so without one
-it names no keys at all — and that requirement is checked at `CREATE` and at
-`ALTER`, not at the first query.
+**That is the whole of the shape it answers**, and every other query against
+such a table is refused with a message naming the part that is missing: no
+`ORDER BY`, an `ORDER BY` that is not a distance, `DESC`, no `LIMIT`, a `LIMIT`
+that is not a plan-time constant, a `WHERE`, a join, or a second table in the
+`FROM` list.
 
-`distance` belongs to this shape and to no other: a distance is what a search
-returns, so a `distance` column on a hash is a table definition error naming
-the column. `field` columns are accepted on a vector table because a search
-answers with the hash its index indexed, so the same field mapping applies.
+The narrowness is the point. A top-K query is a **ranking**, not a filter, so
+`k` only means anything if the scan's rows go straight to the `LIMIT`. A
+`WHERE` applied after the search would return fewer than `k` rows, and not the
+`k` nearest *matching* ones — the rows needed to answer that were never
+fetched. valkey-search can pre-filter inside the query language, which is the
+correct place for it; that is not implemented, so a query with a `WHERE` is
+refused rather than answered wrongly. `OFFSET` is fine: it is folded into `k`
+and the rows are discarded above the scan.
 
-The alternative to refusing was to walk the keyspace instead, which answers a
-plain `SELECT` correctly and answers a nearest-neighbour query with the wrong
-rows in the wrong order. A definition written ahead of the feature is the
-reason these options appear in the tables at all.
+**pgvector is not required and not linked.** The three operators are
+recognised by NAME — `<->` is L2, `<=>` is COSINE, `<#>` is inner product —
+and their OIDs are assigned by `CREATE EXTENSION`, so they differ in every
+database. The query vector may be a parameter: it is evaluated when the scan
+runs, so a prepared statement searches for the vector each execution supplies.
+
+**Vectors travel as text.** valkey-search stores a vector as raw
+little-endian FLOAT32 with no header; PostgreSQL has no such type, and this
+wrapper does not copy another project's struct layout. Both directions go
+through the type's own text form (`[1,0.5,-2]`), so any type that spells
+itself that way works and one that does not is refused naming what it
+produced. A column declared `bytea` receives the raw bytes instead.
+
+**The index is asked what it is, before every search.** `FT.INFO` is
+pipelined with the search itself, and four disagreements are refused rather
+than answered:
+
+| Checked | Because |
+|---|---|
+| The operator's metric against the index's `DISTANCE_METRIC` | A KNN query does not carry a metric. `<=>` against an L2 index returns `k` rows, in order, with every distance measured the wrong way and nothing to show for it |
+| The field is one the index holds as a `VECTOR` | Ranking by a `TAG` field simply returns something |
+| The query vector's dimension against the index's | A vector of the wrong length is a point in a different space |
+| The element type is `FLOAT32` | That is the layout this wrapper encodes; another would be read as the wrong number of elements of the wrong width |
+
+`search_index` is required rather than optional here — a vector table's rows
+come only from its index — and that is checked at `CREATE` and `ALTER` rather
+than at the first query. `distance` belongs to this table type and to no
+other. `field` columns work as they do on a hash, because a search answers
+with the hash its index indexed. Vector tables are **read-only**, and
+`ANALYZE` on one is refused: there is no keyspace to sample, and a search
+returns the `k` rows one query asked for.
 
 A `ttl` column is not one of them. It reads a hash field's remaining time to
 live as an `interval`, and reports NULL both for a field with no expiry and for
@@ -737,11 +777,11 @@ it on is not.
 | Option | Type | Default | Description | Superuser |
 |---|---|---|---|---|
 | `database` | integer | `0` | Logical database; not valid in cluster mode | no |
-| `tabletype` | enum | `string` | `string`, `hash`, `list`, `set`, `zset` or `vector`; `vector` is accepted and refused at plan time | no |
+| `tabletype` | enum | `string` | `string`, `hash`, `list`, `set`, `zset` or `vector`; a `vector` table is read only by nearest-neighbour search | no |
 | `keyprefix` | string | — | Literal key prefix scoping the table | no |
 | `keyset` | string | — | Set holding the table's key names | no |
 | `singleton_key` | string | — | Draw all rows from this single key | no |
-| `search_index` | string | — | valkey-search index backing this table; required by `tabletype 'vector'`, accepted and not consulted on every other table type | no |
+| `search_index` | string | — | valkey-search index backing this table; required by `tabletype 'vector'` and searched by it, accepted and not consulted on every other table type | no |
 | `legacy_value` | boolean | `false` | Expose the whole collection as one `text[]` or `bytea[]` column, one row per key; read-only, and needs a collection `tabletype` | no |
 | `readonly` | boolean | `false` | Reject all writes on this table | no |
 
@@ -755,8 +795,8 @@ it on is not.
 | `score` | boolean | `false` | Column holds the zset score | no |
 | `position` | boolean | `false` | Column holds the member's zero-based index in its list; read-only, needs `tabletype 'list'` and `integer` or `bigint` | no |
 | `ttl` | boolean | `false` | Column holds the paired field's time to live, as an `interval`; needs `tabletype 'hash'`, a `field`, and Valkey 9+ | no |
-| `distance` | boolean | `false` | Column receives the vector search score; needs `tabletype 'vector'` | no |
-| `index_type` | enum | — | `tag`, `numeric` or `vector`; accepted and not consulted | no |
+| `distance` | boolean | `false` | Column receives the search's distance for the row; needs `tabletype 'vector'` | no |
+| `index_type` | enum | — | `tag`, `numeric` or `vector`; `vector` marks the column a KNN query may rank by. `tag` and `numeric` are accepted and not yet consulted | no |
 
 <!-- options:end -->
 
