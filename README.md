@@ -387,6 +387,7 @@ anything that would need two is refused when it is issued — not discovered at
 | `MERGE` | core's own refusal |
 | A query against a `tabletype 'vector'` table that is not the one search shape | `0A000` |
 | Any write to a `tabletype 'vector'` table, and `ANALYZE` of one | `0A000` |
+| A search against a server declared `cluster 'true'` | `0A000` |
 
 Two further refusals arrive from the server at `COMMIT`, because they are
 facts about the keyspace rather than about the statement: a key that already
@@ -642,6 +643,16 @@ than answered:
 | The field is one the index holds as a `VECTOR` | Ranking by a `TAG` field simply returns something |
 | The query vector's dimension against the index's | A vector of the wrong length is a point in a different space |
 | The element type is `FLOAT32` | That is the layout this wrapper encodes; another would be read as the wrong number of elements of the wrong width |
+
+**A search on a Valkey Cluster is refused.** `FT.SEARCH` is answered by one
+node out of its own slots, so a KNN query against a cluster would return that
+node's `k` nearest rows as though they were the whole keyspace's — and unlike a
+misrouted key, which the server answers with `MOVED`, nothing objects to that:
+each node answers correctly for the slots it holds. A correct top-K needs every
+primary asked and the union re-ranked, which the cluster fan-out does not do —
+it concatenates, which is right for a keyspace scan and wrong for a ranking.
+Point the table at a standalone server, or at a single node declared without
+`cluster 'true'`.
 
 `search_index` is required rather than optional here — a vector table's rows
 come only from its index — and that is checked at `CREATE` and `ALTER` rather

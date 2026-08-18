@@ -67,4 +67,13 @@ extern bool vfdw_knn_match(PlannerInfo *root, RelOptInfo *baserel,
 extern void vfdw_knn_refuse(PlannerInfo *root, RelOptInfo *baserel,
 							VfdwTableMap *map);
 
+/*
+ * Refuse a search on a server declared cluster 'true'.
+ *
+ * Called before the shape is examined, so a query that is wrong in two ways is
+ * told about the one no rewrite of it will fix. See the definition for why the
+ * fan-out phase 4 already has is not the merge this needs.
+ */
+extern void vfdw_knn_require_standalone(Oid relid, VfdwTableMap *map);
+
 #endif							/* VFDW_KNN_H */

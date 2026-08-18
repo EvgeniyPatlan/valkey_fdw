@@ -52,7 +52,10 @@
 #include "catalog/pg_type.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
+#include "foreign/foreign.h"
 #include "utils/lsyscache.h"
+
+#include "vfdw_option.h"
 
 /*
  * PostgreSQL 18 replaced PathKey.pk_strategy with pk_cmptype. Both spell the
@@ -344,4 +347,53 @@ vfdw_knn_refuse(PlannerInfo *root, RelOptInfo *baserel, VfdwTableMap *map)
 			 errhint("The shape that runs is: SELECT ... FROM t ORDER BY "
 					 "<vector column> <-> <query vector> LIMIT <constant>, "
 					 "with no WHERE and no join.")));
+}
+
+/*
+ * A search on a cluster is refused, and this is where.
+ *
+ * FT.SEARCH IS PER SHARD. Each node holds its own index over its own slots, so
+ * a KNN query answered by one node returns that node's k nearest and calls
+ * them the keyspace's. A correct top-K across shards means asking every
+ * primary for k, then re-ranking the union and keeping k of it - and that
+ * merge is what nothing here has.
+ *
+ * Phase 4's fan-out is not it. The fan-out visits every primary and
+ * CONCATENATES what they return, which is exactly right for a keyspace scan -
+ * a key belongs to one node, so the union is the keyspace - and exactly wrong
+ * for a ranking, where the union of three ordered lists is not an ordered
+ * list.
+ *
+ * Refused at plan time, and before the shape is examined: a query whose ORDER
+ * BY is also wrong should be told about the cluster, because that is the fact
+ * no rewrite of the query will change.
+ *
+ * The OPTION is read rather than the connection asked. There is no connection
+ * at plan time and this must not open one - and the declaration is the right
+ * thing to test anyway, because it is what routes every command this table
+ * would send, whatever the server behind it turns out to be.
+ */
+void
+vfdw_knn_require_standalone(Oid relid, VfdwTableMap *map)
+{
+	ForeignTable *table = GetForeignTable(relid);
+	ForeignServer *server = GetForeignServer(table->serverid);
+	VfdwServerOptions opts;
+
+	vfdw_read_server_options(server->options, &opts);
+
+	if (!opts.cluster)
+		return;
+
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot search a Valkey Cluster"),
+			 errdetail("FT.SEARCH is answered by one node from its own slots, "
+					   "so index \"%s\" on a cluster would return that node's "
+					   "nearest rows as though they were the whole keyspace's. "
+					   "A correct answer needs every primary asked and the "
+					   "replies re-ranked, which is not implemented.",
+					   map->search_index),
+			 errhint("Point the table at a standalone server, or at one "
+					 "cluster node declared without cluster 'true'.")));
 }

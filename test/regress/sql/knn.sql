@@ -159,12 +159,31 @@ CREATE FOREIGN TABLE kn_nofield (
 SELECT k FROM kn_nofield ORDER BY nope <-> '[1,0,0,0]'::vector LIMIT 1;
 
 -- An index that does not exist. The server's own error, passed through.
+--
+-- The MESSAGE is not asserted, because it is not this wrapper's to promise:
+-- Valkey 9.0 says "Index with name 'x' not found" and 9.1 says the same thing
+-- with " in database 0" appended, and this suite runs against both. Recording
+-- one of them made the other a failure with nothing wrong in it. What is
+-- asserted is what this code is responsible for - that the server's error is
+-- passed through rather than swallowed, that it arrives as an error rather
+-- than as an empty result, and that whatever the server said still names the
+-- index the user asked for.
 CREATE FOREIGN TABLE kn_noindex (
     k   text      OPTIONS (key 'true'),
     emb vector(4) OPTIONS (field 'emb', index_type 'vector')
 ) SERVER kn_srv OPTIONS (tabletype 'vector', search_index 'no_such_index');
 
-SELECT k FROM kn_noindex ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 1;
+DO $$
+DECLARE
+    detail text;
+BEGIN
+    PERFORM k FROM kn_noindex ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 1;
+    RAISE EXCEPTION 'a search against a missing index returned instead of raising';
+EXCEPTION WHEN others THEN
+    GET STACKED DIAGNOSTICS detail = PG_EXCEPTION_DETAIL;
+    RAISE NOTICE 'raised, and the detail names the index: %',
+        position('no_such_index' in detail) > 0;
+END $$;
 
 -- A NULL query vector asks for the rows nearest to nothing.
 --

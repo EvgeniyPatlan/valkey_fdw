@@ -489,13 +489,15 @@ vfdwGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid
  * QUERY, so it belongs where the query is known.
  */
 static List *
-vfdwKnnPathkeys(PlannerInfo *root, RelOptInfo *baserel, double *rows)
+vfdwKnnPathkeys(PlannerInfo *root, RelOptInfo *baserel, Oid relid, double *rows)
 {
 	VfdwTableMap *map = (VfdwTableMap *) baserel->fdw_private;
 	VfdwKnnPlan knn;
 
 	if (map->tabletype != VFDW_TABLE_VECTOR)
 		return NIL;
+
+	vfdw_knn_require_standalone(relid, map);
 
 	if (!vfdw_knn_match(root, baserel, map, &knn))
 		vfdw_knn_refuse(root, baserel, map);
@@ -517,9 +519,7 @@ vfdwGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
 	double		rows = baserel->rows;
 	List	   *pathkeys;
 
-	(void) foreigntableid;
-
-	pathkeys = vfdwKnnPathkeys(root, baserel, &rows);
+	pathkeys = vfdwKnnPathkeys(root, baserel, foreigntableid, &rows);
 
 	/*
 	 * One round trip to get going, then one per page of keys plus the usual

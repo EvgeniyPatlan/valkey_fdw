@@ -477,7 +477,7 @@ MUTATIONS = [
     #
     # The replacement counts what it creates, so the mutation is the defect and
     # not merely a counter that stopped counting.
-    ("M2-rescan", "src/vfdw_scan.c",
+    ("M2-rescan", "src/vfdw_scan_open.c",
      "\tvfdw_scan_batch_resets++;\n\tMemoryContextReset(state->batch_cxt);",
      "\tvfdw_scan_batch_resets++;\n"
      "\tvfdw_scan_batch_contexts++;\n"
@@ -507,17 +507,26 @@ MUTATIONS = [
      "\t\t\tvfdw_cmd_add_cstr(cmd, \"WITHSCORES\");",
      "standalone", "legacy"),
 
-    # A vector table answers nothing, and the refusal is the whole feature.
+    # A vector table refuses every query shape it cannot serve.
     #
-    # Removing it does not fail: the table has a key column and a keyspace
-    # option, so the ordinary scan runs and returns rows. They are the right
-    # rows for `SELECT *` and the wrong ones, in the wrong order, for the
-    # nearest-neighbour query the table exists to serve - which is why the
-    # shape is refused rather than approximated. ddl selects from one three
-    # ways, so a scan that succeeds is what goes red.
-    ("V1-vectorquery", "src/vfdw_map_check.c",
-     "\tif (map->tabletype == VFDW_TABLE_VECTOR)\n\t\tereport(ERROR,",
-     "\tif (false)\n\t\tereport(ERROR,",
+    # The refusal used to be raised while building the map, and this mutation
+    # patched it there; 6.3 moved it to the access-path choice, where it is a
+    # fact about the query rather than about the table, and the old anchor went
+    # with it. PATTERN-NOT-FOUND in CI is what said so - the local run reported
+    # 56 RED out of 58 and the two missing verdicts were filtered out of the
+    # summary rather than counted.
+    #
+    # The refusal is now made in two places - the access-path choice and, as
+    # its second line, the plan encoder - so no single edit to either one lets
+    # a query through. What does is making the table type resolve as HASH, the
+    # thing a keyspace walk CAN answer: ddl then gets rows from all three of
+    # its vector queries, in an order that means nothing, which is the failure
+    # this refusal exists to prevent rather than a crash standing in for it.
+    ("V1-vectorquery", "src/vfdw_map.c",
+     "\t\t\tmap->tabletype = (VfdwTableType) vfdw_parse_enum(def, value);",
+     "\t\t\tmap->tabletype = (VfdwTableType) vfdw_parse_enum(def, value);\n"
+     "\t\tif (map->tabletype == VFDW_TABLE_VECTOR)\n"
+     "\t\t\tmap->tabletype = VFDW_TABLE_HASH;",
      "standalone", "ddl"),
 
     # A distance column belongs to a vector table and to no other.
@@ -616,6 +625,18 @@ MUTATIONS = [
      "\tif (len == 0)",
      "\tif (false)",
      "standalone", "vec"),
+
+    # A search on a cluster.
+    #
+    # THE ONE CLUSTER MUTATION WHOSE MUTANT RETURNS ROWS. Every other misrouting
+    # in this suite is caught by the server saying MOVED about a key it does not
+    # own; a shard-local top-K draws no objection from anyone, because each node
+    # answers correctly for its own slots. Removing the refusal gives a KNN
+    # query one node's nearest rows presented as the keyspace's.
+    ("K9-cluster", "src/vfdw_knn.c",
+     "\tif (!opts.cluster)\n\t\treturn;",
+     "\treturn;",
+     "cluster", "cluster"),
 ]
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

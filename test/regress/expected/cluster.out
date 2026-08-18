@@ -763,6 +763,46 @@ SELECT count(*) AS rolled_back FROM cl_t WHERE k = 'cl:{w}d';
 (1 row)
 
 DROP FOREIGN TABLE cl_t;
+-- ---------------------------------------------------------------------------
+-- A VECTOR SEARCH IS REFUSED ON A CLUSTER.
+--
+-- FT.SEARCH is answered by one node out of its own slots, so a KNN query
+-- against a cluster returns that node's k nearest rows as though they were
+-- the whole keyspace's. A correct top-K needs every primary asked and the
+-- union re-ranked, and the fan-out this phase built is not that merge: it
+-- CONCATENATES what the nodes return, which is right for a keyspace scan
+-- because a key belongs to one node, and wrong for a ranking because the
+-- union of ordered lists is not an ordered list.
+--
+-- This is the one refusal in this file that would otherwise produce ROWS. A
+-- misrouted key gets MOVED from the server; a shard-local top-K gets no
+-- objection from anyone, which is why it is refused here rather than left to
+-- be noticed.
+--
+-- No pgvector, and none needed: the refusal comes before the query's shape is
+-- looked at, so a query the server would reject for its ORDER BY is told
+-- about the cluster - the fact no rewrite of the query will change.
+-- ---------------------------------------------------------------------------
+CREATE FOREIGN TABLE cl_vec (
+    k    text             OPTIONS (key 'true'),
+    emb  bytea            OPTIONS (field 'emb', index_type 'vector'),
+    dist double precision OPTIONS (distance 'true')
+) SERVER cl OPTIONS (tabletype 'vector', search_index 'clidx');
+SELECT * FROM cl_vec;
+ERROR:  cannot search a Valkey Cluster
+DETAIL:  FT.SEARCH is answered by one node from its own slots, so index "clidx" on a cluster would return that node's nearest rows as though they were the whole keyspace's. A correct answer needs every primary asked and the replies re-ranked, which is not implemented.
+HINT:  Point the table at a standalone server, or at one cluster node declared without cluster 'true'.
+SELECT k FROM cl_vec ORDER BY k LIMIT 1;
+ERROR:  cannot search a Valkey Cluster
+DETAIL:  FT.SEARCH is answered by one node from its own slots, so index "clidx" on a cluster would return that node's nearest rows as though they were the whole keyspace's. A correct answer needs every primary asked and the replies re-ranked, which is not implemented.
+HINT:  Point the table at a standalone server, or at one cluster node declared without cluster 'true'.
+-- Writes are refused by their own reason, which is true on any topology and
+-- is reached before the cluster question is asked.
+INSERT INTO cl_vec VALUES ('v:1', '\x00'::bytea, 1.0);
+ERROR:  cannot insert into a Valkey "vector" table
+DETAIL:  A vector table is read through a search index, and writing one is not implemented.
+HINT:  Write the underlying hash keys through a tabletype 'hash' table over the same keyspace.
+DROP FOREIGN TABLE cl_vec;
 -- The per-node servers are named after addresses this suite does not choose,
 -- so they are dropped by pattern rather than by name.
 DO $$
