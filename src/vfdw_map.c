@@ -29,7 +29,7 @@
 #include "vfdw_map_check.h"
 
 static const char *const vfdw_tabletype_names[] = {
-	"string", "hash", "list", "set", "zset"
+	"string", "hash", "list", "set", "zset", "vector"
 };
 
 /*
@@ -84,6 +84,8 @@ vfdw_tabletype_supplies(VfdwTableType type)
 			return "a key and one member";
 		case VFDW_TABLE_ZSET:
 			return "a key, a member and a score";
+		case VFDW_TABLE_VECTOR:
+			return "a key, named fields and a distance";
 	}
 
 	/*
@@ -233,6 +235,23 @@ vfdw_map_check_table_options(const VfdwTableMap *map)
 	 * with a nil, while vfdw_scan_reply_is_absent reads emptiness only for the
 	 * container types.
 	 */
+	/*
+	 * A vector table is its index. Without one there is nothing to search and
+	 * nothing to fall back to: the table names no keyspace of its own, so the
+	 * alternative to refusing is a table that can only ever answer nothing.
+	 *
+	 * Like the trio above, this rule is between two TABLE options, so
+	 * vfdw_check_shape_options refuses it at CREATE and at ALTER, where the
+	 * mistake is. This is the second line, for a catalog row nothing
+	 * validated.
+	 */
+	if (map->tabletype == VFDW_TABLE_VECTOR && map->search_index == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("tabletype \"vector\" requires the search_index option"),
+				 errdetail("A vector table draws its rows from a valkey-search "
+						   "index, which nothing here names.")));
+
 	if (map->legacy_value && map->tabletype == VFDW_TABLE_STRING)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),

@@ -506,6 +506,43 @@ MUTATIONS = [
      "\t\t\t\tvfdw_cmd_add_cstr(cmd, \"WITHSCORES\");",
      "\t\t\tvfdw_cmd_add_cstr(cmd, \"WITHSCORES\");",
      "standalone", "legacy"),
+
+    # A vector table answers nothing, and the refusal is the whole feature.
+    #
+    # Removing it does not fail: the table has a key column and a keyspace
+    # option, so the ordinary scan runs and returns rows. They are the right
+    # rows for `SELECT *` and the wrong ones, in the wrong order, for the
+    # nearest-neighbour query the table exists to serve - which is why the
+    # shape is refused rather than approximated. ddl selects from one three
+    # ways, so a scan that succeeds is what goes red.
+    ("V1-vectorquery", "src/vfdw_map_check.c",
+     "\tif (map->tabletype == VFDW_TABLE_VECTOR)\n\t\tereport(ERROR,",
+     "\tif (false)\n\t\tereport(ERROR,",
+     "standalone", "ddl"),
+
+    # A distance column belongs to a vector table and to no other.
+    #
+    # The rule it replaced was "distance is not implemented", which was true of
+    # every table and told a user nothing about which line to change. Dropping
+    # the type test restores a hash table that claims to report a distance -
+    # accepted at CREATE, and filled by nothing at all. mapping declares one.
+    ("V2-distanceshape", "src/vfdw_map_check.c",
+     "\t\t\tif (map->tabletype != VFDW_TABLE_VECTOR)\n"
+     "\t\t\t\treturn \"distance columns require tabletype 'vector'\";",
+     "",
+     "standalone", "mapping"),
+
+    # search_index is required by a vector table, at CREATE rather than later.
+    #
+    # Without the validator rule the definition is accepted and the map's own
+    # second line catches it at the first query instead - which is a refusal
+    # at the wrong moment: the mistake is in the DDL, and the query that meets
+    # it may be someone else's. ddl creates such a table and asserts the
+    # CREATE itself fails.
+    ("V3-vectorindex", "src/valkey_fdw.c",
+     "\tbool\t\tindexed = false;",
+     "\tbool\t\tindexed = true;",
+     "standalone", "ddl"),
 ]
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

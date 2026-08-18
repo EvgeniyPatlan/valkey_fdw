@@ -31,7 +31,7 @@
 
 
 static const char *const vfdw_tabletype_values[] = {
-	"string", "hash", "list", "set", "zset", NULL
+	"string", "hash", "list", "set", "zset", "vector", NULL
 };
 
 static const char *const vfdw_tlsverify_values[] = {
@@ -201,16 +201,24 @@ const VfdwOptionDef vfdw_options[] = {
 	/*
 	 * ACCEPTED AND REFUSED, WHICH IS A POSITION RATHER THAN AN OVERSIGHT.
 	 *
-	 * search_index here, and ttl, distance and index_type in the column group
-	 * below, validate and then do not do what they name: the first plan over a
-	 * ttl or distance table raises 0A000, and the two search options are
-	 * simply never consulted - the ordinary key path answers, no qual reaches
-	 * an index. They are accepted so that a table definition can be written
-	 * ahead of the feature.
+	 * search_index here, and index_type in the column group below, validate
+	 * and are then never consulted on any table this wrapper can currently
+	 * answer: a tabletype 'vector' table is where they will mean something,
+	 * and every query against one is refused. They are accepted so that a
+	 * table definition can be written ahead of the feature.
 	 *
-	 * legacy_value is no longer one of them. It reads, and its writes are
-	 * refused for a reason of their own - a packed collection names no member,
-	 * so a row in it has no identity to update or delete by.
+	 * distance has left this list, and so has the old "accepted then refused
+	 * at plan time" arrangement it stood for. It is a shape rule now: a
+	 * distance column requires tabletype 'vector', and a vector table is
+	 * refused as a whole rather than column by column. That is a better
+	 * refusal because it names the table the user has to change rather than
+	 * the column that happens to be checked first.
+	 *
+	 * legacy_value is no longer one of them either. It reads, and it writes:
+	 * a packed row is the key and its array is the key's whole contents, so a
+	 * write says what the key should hold. Only a packed zset is still refused
+	 * every write, for a reason of its own - its read drops the scores, so an
+	 * array written back could not say what they should become.
 	 *
 	 * The rule that keeps this from being a broken promise: an option may be
 	 * accepted and refused only where a suite asserts the exact refusal and
@@ -218,9 +226,9 @@ const VfdwOptionDef vfdw_options[] = {
 	 * unasserted refusal is free to decay into a crash or - worse, because it
 	 * looks like an answer - a plausible empty result, with nothing going red;
 	 * and a refusal stated nowhere is indistinguishable from the outside from
-	 * an option somebody forgot to finish. test/regress/sql/ddl.sql holds all
-	 * five: the three refusals to their exact message, and the two search
-	 * options to the unchanged answer the key path gives with them set. An
+	 * an option somebody forgot to finish. test/regress/sql/ddl.sql holds
+	 * them: each refusal to its exact message, and the search options to the
+	 * unchanged answer the key path gives with them set on a hash table. An
 	 * option whose boundary cannot be spelled out there does not belong in
 	 * this table.
 	 */

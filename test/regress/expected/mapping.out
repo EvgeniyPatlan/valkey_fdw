@@ -169,14 +169,16 @@ CREATE FOREIGN TABLE map_ttl_no_field (
 EXPLAIN (COSTS OFF) SELECT * FROM map_ttl_no_field;
 ERROR:  column "t" cannot be used with tabletype "hash"
 DETAIL:  a ttl column must also name its field.
--- distance needs an index to have come from.
+-- distance needs a table type it could have come from. A search_index on a
+-- hash does not make one: the index is where the search happens, and the
+-- table type is what says a search happens at all.
 CREATE FOREIGN TABLE map_distance_no_index (
     k text,
     d double precision OPTIONS (distance 'true')
 ) SERVER map_srv OPTIONS (tabletype 'hash');
 EXPLAIN (COSTS OFF) SELECT * FROM map_distance_no_index;
 ERROR:  column "d" cannot be used with tabletype "hash"
-DETAIL:  distance columns require the search_index option.
+DETAIL:  distance columns require tabletype 'vector'.
 -- field columns are meaningless on a set.
 CREATE FOREIGN TABLE map_field_on_set (
     k text,
@@ -184,7 +186,7 @@ CREATE FOREIGN TABLE map_field_on_set (
 ) SERVER map_srv OPTIONS (tabletype 'set');
 EXPLAIN (COSTS OFF) SELECT * FROM map_field_on_set;
 ERROR:  column "f" cannot be used with tabletype "set"
-DETAIL:  field columns require tabletype 'hash'.
+DETAIL:  field columns require tabletype 'hash' or 'vector'.
 -- The three key-discovery strategies are alternatives. Documenting that and
 -- then accepting the combination anyway means silently ignoring one.
 --
@@ -246,6 +248,11 @@ EXPLAIN (COSTS OFF) SELECT * FROM map_legacy;
 -- rejects them - but no code fills their columns. Returning NULL would be a
 -- plausible empty result, which is the failure this wrapper exists to avoid,
 -- so they are refused at plan time until the phase that implements them.
+--
+-- The list is shorter than it was. ttl reads, and distance is no longer a
+-- column waiting on a phase but a column that belongs to a table type: it is
+-- what a vector search returns, so asking for one from a hash is a shape
+-- error, and the whole vector table is what is refused instead.
 -- ---------------------------------------------------------------------------
 CREATE FOREIGN TABLE map_ttl (
     k text,
@@ -259,14 +266,29 @@ EXPLAIN (COSTS OFF) SELECT * FROM map_ttl;
    Valkey Strategy: Keyspace Scan
 (2 rows)
 
+-- The shape error, which names the table type rather than the phase - a
+-- search_index on the table does not make a hash able to report a distance.
 CREATE FOREIGN TABLE map_distance (
     k text,
     d double precision OPTIONS (distance 'true')
 ) SERVER map_srv OPTIONS (tabletype 'hash', search_index 'idx');
 EXPLAIN (COSTS OFF) SELECT * FROM map_distance;
-ERROR:  column "d" reads distance, which is not implemented yet
+ERROR:  column "d" cannot be used with tabletype "hash"
+DETAIL:  distance columns require tabletype 'vector'.
+-- A field column on a vector table is accepted: a vector search answers with
+-- the hash the index indexed, so its fields are the row's columns. The table
+-- is refused for being unimplemented, not for the column being wrong, which
+-- is the distinction this pair is here to hold.
+CREATE FOREIGN TABLE map_vector_field (
+    k text,
+    f text OPTIONS (field 'f')
+) SERVER map_srv OPTIONS (tabletype 'vector', search_index 'idx');
+EXPLAIN (COSTS OFF) SELECT * FROM map_vector_field;
+ERROR:  tabletype 'vector' cannot be queried yet
+DETAIL:  A vector table is answered by FT.SEARCH against index "idx", which is not implemented.
+HINT:  The definition is accepted so a table can be written ahead of the feature. Use tabletype 'hash' to read the same keys through the ordinary key path.
 DROP SERVER map_srv CASCADE;
-NOTICE:  drop cascades to 23 other objects
+NOTICE:  drop cascades to 24 other objects
 DETAIL:  drop cascades to user mapping for vfdw on server map_srv
 drop cascades to foreign table map_key_only
 drop cascades to foreign table map_two
@@ -290,3 +312,4 @@ drop cascades to foreign table map_legacy_wide
 drop cascades to foreign table map_legacy
 drop cascades to foreign table map_ttl
 drop cascades to foreign table map_distance
+drop cascades to foreign table map_vector_field

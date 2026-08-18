@@ -41,7 +41,18 @@ typedef enum VfdwTableType
 	VFDW_TABLE_HASH,
 	VFDW_TABLE_LIST,
 	VFDW_TABLE_SET,
-	VFDW_TABLE_ZSET
+	VFDW_TABLE_ZSET,
+
+	/*
+	 * A keyspace searched through a valkey-search index rather than walked.
+	 *
+	 * Its rows come from FT.SEARCH, so it is not a container type the way the
+	 * five above are - the table names an index, and the index names the keys.
+	 * Nothing reads one yet: every query against it is refused, which is the
+	 * state the design calls step 2 and is the point of declaring the shape
+	 * before implementing it.
+	 */
+	VFDW_TABLE_VECTOR
 } VfdwTableType;
 
 typedef enum VfdwColKind

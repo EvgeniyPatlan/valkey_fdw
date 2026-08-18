@@ -32,6 +32,44 @@
 #include "vfdw_map_check.h"
 
 /*
+ * A position column belongs to a list and nothing else. A set has no order at
+ * all, and a zset's order is its scores - which a score column already
+ * reports, and which survives a concurrent write in a way an index does not.
+ */
+static const char *
+vfdw_map_position_conflict(VfdwTableMap *map, VfdwColumn *col)
+{
+	if (map->tabletype != VFDW_TABLE_LIST)
+		return "position columns require tabletype 'list'";
+	if (getBaseType(col->typid) != INT4OID &&
+		getBaseType(col->typid) != INT8OID)
+		return "position columns must be of type integer or bigint";
+	return NULL;
+}
+
+/*
+ * A ttl column reports one field's lifetime, so it needs a hash, a field to be
+ * paired with, and a type that can hold a duration.
+ *
+ * The slot is claimed before any of that is checked: it is the position this
+ * column's answer is read from, and the count HPTTL is told, and the two are
+ * assigned by this one walk so they cannot disagree.
+ */
+static const char *
+vfdw_map_ttl_conflict(VfdwTableMap *map, VfdwColumn *col)
+{
+	col->ttl_slot = map->nttl++;
+
+	if (map->tabletype != VFDW_TABLE_HASH)
+		return "ttl columns require tabletype 'hash'";
+	if (col->field == NULL)
+		return "a ttl column must also name its field";
+	if (getBaseType(col->typid) != INTERVALOID)
+		return "ttl columns must be of type interval";
+	return NULL;
+}
+
+/*
  * Why this column cannot mean anything for this table type, or NULL.
  *
  * Separate from the walk that reports it so the rules read as a list of rules.
@@ -47,8 +85,15 @@ vfdw_map_column_conflict(VfdwTableMap *map, VfdwColumn *col)
 	{
 		case VFDW_COL_FIELD:
 			map->nfields++;
-			if (map->tabletype != VFDW_TABLE_HASH)
-				return "field columns require tabletype 'hash'";
+
+			/*
+			 * A vector table's rows are hash keys too - FT.SEARCH over an
+			 * ON HASH index returns their fields - so a field column means
+			 * the same thing there as it does on a hash table.
+			 */
+			if (map->tabletype != VFDW_TABLE_HASH &&
+				map->tabletype != VFDW_TABLE_VECTOR)
+				return "field columns require tabletype 'hash' or 'vector'";
 			return NULL;
 
 		case VFDW_COL_SCORE:
@@ -64,32 +109,22 @@ vfdw_map_column_conflict(VfdwTableMap *map, VfdwColumn *col)
 			return NULL;
 
 		case VFDW_COL_POSITION:
-
-			/*
-			 * A list, and nothing else. A set has no order at all, and a zset's
-			 * order is its scores - which a score column already reports, and
-			 * which survives a concurrent write in a way an index does not.
-			 */
-			if (map->tabletype != VFDW_TABLE_LIST)
-				return "position columns require tabletype 'list'";
-			if (getBaseType(col->typid) != INT4OID &&
-				getBaseType(col->typid) != INT8OID)
-				return "position columns must be of type integer or bigint";
-			return NULL;
+			return vfdw_map_position_conflict(map, col);
 
 		case VFDW_COL_TTL:
-			col->ttl_slot = map->nttl++;
-			if (map->tabletype != VFDW_TABLE_HASH)
-				return "ttl columns require tabletype 'hash'";
-			if (col->field == NULL)
-				return "a ttl column must also name its field";
-			if (getBaseType(col->typid) != INTERVALOID)
-				return "ttl columns must be of type interval";
-			return NULL;
+			return vfdw_map_ttl_conflict(map, col);
 
 		case VFDW_COL_DISTANCE:
-			if (map->search_index == NULL)
-				return "distance columns require the search_index option";
+
+			/*
+			 * One rule, not two. "It also needs a search_index" was the
+			 * second, and a vector table cannot lack one: that is refused at
+			 * CREATE and again by vfdw_map_check_table_options, which runs
+			 * before this walk. Keeping it would have been a branch no input
+			 * reaches, saying something the table type already guarantees.
+			 */
+			if (map->tabletype != VFDW_TABLE_VECTOR)
+				return "distance columns require tabletype 'vector'";
 			return NULL;
 
 		case VFDW_COL_VALUE:
@@ -138,6 +173,32 @@ void
 vfdw_map_check_implemented(VfdwTableMap *map, TupleDesc tupdesc)
 {
 	int			i;
+
+	/*
+	 * A VECTOR TABLE IS REFUSED WHOLE, not column by column.
+	 *
+	 * Its rows come from FT.SEARCH and nothing here issues one, so there is no
+	 * query shape it can answer - not a KNN query, and not a plain SELECT
+	 * either. The alternative would be to fall back to walking the keyspace,
+	 * which answers the plain SELECT correctly and answers the KNN query with
+	 * rows in the wrong order and no k applied. Refusing both is the honest
+	 * state, and it is what makes declaring the shape ahead of the feature
+	 * safe: the definition is accepted, and nothing pretends to serve it.
+	 *
+	 * Before the per-column loop, so a vector table is refused for being one
+	 * rather than for the distance column it probably also has. The message a
+	 * user needs is about the table.
+	 */
+	if (map->tabletype == VFDW_TABLE_VECTOR)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("tabletype 'vector' cannot be queried yet"),
+				 errdetail("A vector table is answered by FT.SEARCH against "
+						   "index \"%s\", which is not implemented.",
+						   map->search_index),
+				 errhint("The definition is accepted so a table can be written "
+						 "ahead of the feature. Use tabletype 'hash' to read "
+						 "the same keys through the ordinary key path.")));
 
 	for (i = 0; i < map->natts; i++)
 	{

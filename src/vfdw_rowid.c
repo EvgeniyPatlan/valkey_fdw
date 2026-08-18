@@ -81,6 +81,19 @@ vfdw_rowid_shape(const VfdwTableMap *map, CmdType operation, VfdwRowId *out)
 				out->want_key = !singleton;
 				out->want_member = true;
 				break;
+
+			case VFDW_TABLE_VECTOR:
+
+				/*
+				 * Unreachable: vfdw_refuse_unwritable turns a vector table
+				 * away before row identity is asked for, because it is
+				 * read-only until the search phase lands. The key is named
+				 * anyway rather than left blank - a shape that starts
+				 * answering writes should do so with an identity, not with
+				 * whatever this happened to leave behind.
+				 */
+				out->want_key = !singleton;
+				break;
 		}
 	}
 

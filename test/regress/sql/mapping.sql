@@ -122,7 +122,9 @@ CREATE FOREIGN TABLE map_ttl_no_field (
 ) SERVER map_srv OPTIONS (tabletype 'hash');
 EXPLAIN (COSTS OFF) SELECT * FROM map_ttl_no_field;
 
--- distance needs an index to have come from.
+-- distance needs a table type it could have come from. A search_index on a
+-- hash does not make one: the index is where the search happens, and the
+-- table type is what says a search happens at all.
 CREATE FOREIGN TABLE map_distance_no_index (
     k text,
     d double precision OPTIONS (distance 'true')
@@ -178,6 +180,11 @@ EXPLAIN (COSTS OFF) SELECT * FROM map_legacy;
 -- rejects them - but no code fills their columns. Returning NULL would be a
 -- plausible empty result, which is the failure this wrapper exists to avoid,
 -- so they are refused at plan time until the phase that implements them.
+--
+-- The list is shorter than it was. ttl reads, and distance is no longer a
+-- column waiting on a phase but a column that belongs to a table type: it is
+-- what a vector search returns, so asking for one from a hash is a shape
+-- error, and the whole vector table is what is refused instead.
 -- ---------------------------------------------------------------------------
 CREATE FOREIGN TABLE map_ttl (
     k text,
@@ -186,10 +193,22 @@ CREATE FOREIGN TABLE map_ttl (
 ) SERVER map_srv OPTIONS (tabletype 'hash');
 EXPLAIN (COSTS OFF) SELECT * FROM map_ttl;
 
+-- The shape error, which names the table type rather than the phase - a
+-- search_index on the table does not make a hash able to report a distance.
 CREATE FOREIGN TABLE map_distance (
     k text,
     d double precision OPTIONS (distance 'true')
 ) SERVER map_srv OPTIONS (tabletype 'hash', search_index 'idx');
 EXPLAIN (COSTS OFF) SELECT * FROM map_distance;
+
+-- A field column on a vector table is accepted: a vector search answers with
+-- the hash the index indexed, so its fields are the row's columns. The table
+-- is refused for being unimplemented, not for the column being wrong, which
+-- is the distinction this pair is here to hold.
+CREATE FOREIGN TABLE map_vector_field (
+    k text,
+    f text OPTIONS (field 'f')
+) SERVER map_srv OPTIONS (tabletype 'vector', search_index 'idx');
+EXPLAIN (COSTS OFF) SELECT * FROM map_vector_field;
 
 DROP SERVER map_srv CASCADE;

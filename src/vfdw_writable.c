@@ -84,17 +84,19 @@ vfdw_map_read_writability(List *options, VfdwWritability *w)
 }
 
 /*
- * Does any column of this relation name a source nothing fills yet?
+ * Does any column of this relation ask for a distance?
  *
  * Table options alone used to decide writability, so a hash table with a
  * distance column was advertised through information_schema as fully writable
- * while it could not even be SELECTed. Returns the option's name rather than a
- * bool so the refusal can name what it found. The syscache is walked directly rather than
- * through the relcache because this must not open a relation and must not
+ * while it could not even be SELECTed. A distance belongs to a tabletype
+ * 'vector' table, which is blocked above by its type - so what reaches here is
+ * the shape vfdw_map_column_conflict refuses, and it must not be called
+ * writable on the way to that refusal. The syscache is walked directly rather
+ * than through the relcache because this must not open a relation and must not
  * raise; attnums are contiguous, so the first miss is the end.
  */
-static const char *
-vfdw_map_has_unimplemented_column(Oid relid)
+static bool
+vfdw_map_has_distance_column(Oid relid)
 {
 	AttrNumber	attnum;
 
@@ -106,7 +108,7 @@ vfdw_map_has_unimplemented_column(Oid relid)
 		tp = SearchSysCache2(ATTNUM, ObjectIdGetDatum(relid),
 							 Int16GetDatum(attnum));
 		if (!HeapTupleIsValid(tp))
-			return NULL;
+			return false;
 		ReleaseSysCache(tp);
 
 		foreach(lc, GetForeignColumnOptions(relid, attnum))
@@ -123,11 +125,11 @@ vfdw_map_has_unimplemented_column(Oid relid)
 			if (strcmp(elem->defname, "distance") != 0)
 				continue;
 			if (parse_bool(defGetString(elem), &flag) && flag)
-				return elem->defname;
+				return true;
 		}
 	}
 
-	return NULL;
+	return false;
 }
 
 /*
@@ -166,6 +168,13 @@ vfdw_map_write_block(Oid relid, const VfdwWritability *w, const char **hint)
 		return "A packed zset reads its members without their scores, so an "
 			"array written back could not say what the scores should be.";
 	}
+	if (strcmp(w->tabletype, "vector") == 0)
+	{
+		*hint = "Write the underlying hash keys through a tabletype 'hash' "
+			"table over the same keyspace.";
+		return "A vector table is read through a search index, and writing "
+			"one is not implemented.";
+	}
 	if (w->search_index)
 	{
 		*hint = "Drop the search_index option to use the ordinary key path.";
@@ -178,11 +187,11 @@ vfdw_map_write_block(Oid relid, const VfdwWritability *w, const char **hint)
 		return "This table names more than one key-discovery option, so no "
 			"key can be resolved for a row.";
 	}
-	if (vfdw_map_has_unimplemented_column(relid) != NULL)
+	if (vfdw_map_has_distance_column(relid))
 	{
-		*hint = "Drop the column, or wait for the phase that fills it.";
-		return "A column of this table reads distance, which is not "
-			"implemented.";
+		*hint = "Drop the column, or declare the table tabletype 'vector'.";
+		return "A distance column is what a search returns, and this table is "
+			"not searched, so nothing fills it.";
 	}
 
 	return NULL;

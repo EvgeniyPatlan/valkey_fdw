@@ -456,6 +456,36 @@ vfdw_ledger_fold_rename(VfdwKeyPlan *plan, const VfdwWriteOp *op)
 	}
 }
 
+/*
+ * A packed op replaces the key's whole contents, so it does not go through the
+ * per-type folds at all - those edit one thing inside a key.
+ */
+static void
+vfdw_ledger_fold_packed_op(VfdwKeyPlan *plan, const VfdwWriteOp *op)
+{
+	vfdw_ledger_fold_packed(plan, op);
+
+	if (op->kind == VFDW_OP_INSERT)
+		vfdw_ledger_keyset(plan, op, op->key, op->keylen, true);
+	if (plan->state == VFDW_KEY_DELETED)
+		plan->state = VFDW_KEY_LIVE;
+}
+
+/*
+ * A vector table has no write fold, and reaching this says the refusal that
+ * should have stopped it did not.
+ *
+ * Loud rather than a silent no-op: an arm that fell through would fold the
+ * write into no actions at all, and the transaction would commit having
+ * written nothing. That is the worst shape of failure this ledger can produce,
+ * because every layer above it reports success.
+ */
+static void
+vfdw_ledger_no_vector_writes(void)
+{
+	elog(ERROR, "valkey_fdw: a vector table reached the write fold");
+}
+
 /* A whole-key delete: the shapes whose row IS the key. */
 static bool
 vfdw_ledger_fold_key_delete(VfdwKeyPlan *plan, const VfdwWriteOp *op)
@@ -498,17 +528,9 @@ vfdw_ledger_note(const VfdwWriteOp *op, Relation rel)
 	if (vfdw_ledger_fold_key_delete(plan, op))
 		return;
 
-	/*
-	 * A packed op replaces the key's whole contents, so it does not go through
-	 * the per-type folds at all - those edit one thing inside a key.
-	 */
 	if (op->packed_shape)
 	{
-		vfdw_ledger_fold_packed(plan, op);
-		if (op->kind == VFDW_OP_INSERT)
-			vfdw_ledger_keyset(plan, op, op->key, op->keylen, true);
-		if (plan->state == VFDW_KEY_DELETED)
-			plan->state = VFDW_KEY_LIVE;
+		vfdw_ledger_fold_packed_op(plan, op);
 		return;
 	}
 
@@ -530,6 +552,12 @@ vfdw_ledger_note(const VfdwWriteOp *op, Relation rel)
 
 		case VFDW_TABLE_LIST:
 			vfdw_ledger_fold_list(plan, op);
+			break;
+
+		case VFDW_TABLE_VECTOR:
+
+			/* Unreachable; see vfdw_ledger_no_vector_writes. */
+			vfdw_ledger_no_vector_writes();
 			break;
 	}
 

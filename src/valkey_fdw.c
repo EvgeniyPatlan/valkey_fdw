@@ -232,6 +232,7 @@ vfdw_check_shape_options(List *options)
 {
 	const char *tabletype = NULL;
 	bool		legacy = false;
+	bool		indexed = false;
 	ListCell   *lc;
 
 	foreach(lc, options)
@@ -242,7 +243,20 @@ vfdw_check_shape_options(List *options)
 			tabletype = defGetString(def);
 		else if (strcmp(def->defname, "legacy_value") == 0)
 			legacy = defGetBoolean(def);
+		else if (strcmp(def->defname, "search_index") == 0)
+			indexed = true;
 	}
+
+	if (tabletype != NULL && strcmp(tabletype, "vector") == 0 && !indexed)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("tabletype \"vector\" requires the search_index option"),
+				 errdetail("A vector table's rows come from a search index. "
+						   "Without one it names no keys at all, where every "
+						   "other table type names them by prefix, by set or "
+						   "by being a single key."),
+				 errhint("Add OPTIONS (search_index 'name'), or use a table "
+						 "type that walks the keyspace.")));
 
 	if (legacy && tabletype != NULL && strcmp(tabletype, "string") == 0)
 		ereport(ERROR,

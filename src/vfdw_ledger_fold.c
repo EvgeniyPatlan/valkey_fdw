@@ -347,11 +347,13 @@ vfdw_ledger_fold_packed(VfdwKeyPlan *plan, const VfdwWriteOp *op)
 
 			case VFDW_TABLE_ZSET:
 			case VFDW_TABLE_STRING:
+			case VFDW_TABLE_VECTOR:
 
 				/*
 				 * Unreachable. A packed zset is refused every write because
-				 * its read drops the scores, and legacy_value with tabletype
-				 * 'string' is refused at CREATE.
+				 * its read drops the scores, legacy_value with tabletype
+				 * 'string' is refused at CREATE, and a vector table is
+				 * refused every write outright.
 				 */
 				elog(ERROR, "valkey_fdw: packed write for table type %d",
 					 (int) op->tabletype);

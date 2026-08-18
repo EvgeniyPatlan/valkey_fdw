@@ -45,7 +45,7 @@ including against a cluster. Vector search does not.
 | Transport | TLS with hostname verification, ACL auth, RESP3 with a tested RESP2 fallback |
 | Cluster | slot discovery, per-node pooling, fan-out scans, `MOVED`/`ASK`, single-slot writes |
 | Field expiry | a `ttl` column reads and writes a hash field's time to live as an `interval`, on a server that has per-field expiry (Valkey 9+) |
-| Accepted, then refused | `distance` columns. The validator takes them so a table can be defined ahead of the feature; the first query against such a table raises `0A000` |
+| Accepted, then refused | `tabletype 'vector'` tables. The definition is taken so a table can be written ahead of the feature; every query and every write against one raises `0A000` |
 | Declared, not routed | `prefer_replica` marks a server a replica and refuses writes through it. It sends no read anywhere else |
 
 Three qualifications, stated once here rather than repeated below.
@@ -58,11 +58,13 @@ wrong idea will be changed rather than carried for compatibility with a version
 nobody ran.
 
 **A shape in the *accepted, then refused* row is a definition you may write and
-a query you may not run.** `search_index` and `index_type` stop one step short
-of that: they are accepted, they raise nothing, and nothing consults them — no
-qual reaches the index, and a table carrying one cannot be written. Between
-those two and a refused `distance` column, vector similarity search is absent
-rather than partial. No date is attached to it or to the other one.
+a query you may not run.** `tabletype 'vector'` is that shape: it names an
+index, it takes `field`, `index_type` and `distance` columns, and it answers
+nothing. On any other table type `search_index` and `index_type` stop one step
+short of even that — accepted, raising nothing, consulted by nothing, with no
+qual reaching an index and no write allowed through such a table. Vector
+similarity search is therefore absent rather than partial. No date is attached
+to it.
 
 **Every claim of working behaviour above is a suite rather than a sentence.**
 `harness.sh ci` runs those suites across three PostgreSQL majors, two Valkey
@@ -374,23 +376,26 @@ anything that would need two is refused when it is issued — not discovered at
 | A second logical `database` in one transaction | `0A000` |
 | More than `write_max_ops` operations, or `write_max_bytes` accumulated | `54000` |
 | `UPDATE` on a `tabletype 'list'` table | `0A000` |
-| Any write to a `legacy_value 'true'` table | `0A000` |
+| Any write to a `legacy_value 'true'` **zset** table | `0A000` |
 | Any write to a `readonly 'true'` table, including `COPY FROM` | core's own message |
 | Any write to a server with `prefer_replica 'true'` | `25006` |
 | `INSERT ... ON CONFLICT`, any form | `0A000` |
 | `PREPARE TRANSACTION` for a transaction that wrote | `0A000` |
 | `TRUNCATE` | core's "cannot truncate foreign table" |
 | `MERGE` | core's own refusal |
+| Any query or write against a `tabletype 'vector'` table | `0A000` |
 
 Two further refusals arrive from the server at `COMMIT`, because they are
 facts about the keyspace rather than about the statement: a key that already
 exists where one is being created (`23505`), and a key holding a different
 Valkey type than its table declares (`42804`).
 
-One shape is refused in both directions rather than only on write, at the
-first plan over the table and at `0A000`: a `distance` column. That is the
+The last row is refused in both directions rather than only on write, and
+at the first plan over the table rather than at `COMMIT`. It is the
 unimplemented shape described under *Usage*, and the refusal is what stands in
-for it.
+for it: a vector table's rows come from `FT.SEARCH`, and walking its keyspace
+instead would answer a plain `SELECT` correctly and a nearest-neighbour query
+with the wrong rows in the wrong order.
 
 A `ttl` column is refused only when the server has no per-field expiry, which
 is a fact about the server rather than about the wrapper. It is reported when
@@ -575,12 +580,36 @@ all; here the query supplies the schema and the table supplies the bytes.
 - `tabletype 'string'` is refused with it: a string holds one value and has no
   members, and `(key, value text)` already reads it.
 
-One thing in the option tables below may be written into a table definition
-and cannot yet be queried: a `distance` column. It is **not implemented**:
-declaring one is accepted, and the first plan over it raises `0A000`, in either
-direction. It is accepted by the validator so that a table definition can be
-written ahead of the feature, which is the only reason it appears in the option
-tables at all.
+### `tabletype 'vector'`, declared and not implemented
+
+One shape in the option tables below may be written into a table definition and
+cannot yet be queried. A vector table names a valkey-search index instead of a
+keyspace:
+
+```sql
+CREATE FOREIGN TABLE doc_knn (
+  key text            OPTIONS (key 'true'),
+  title text          OPTIONS (field 'title'),
+  tag text            OPTIONS (field 'tag', index_type 'tag'),
+  dist double precision OPTIONS (distance 'true')
+) SERVER cache OPTIONS (tabletype 'vector', search_index 'doc_idx');
+```
+
+The definition is accepted. Every query and every write against it raises
+`0A000`, naming the table type. `search_index` is required rather than
+optional here — a vector table's rows come only from its index, so without one
+it names no keys at all — and that requirement is checked at `CREATE` and at
+`ALTER`, not at the first query.
+
+`distance` belongs to this shape and to no other: a distance is what a search
+returns, so a `distance` column on a hash is a table definition error naming
+the column. `field` columns are accepted on a vector table because a search
+answers with the hash its index indexed, so the same field mapping applies.
+
+The alternative to refusing was to walk the keyspace instead, which answers a
+plain `SELECT` correctly and answers a nearest-neighbour query with the wrong
+rows in the wrong order. A definition written ahead of the feature is the
+reason these options appear in the tables at all.
 
 A `ttl` column is not one of them. It reads a hash field's remaining time to
 live as an `interval`, and reports NULL both for a field with no expiry and for
@@ -607,10 +636,10 @@ opens rather than at `COMMIT`. Whether the server has it is settled by asking
 it about the three verbs actually sent, not by reading a version, so a fork or
 a backport is judged on what it can do.
 
-`search_index` and `index_type` fail differently: they are accepted and simply
-not consulted. No qual reaches the index, and a write through a table carrying
-a `search_index` is refused, because the search path is what would serve such a
-table — and it is where a `distance` column's score would arrive.
+On any table type other than `vector`, `search_index` and `index_type` fail
+differently again: they are accepted and simply not consulted. No qual reaches
+the index, and a write through a table carrying a `search_index` is refused,
+because the search path is what would serve such a table.
 
 ## Options
 
@@ -708,11 +737,11 @@ it on is not.
 | Option | Type | Default | Description | Superuser |
 |---|---|---|---|---|
 | `database` | integer | `0` | Logical database; not valid in cluster mode | no |
-| `tabletype` | enum | `string` | `string`, `hash`, `list`, `set` or `zset` | no |
+| `tabletype` | enum | `string` | `string`, `hash`, `list`, `set`, `zset` or `vector`; `vector` is accepted and refused at plan time | no |
 | `keyprefix` | string | — | Literal key prefix scoping the table | no |
 | `keyset` | string | — | Set holding the table's key names | no |
 | `singleton_key` | string | — | Draw all rows from this single key | no |
-| `search_index` | string | — | valkey-search index backing this table; accepted and not consulted | no |
+| `search_index` | string | — | valkey-search index backing this table; required by `tabletype 'vector'`, accepted and not consulted on every other table type | no |
 | `legacy_value` | boolean | `false` | Expose the whole collection as one `text[]` or `bytea[]` column, one row per key; read-only, and needs a collection `tabletype` | no |
 | `readonly` | boolean | `false` | Reject all writes on this table | no |
 
@@ -721,12 +750,12 @@ it on is not.
 | Option | Type | Default | Description | Superuser |
 |---|---|---|---|---|
 | `key` | boolean | `false` | Column holds the Valkey key name | no |
-| `field` | string | — | Hash field name | no |
+| `field` | string | — | Hash field name; needs `tabletype 'hash'` or `'vector'` | no |
 | `member` | boolean | `false` | Column holds the list/set/zset member | no |
 | `score` | boolean | `false` | Column holds the zset score | no |
 | `position` | boolean | `false` | Column holds the member's zero-based index in its list; read-only, needs `tabletype 'list'` and `integer` or `bigint` | no |
 | `ttl` | boolean | `false` | Column holds the paired field's time to live, as an `interval`; needs `tabletype 'hash'`, a `field`, and Valkey 9+ | no |
-| `distance` | boolean | `false` | Column receives the vector search score; accepted and refused at plan time | no |
+| `distance` | boolean | `false` | Column receives the vector search score; needs `tabletype 'vector'` | no |
 | `index_type` | enum | — | `tag`, `numeric` or `vector`; accepted and not consulted | no |
 
 <!-- options:end -->

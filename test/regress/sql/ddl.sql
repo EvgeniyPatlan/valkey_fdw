@@ -185,8 +185,9 @@ CREATE FOREIGN TABLE w_distance (
 ) SERVER w_srv OPTIONS (search_index 'idx');
 
 -- The read direction. Each message names the column or the shape that is
--- waiting, not the table type, because that is the line the user has to
--- delete to make the query run. One shape is left: distance.
+-- waiting, and for a distance column that is now the TABLE TYPE rather than
+-- the column: a distance is what a vector search returns, so the column
+-- belongs to a tabletype 'vector' table and is a shape error anywhere else.
 -- legacy_value is no longer among them, so this one is seeded and asserted on
 -- what comes back rather than on the refusal it used to raise.
 SELECT valkey_fdw_test_probe('w_srv', 0, 'HSET', 'ddl:legacy:h', 'f', 'fv')
@@ -199,6 +200,44 @@ SELECT k, v FROM w_legacy ORDER BY k;
 -- changes with the server. The read and the refusal both belong in the ttl
 -- suite, which runs only where each of them means something.
 SELECT * FROM w_distance;
+
+-- ---------------------------------------------------------------------------
+-- tabletype 'vector', which is declared and answers nothing.
+--
+-- Its rows come from FT.SEARCH and nothing here issues one. The alternative
+-- to refusing was to walk the keyspace instead, which answers a plain SELECT
+-- correctly and answers a KNN query with the wrong rows in the wrong order -
+-- so the shape that cannot be served is refused whole, and the definition is
+-- still accepted so a table can be written ahead of the feature.
+-- ---------------------------------------------------------------------------
+CREATE FOREIGN TABLE w_vector (
+    k text OPTIONS (key 'true'),
+    t text OPTIONS (field 'tag', index_type 'tag'),
+    d double precision OPTIONS (distance 'true')
+) SERVER w_srv OPTIONS (tabletype 'vector', search_index 'idx');
+
+-- Refused for being a vector table, not for the distance column it also has.
+-- The message a user can act on is the one about the table.
+SELECT * FROM w_vector;
+SELECT k FROM w_vector WHERE k = 'ddl:v:1';
+SELECT count(*) FROM w_vector;
+
+-- A vector table with no index has nothing to search and no keyspace of its
+-- own to fall back to, so it is refused at CREATE rather than at the query.
+CREATE FOREIGN TABLE w_vector_noindex (k text, v text) SERVER w_srv
+    OPTIONS (tabletype 'vector');
+
+-- Writes reach the SAME refusal, which is not the write-side reason
+-- vfdw_map_writability holds for a vector table: planning happens before the
+-- executor consults the updatable mask, so the shape refusal is what a user
+-- sees. The mask is asserted below on its own, because it is what
+-- information_schema reports and nothing else would notice it changing.
+INSERT INTO w_vector VALUES ('ddl:v:1', 'x', 1.0);
+UPDATE w_vector SET t = 'y';
+DELETE FROM w_vector;
+
+SELECT c.relname, pg_relation_is_updatable(c.oid, false) AS mask
+FROM pg_class c WHERE c.relname = 'w_vector';
 
 -- w_legacy is no longer one of these either. A packed row is the key and its
 -- array is the key's whole contents, so a write names the key and says what it

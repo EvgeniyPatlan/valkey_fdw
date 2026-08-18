@@ -61,6 +61,14 @@ vfdw_estimate_count_verb(VfdwTableType type)
 		case VFDW_TABLE_ZSET:
 			return "ZCARD";
 		case VFDW_TABLE_STRING:
+		case VFDW_TABLE_VECTOR:
+
+			/*
+			 * A string holds one value, and a vector table is an index rather
+			 * than a key: FT.SEARCH answers how many documents matched a
+			 * query, which is not the same question as how many rows the
+			 * table has. Neither has a count worth one command.
+			 */
 			break;
 	}
 	return NULL;
