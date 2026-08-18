@@ -1,7 +1,13 @@
 # valkey_fdw - foreign data wrapper for Valkey
 #
-# All supported builds run inside the containers described in docker/.
-# Building on a host toolchain is unsupported; use scripts/harness.sh.
+# scripts/harness.sh is how this is developed and tested: it pins the
+# toolchain, the PostgreSQL major and the Valkey version, so "green locally"
+# and "green in CI" are the same statement.
+#
+# A HOST BUILD IS SUPPORTED, and is what the packaging does - see "Building
+# from source" in README.md for the prerequisites. It is PGXS, so a plain
+# `make PG_CONFIG=...` works; what the harness adds is the test environment,
+# not the ability to compile.
 
 # Two extensions, one shared library. valkey_fdw_test carries the diagnostic
 # functions and nothing else, so that an install which will never run the

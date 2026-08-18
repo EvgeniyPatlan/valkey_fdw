@@ -19,8 +19,11 @@ override_dh_auto_build:
 	# Cloned rather than taken from vendor/: the tree carries no vendored
 	# copy, so the package fetches the pinned tag and is self-contained.
 	rm -rf _libvalkey
-	git clone --depth 1 --branch $(LIBVALKEY_REF) \
-	    https://github.com/valkey-io/libvalkey.git _libvalkey
+# From the source tarball rather than a clone: Debian's buildd builds offline
+# from the source package, so a rules file that reaches GitHub cannot be
+# uploaded. scripts/fetch-libvalkey.sh --archive produces the tarball.
+	tar -xzf vendor/libvalkey-$(LIBVALKEY_REF).tar.gz
+	mv libvalkey-$(LIBVALKEY_REF) _libvalkey
 #	CMAKE_INSTALL_LIBDIR is set rather than left to GNUInstallDirs, which
 #	answers lib here and lib64 on a 64-bit RPM distribution. The Makefile
 #	names lib, so the default happens to be right on this half of the target

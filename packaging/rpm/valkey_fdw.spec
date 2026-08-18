@@ -81,12 +81,16 @@ full or not at all.
 %autosetup -n %{name}-%{version}
 
 %build
-# libvalkey is CLONED here rather than taken from vendor/, because the tree
-# carries no vendored copy - VALKEY_VENDORED expects one and nothing populates
-# it. Cloning at the pinned tag makes the package self-contained and makes the
-# version in the binary the version this suite tests against.
-git clone --depth 1 --branch %{libvalkey_ref} \
-    https://github.com/valkey-io/libvalkey.git _libvalkey
+# libvalkey comes from the SOURCE TARBALL in the tree, not from a clone.
+#
+# rpmbuild here has to work the way a distribution's build system works, and
+# Koji, OBS and their equivalents run offline from declared sources: a spec
+# that reaches GitHub during %%build cannot be submitted to any of them. The
+# tarball is produced once by scripts/fetch-libvalkey.sh --archive and travels
+# with the source, so the version in the binary is still the pinned one and
+# still the one the suites test against.
+tar -xzf vendor/libvalkey-%{libvalkey_ref}.tar.gz
+mv libvalkey-%{libvalkey_ref} _libvalkey
 # CMAKE_INSTALL_LIBDIR is set rather than left to GNUInstallDirs, which
 # answers lib64 on a 64-bit RPM distribution and lib on a Debian one. The
 # Makefile names lib, so the default is right on one half of the target matrix

@@ -416,6 +416,42 @@ versions, so packing them would make the array's shape depend on the transport
 — and an array of bare members cannot say what any score should become. Map the
 members and scores to columns to write them.
 
+## Building from source
+
+The suites run in containers, and that is how this is developed — but the
+build itself is plain PGXS and needs no container. The packaging does exactly
+what follows.
+
+Prerequisites: a C compiler, `make`, PostgreSQL 16, 17 or 18 server headers
+(`postgresql-server-dev-17`, `postgresql17-devel`, or your distribution's
+name for them), `libssl-dev`, and libvalkey 0.5.0+ — either the system package
+or the vendored build below. `cmake` as well if you vendor it.
+
+```sh
+# Against a system libvalkey
+make PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
+sudo make install PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
+```
+
+**No distribution in the packaging matrix ships libvalkey**, which is why the
+packages link it statically. To do the same:
+
+```sh
+# Once, on a machine with network access: fetch the pinned source
+./scripts/fetch-libvalkey.sh --archive        # -> vendor/libvalkey-0.5.0.tar.gz
+
+# Then, offline: build it and link against it
+./scripts/fetch-libvalkey.sh                  # unpacks and builds vendor/libvalkey
+make VALKEY_VENDORED=1 PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
+```
+
+**Nothing in a build reaches the network.** The one step that does is
+`--archive`, and it is separate for that reason: the build systems
+distributions use — Koji, OBS, Debian's buildd — run offline from declared
+sources, so a build that cloned during compilation could not be submitted to
+any of them. `scripts/package.sh` fetches the source drop before it starts and
+the package builds themselves take it from the tree.
+
 ## Upgrading
 
 Each version ships its full install script and the upgrade step from the one

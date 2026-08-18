@@ -7,6 +7,11 @@
 *.gcov
 /coverage/
 /vendor/libvalkey/
+# The libvalkey source drop. Fetched by scripts/fetch-libvalkey.sh --archive
+# and consumed by every build here without touching the network; not committed
+# for the reason dist/ is not, and because it is upstream's source rather than
+# this project's.
+/vendor/libvalkey-*.tar.gz
 
 # Distribution packages. scripts/package.sh builds them from the tree, so they
 # are release output rather than source: committing them adds roughly a

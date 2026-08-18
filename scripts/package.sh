@@ -102,6 +102,21 @@ el_for() {
     esac
 }
 
+# The libvalkey source, fetched once on the host so the package build itself
+# never reaches the network.
+#
+# That is the whole point of the tarball: rpmbuild and dpkg-buildpackage below
+# run the way a distribution's build system runs them, and those build offline
+# from declared sources. Fetching here rather than there keeps the one step
+# that needs the network outside the step that must not.
+ensure_libvalkey_source() {
+    local ref="${LIBVALKEY_REF:-0.5.0}"
+
+    [[ -f "vendor/libvalkey-${ref}.tar.gz" ]] && return 0
+    say "fetching libvalkey ${ref} source"
+    LIBVALKEY_REF="$ref" bash scripts/fetch-libvalkey.sh --archive
+}
+
 build_one() {
     local target="$1" family base image out
     family="$(family_for "$target")"
@@ -110,6 +125,8 @@ build_one() {
     out="dist/${target}/${ARCH}"
 
     spec_overrides_for "$target"
+
+    ensure_libvalkey_source
 
     say "building ${target} (${base}, ${DOCKER_ARCH}, pg${PG_MAJOR})"
     docker build --platform "$DOCKER_ARCH" \
@@ -149,6 +166,14 @@ build_one() {
                     find /build -type f -name "$pat" -delete
                 done
                 rm -rf /build/*/.harness
+                # The built libvalkey, not its source. Each packaging build
+                # makes one from vendor/*.tar.gz into its own prefix, so
+                # carrying a tree of objects from another build along only
+                # invites one of them to be linked by accident.
+                #
+                # No apostrophes in here: this whole block is the body of a
+                # bash -lc '...' and one would end the string.
+                rm -rf /build/*/vendor/libvalkey
                 tar -C /build -czf /root/rpmbuild/SOURCES/$name.tar.gz $name
                 cp /src/packaging/rpm/valkey_fdw.spec /root/rpmbuild/SPECS/
                 # Added only when non-empty: an empty --define would set the
@@ -189,6 +214,14 @@ build_one() {
                     find /build -type f -name "$pat" -delete
                 done
                 rm -rf /build/*/.harness
+                # The built libvalkey, not its source. Each packaging build
+                # makes one from vendor/*.tar.gz into its own prefix, so
+                # carrying a tree of objects from another build along only
+                # invites one of them to be linked by accident.
+                #
+                # No apostrophes in here: this whole block is the body of a
+                # bash -lc '...' and one would end the string.
+                rm -rf /build/*/vendor/libvalkey
                 cd /build/src
                 cp -a packaging/deb/debian debian
                 # The binary package name carries the major, so the control

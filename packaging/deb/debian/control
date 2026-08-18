@@ -5,7 +5,6 @@ Maintainer: Evgeniy Patlan <evgeniy.patlan@percona.com>
 Build-Depends: debhelper-compat (= 13),
                postgresql-server-dev-PGMAJOR,
                cmake,
-               git,
                libssl-dev
 Standards-Version: 4.6.2
 # No Homepage field. It means "where this package comes from", and the answer
