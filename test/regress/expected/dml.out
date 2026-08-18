@@ -470,10 +470,8 @@ SELECT d_err($$INSERT INTO d_hash VALUES ('dh:none', NULL, NULL)$$)
 -- answers reachable: the target is no longer entry one, and the junk column
 -- is compared with a column from another relation.
 --
--- The key column is text, so its collation is not the invalid one that an
--- uncollatable type would carry - a Var built with InvalidOid here would be
--- a collation mismatch the planner reports rather than something silently
--- returning the wrong rows.
+-- The collation is guarded separately, further down: a join alone does not
+-- reach it, which is a thing this file used to claim and did not do.
 -- ---------------------------------------------------------------------------
 CREATE TABLE d_local (k text, want text);
 INSERT INTO d_local VALUES ('dh:j1', 'updated'), ('dh:j2', 'deleted');
@@ -550,6 +548,53 @@ ALTER FOREIGN TABLE d_hash NO INHERIT d_parent;
 DROP TABLE d_parent;
 DELETE FROM d_hash WHERE k = 'dh:j1';
 DROP TABLE d_local;
+-- ---------------------------------------------------------------------------
+-- THE JUNK VAR'S COLLATION, which a join alone does not reach.
+--
+-- vfdw_rowid_add_one builds the row-identity Var with the column's own
+-- attcollation. Replacing that with InvalidOid changed nothing observable in
+-- any statement this file had - including every joined one above - and the
+-- register carried it as an unguarded line for exactly that reason.
+--
+-- What it needs is a collation that is not the DEFAULT one. With the default,
+-- a sort key carries no COLLATE clause and the planner matches the junk Var
+-- whatever collation it claims. With COLLATE "C" the sort key carries it, and
+-- a Var that disagrees cannot be matched to the pathkey:
+--
+--     ERROR:  could not find pathkey item to sort
+--
+-- And it needs a plan that SORTS on that column, which is why the two joins
+-- below are forced to a merge join. Neither condition arises by accident in a
+-- suite whose tables all use the database's default collation, which is why
+-- this went unguarded through the whole of the joined-DML work above.
+--
+-- Measured rather than reasoned: the failure was found by applying the
+-- mutation and trying shapes until one of them stopped planning.
+-- ---------------------------------------------------------------------------
+CREATE FOREIGN TABLE d_coll (
+    k text OPTIONS (key 'true') COLLATE "C",
+    a text OPTIONS (field 'a')
+) SERVER dml_srv OPTIONS (tabletype 'hash', keyprefix 'dc:');
+CREATE TABLE d_coll_local (k text COLLATE "C", want text);
+INSERT INTO d_coll_local VALUES ('dc:1', 'updated'), ('dc:2', 'deleted');
+INSERT INTO d_coll VALUES ('dc:1', 'a1'), ('dc:2', 'a2');
+SET enable_hashjoin = off;
+SET enable_nestloop = off;
+UPDATE d_coll SET a = l.want
+FROM d_coll_local l WHERE d_coll.k = l.k AND l.want = 'updated';
+DELETE FROM d_coll USING d_coll_local l
+WHERE d_coll.k = l.k AND l.want = 'deleted';
+RESET enable_hashjoin;
+RESET enable_nestloop;
+SELECT k, a FROM d_coll ORDER BY k;
+  k   |    a    
+------+---------
+ dc:1 | updated
+(1 row)
+
+DELETE FROM d_coll;
+DROP TABLE d_coll_local;
+DROP FOREIGN TABLE d_coll;
 -- ---------------------------------------------------------------------------
 -- DELETE WITH NO WHERE, on a table that spans several keys.
 --

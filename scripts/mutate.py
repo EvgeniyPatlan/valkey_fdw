@@ -351,6 +351,24 @@ MUTATIONS = [
     # would never notice: the result relation IS the first entry there, so the
     # wrong answer and the right one are the same number. dml reaches it
     # through an inherited child, where the parent takes entry one.
+    # The junk row-identity Var's COLLATION.
+    #
+    # The register carried this as an unguarded line for a long time: dropping
+    # the collation changed nothing observable in any statement the suite had,
+    # including every joined one. Two conditions are needed together, and
+    # neither arises by accident in a suite whose tables all use the database's
+    # default collation - a column whose collation is NOT the default, so a
+    # sort key carries a COLLATE clause at all, and a plan that sorts on it, so
+    # there is a pathkey for the Var to fail to match. dml now forces both, and
+    # the planner answers "could not find pathkey item to sort".
+    #
+    # Found by applying this mutation and trying shapes until one stopped
+    # planning, which is the only way it was ever going to be found.
+    ("R2-rowidcoll", "src/vfdw_rowid.c",
+     "\t\t\t\t  attr->attcollation, 0);",
+     "\t\t\t\t  InvalidOid, 0);",
+     "standalone", "dml"),
+
     ("R1-rtindex", "src/vfdw_rowid.c",
      "\tvar = makeVar(rtindex, attno, attr->atttypid, attr->atttypmod,",
      "\tvar = makeVar(1, attno, attr->atttypid, attr->atttypmod,",
