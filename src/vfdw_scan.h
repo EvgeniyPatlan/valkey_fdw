@@ -103,4 +103,19 @@ extern int	vfdw_scan_acquire_sample_rows(Relation rel, int elevel,
 										  double *totalrows,
 										  double *totaldeadrows);
 
+/*
+ * How many batch contexts a scan has created, and how many it has reset.
+ *
+ * A rescan RESETS its batch context rather than creating another: a foreign
+ * scan on the inner side of a nested loop is rescanned once per outer row, and
+ * a context abandoned per pass leaves a struct and a memory-context reset
+ * callback behind each time - so both memory and the callback chain grow with
+ * the outer row count. Nothing fails; it just gets heavier, which is why the
+ * fix had no test until these counters gave it one.
+ *
+ * Counted rather than measured, for the reason the overlay counters give: a
+ * megabyte is a fact about the machine and a context is a fact about the code.
+ */
+extern void vfdw_scan_batch_stats(uint64 *contexts, uint64 *resets);
+
 #endif							/* VFDW_SCAN_H */

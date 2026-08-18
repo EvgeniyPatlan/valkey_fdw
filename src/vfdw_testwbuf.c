@@ -42,6 +42,7 @@
 #include "vfdw_flush.h"
 #include "vfdw_ledger.h"
 #include "vfdw_opcode.h"
+#include "vfdw_scan.h"
 #include "vfdw_script.h"
 #include "vfdw_overlay.h"
 #include "vfdw_wbuf.h"
@@ -378,6 +379,39 @@ valkey_fdw_test_overlay_stats(PG_FUNCTION_ARGS)
 	vfdw_overlay_index_stats(&rebuilds, &extends);
 	values[0] = Int64GetDatum((int64) rebuilds);
 	values[1] = Int64GetDatum((int64) extends);
+
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/*
+ * valkey_fdw_test_leak_stats() -> the two pairings that must stay balanced
+ *
+ * A scan's batch contexts against the resets a rescan does instead of creating
+ * another, and the flush's batches opened against those it closed. Both were
+ * fixed with no test, because neither leak fails anything: the query answers,
+ * the transaction commits, and the cost is memory nobody counted. These count
+ * it.
+ */
+PG_FUNCTION_INFO_V1(valkey_fdw_test_leak_stats);
+
+Datum
+valkey_fdw_test_leak_stats(PG_FUNCTION_ARGS)
+{
+	Datum		values[4];
+	bool		nulls[4] = {false, false, false, false};
+	TupleDesc	tupdesc;
+	uint64		contexts;
+	uint64		resets;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "valkey_fdw_test_leak_stats: return type is not a record");
+	tupdesc = BlessTupleDesc(tupdesc);
+
+	vfdw_scan_batch_stats(&contexts, &resets);
+	values[0] = Int64GetDatum((int64) contexts);
+	values[1] = Int64GetDatum((int64) resets);
+	values[2] = Int64GetDatum((int64) vfdw_flush_batches_opened());
+	values[3] = Int64GetDatum((int64) vfdw_flush_batches_closed());
 
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }

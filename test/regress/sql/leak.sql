@@ -294,6 +294,106 @@ END $$;
 
 SELECT valkey_fdw_test_pooled_ping('leak_srv') AS still_usable;
 
+-- ---------------------------------------------------------------------------
+-- TWO PAIRINGS THAT MUST STAY BALANCED.
+--
+-- Both were fixed with no test, and neither leak fails anything: the query
+-- answers, the transaction commits, and what is lost is memory nobody counts.
+-- That is the whole reason they belong in this file, beside the descriptors.
+-- ---------------------------------------------------------------------------
+CREATE FOREIGN TABLE leak_rescan (k text OPTIONS (key 'true'), v text)
+    SERVER leak_srv OPTIONS (tabletype 'string', keyprefix 'lkr:');
+
+SELECT count(*) AS seeded FROM (
+    SELECT valkey_fdw_test_poke('leak_srv',
+                                ('lkr:' || g)::bytea, g::text::bytea)
+    FROM generate_series(1, 20) g) s;
+
+SELECT scan_batch_contexts AS ctx_before, scan_batch_resets AS resets_before
+FROM valkey_fdw_test_leak_stats() \gset
+
+-- A rescan that created another batch context instead of resetting the one it
+-- has would leave a struct and a memory-context reset callback behind on every
+-- pass, so both memory and the callback chain would grow with the number of
+-- rescans.
+-- A SCALAR SUBQUERY IN THE TARGET LIST, which is the construct that actually
+-- rescans. A join - even a correlated one - does not: this wrapper advertises
+-- no parameterised path, so a nested loop would have to read the whole foreign
+-- table per outer row, and the planner rightly picks a hash join instead and
+-- scans it once. Both weaker versions were written first and the counter said
+-- zero rescans, which is the only reason this one is here.
+--
+-- A subplan is initialised once and re-executed per outer row, and
+-- re-executing it is exactly ReScanForeignScan.
+SELECT count(v) AS found
+FROM (SELECT (SELECT r.v FROM leak_rescan r WHERE r.k = 'lkr:' || g::text) AS v
+      FROM generate_series(1, 20) g) s;
+
+-- Many resets, few contexts. The exact numbers depend on how the planner
+-- shapes the join, so what is asserted is the RELATIONSHIP: a rescan resets,
+-- and resetting is not creating.
+-- Twenty rescans, one context. The relationship is what matters: a rescan
+-- resets the context it has, and resetting is not creating.
+SELECT scan_batch_resets - :resets_before AS resets,
+       scan_batch_contexts - :ctx_before AS contexts_created
+FROM valkey_fdw_test_leak_stats();
+
+-- ---------------------------------------------------------------------------
+-- The flush's retry path, which nothing reached before.
+--
+-- Emptying the server's script cache makes the next flush answer NOSCRIPT, so
+-- it loads the program and goes round again. That path used to return without
+-- closing the batch it had opened - invisible, because the retry succeeds and
+-- the transaction commits.
+-- ---------------------------------------------------------------------------
+-- A plain write first, as the control: whatever the retry does, this is what
+-- one attempt with no retry looks like.
+SELECT flush_batches_open AS plain_open, flush_batches_close AS plain_close
+FROM valkey_fdw_test_leak_stats() \gset
+INSERT INTO leak_rescan VALUES ('lkr:ctl', 'ctl');
+SELECT (SELECT flush_batches_open FROM valkey_fdw_test_leak_stats()) - :plain_open
+           AS plain_opened,
+       (SELECT flush_batches_close FROM valkey_fdw_test_leak_stats()) - :plain_close
+           AS plain_closed;
+
+SELECT reply_type AS script_cache_emptied
+FROM valkey_fdw_test_probe('leak_srv', 0, 'SCRIPT', 'FLUSH');
+
+SELECT retries AS retries_before FROM valkey_fdw_test_flush_stats() \gset
+SELECT flush_batches_open AS open_before, flush_batches_close AS close_before
+FROM valkey_fdw_test_leak_stats() \gset
+
+-- A key NOTHING has created yet. Written as 'lkr:2' first, which the seeding
+-- loop above had already made: the INSERT then failed its own precondition,
+-- the flush raised, and the assertions below passed anyway - "retried" was
+-- true and the row existed, because it was the SEEDED row with the seeded
+-- value. Both halves of that were reading something other than what they
+-- claimed.
+INSERT INTO leak_rescan VALUES ('lkr:new', 'two');
+
+-- The write went through, so the retry did its job - and the VALUE is checked,
+-- not just the row's existence.
+SELECT k, v FROM leak_rescan WHERE k = 'lkr:new';
+
+-- Two attempts, and both closed what they opened. The retry path used to
+-- return without closing its batch, which nothing noticed because the retry
+-- succeeds and the transaction commits.
+--
+-- ONLY MEANINGFUL FOR A FLUSH THAT DID NOT RAISE. A raising flush leaves its
+-- batch open deliberately - invariant I1: nothing is freed, reset or closed on
+-- the way out of an error path, because the reply stream's offset is unknown
+-- and the transaction callback discards the connection. So an imbalance here
+-- would be a leak, and an imbalance after a failed write would be the design.
+SELECT (SELECT retries FROM valkey_fdw_test_flush_stats()) - :retries_before
+           AS retries,
+       (SELECT flush_batches_open FROM valkey_fdw_test_leak_stats()) - :open_before
+           AS opened,
+       (SELECT flush_batches_close FROM valkey_fdw_test_leak_stats()) - :close_before
+           AS closed;
+
+DELETE FROM leak_rescan;
+DROP FOREIGN TABLE leak_rescan;
+
 SELECT valkey_fdw_test_poke('leak_srv', 'vfdw:leak:str'::bytea, NULL) AS cleaned;
 DROP FOREIGN TABLE leak_wrongtype;
 DROP FOREIGN TABLE leak_str;

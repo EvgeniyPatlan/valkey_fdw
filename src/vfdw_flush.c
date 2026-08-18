@@ -71,6 +71,19 @@ static uint64 vfdw_flush_nflushes = 0;
 static uint64 vfdw_flush_nretries = 0;
 
 /*
+ * Batches opened and closed by the flush, counted so the pair can be asserted.
+ *
+ * The retry path used to skip vfdw_batch_end, so a flush that went round again
+ * left a batch behind - and a leak on the path taken only when a server is
+ * reloading or has forgotten the program is a leak nobody meets until the day
+ * that happens. Nothing went red, because the retry succeeds and the
+ * transaction commits; the only visible difference is a count nobody was
+ * keeping. These are that count.
+ */
+static uint64 vfdw_flush_batches_begun = 0;
+static uint64 vfdw_flush_batches_ended = 0;
+
+/*
  * How far the flush has got, and therefore what can honestly be said about
  * the state of Valkey if an error is raised from here.
  */
@@ -402,6 +415,7 @@ vfdw_flush_attempt(VfdwConn *vconn, MemoryContext flush_cxt, int nplans,
 	bool		load = force_load || !vfdw_conn_script_loaded(vconn);
 
 	batch = vfdw_batch_begin(vconn, flush_cxt);
+	vfdw_flush_batches_begun++;
 
 	if (load)
 	{
@@ -451,6 +465,7 @@ vfdw_flush_attempt(VfdwConn *vconn, MemoryContext flush_cxt, int nplans,
 	 * rather than a hope. The next attempt begins its own batch.
 	 */
 	vfdw_batch_end(batch);
+	vfdw_flush_batches_ended++;
 	return outcome;
 }
 
@@ -770,4 +785,16 @@ uint64
 vfdw_flush_retries(void)
 {
 	return vfdw_flush_nretries;
+}
+
+uint64
+vfdw_flush_batches_opened(void)
+{
+	return vfdw_flush_batches_begun;
+}
+
+uint64
+vfdw_flush_batches_closed(void)
+{
+	return vfdw_flush_batches_ended;
 }

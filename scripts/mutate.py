@@ -468,6 +468,34 @@ MUTATIONS = [
      "\t\tvfdw_overlay_built_shrink_gen == vfdw_wbuf_shrink_generation())",
      "standalone", "bulk"),
 
+    # A rescan resets its batch context; it does not abandon one and make
+    # another. A foreign scan on the inner side of a subplan is rescanned once
+    # per outer row, so a context per pass leaves a struct and a reset callback
+    # behind each time and both memory and the callback chain grow with the
+    # row count. Nothing fails - it just gets heavier - which is why leak
+    # counts contexts against resets rather than measuring bytes.
+    #
+    # The replacement counts what it creates, so the mutation is the defect and
+    # not merely a counter that stopped counting.
+    ("M2-rescan", "src/vfdw_scan.c",
+     "\tvfdw_scan_batch_resets++;\n\tMemoryContextReset(state->batch_cxt);",
+     "\tvfdw_scan_batch_resets++;\n"
+     "\tvfdw_scan_batch_contexts++;\n"
+     "\tstate->batch_cxt = AllocSetContextCreate(state->scan_cxt,\n"
+     "\t\t\t\t\t\t\t\t\t\t\t\t\t \"valkey_fdw scan batch\",\n"
+     "\t\t\t\t\t\t\t\t\t\t\t\t\t ALLOCSET_SMALL_SIZES);",
+     "standalone", "leak"),
+
+    # One vfdw_batch_end for the vfdw_batch_begin each attempt opens, on the
+    # retry path as much as the applied one. Skipping it there leaks a batch
+    # per retry, and nothing notices: the retry succeeds and the transaction
+    # commits. leak empties the script cache to reach that path at all.
+    ("M3-retrybatch", "src/vfdw_flush.c",
+     "\tvfdw_batch_end(batch);\n\tvfdw_flush_batches_ended++;",
+     "\tif (outcome == VFDW_FLUSH_APPLIED)\n\t{\n"
+     "\t\tvfdw_batch_end(batch);\n\t\tvfdw_flush_batches_ended++;\n\t}",
+     "standalone", "leak"),
+
     # A packed zset takes members, not scores. Restoring WITHSCORES makes the
     # array's shape follow the negotiated protocol rather than the data: RESP2
     # returns member and score alternating, RESP3 a nested pair per member

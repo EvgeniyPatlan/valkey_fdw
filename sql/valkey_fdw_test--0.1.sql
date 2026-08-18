@@ -570,3 +570,16 @@ REVOKE ALL ON FUNCTION valkey_fdw_test_overlay_stats() FROM PUBLIC;
 
 COMMENT ON FUNCTION valkey_fdw_test_overlay_stats()
 IS 'How many times the overlay index was rebuilt from scratch, and how many times extended in place';
+
+CREATE FUNCTION valkey_fdw_test_leak_stats(
+    OUT scan_batch_contexts bigint,
+    OUT scan_batch_resets   bigint,
+    OUT flush_batches_open  bigint,
+    OUT flush_batches_close bigint)
+RETURNS record
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT VOLATILE;
+REVOKE ALL ON FUNCTION valkey_fdw_test_leak_stats() FROM PUBLIC;
+
+COMMENT ON FUNCTION valkey_fdw_test_leak_stats()
+IS 'Scan batch contexts against rescan resets, and flush batches opened against closed - two pairings that must stay balanced';

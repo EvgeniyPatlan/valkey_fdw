@@ -46,6 +46,13 @@ extern void vfdw_flush_reset(void);
  */
 extern uint64 vfdw_flush_calls(void);
 extern uint64 vfdw_flush_retries(void);
+
+/*
+ * Batches the flush opened and closed. Equal unless an attempt returned
+ * without closing its own - which the retry path once did.
+ */
+extern uint64 vfdw_flush_batches_opened(void);
+extern uint64 vfdw_flush_batches_closed(void);
 extern uint64 vfdw_flush_empty_returns(void);
 extern uint64 vfdw_flush_flushes(void);
 

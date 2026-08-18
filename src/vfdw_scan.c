@@ -58,6 +58,17 @@
 #include "vfdw_row.h"
 #include "vfdw_ttl.h"
 
+/* See vfdw_scan_batch_stats in vfdw_scan.h for what these are for. */
+static uint64 vfdw_scan_batch_contexts = 0;
+static uint64 vfdw_scan_batch_resets = 0;
+
+void
+vfdw_scan_batch_stats(uint64 *contexts, uint64 *resets)
+{
+	*contexts = vfdw_scan_batch_contexts;
+	*resets = vfdw_scan_batch_resets;
+}
+
 /* The Valkey type name for SCAN's server-side TYPE filter. */
 static const char *
 vfdw_scan_type_filter(VfdwTableType type)
@@ -640,6 +651,7 @@ vfdw_scan_state_create(Relation rel, MemoryContext parent)
 	state->cur_hlen = -1;
 	state->cur_member = -1;
 
+	vfdw_scan_batch_contexts++;
 	state->batch_cxt = AllocSetContextCreate(scan_cxt, "valkey_fdw scan batch",
 											 ALLOCSET_SMALL_SIZES);
 	state->batch = vfdw_batch_begin(state->vconn, state->batch_cxt);
@@ -686,6 +698,7 @@ vfdw_scan_begin(ForeignScanState *node, int eflags)
 	node->fdw_state = state;
 }
 
+
 void
 vfdw_scan_rescan(ForeignScanState *node)
 {
@@ -726,6 +739,7 @@ vfdw_scan_rescan(ForeignScanState *node)
 	state->pages = 0;
 
 	/* Reset rather than abandon: see batch_cxt in vfdw_scan_internal.h. */
+	vfdw_scan_batch_resets++;
 	MemoryContextReset(state->batch_cxt);
 	state->batch = vfdw_batch_begin(state->vconn, state->batch_cxt);
 }
