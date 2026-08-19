@@ -16,6 +16,11 @@ name: Packages
 on:
   push:
     branches: [master, main]
+    # A tag builds the same matrix and then publishes it. The release is made
+    # from the artifacts these jobs produced, not from a second build: the
+    # steps above assert what is inside each package and then install it, and
+    # a rebuild for the release would ship something nothing had checked.
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -224,3 +229,96 @@ jobs:
           path: dist/**
           if-no-files-found: error
           retention-days: 14
+
+  # ---------------------------------------------------------------------
+  # Publish, on a tag only.
+  #
+  # needs: build, so a matrix cell that failed to build, failed its contents
+  # check or failed to install stops the release. That is the whole point of
+  # hanging this off the same workflow rather than giving releases their own:
+  # the artifacts attached below are exactly the ones that passed.
+  # ---------------------------------------------------------------------
+  release:
+    name: Publish ${{ github.ref_name }}
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: The tag must agree with what the extension reports
+        run: |
+          set -euo pipefail
+          tag='${{ github.ref_name }}'
+          control=$(sed -n "s/^default_version *= *'\(.*\)'/\1/p" valkey_fdw.control)
+          meta=$(sed -n 's/.*"version" *: *"\([0-9.]*\)".*/\1/p' META.json | head -1)
+          echo "tag=$tag control=$control META.json=$meta"
+          # v0.2.0 and a control saying 0.2 agree; the control carries no patch
+          # level because PostgreSQL's extension versions are not semver.
+          [ "${tag#v}" = "$meta" ] \
+            || { echo "tag ${tag#v} disagrees with META.json $meta" >&2; exit 1; }
+          case "${tag#v}" in
+            "$control".*|"$control") ;;
+            *) echo "tag ${tag#v} disagrees with control $control" >&2; exit 1 ;;
+          esac
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # A release page is a list of files rather than a tree, so the matrix's
+      # dist/<target>/<arch>/ is flattened - and flattening is where this
+      # nearly shipped a quarter of the packages while looking complete.
+      #
+      # An RPM's filename carries the distribution it was built for
+      # (valkey_fdw_17-0.2-1.el9.x86_64.rpm). A DEB's does not:
+      # postgresql-17-valkey-fdw_0.2-1_amd64.deb is the same name on
+      # debian-12, debian-13, ubuntu-24.04 and ubuntu-26.04. Twenty deb builds
+      # collapse into five filenames, and a plain copy keeps whichever landed
+      # first with nothing to say the rest were dropped.
+      #
+      # So a deb is prefixed with the target that built it, and the count is
+      # asserted at the end. The assertion is the part that matters: a silent
+      # truncation and a complete release look identical on the page.
+      #
+      # dbgsym packages are not published. They are large, they are wanted
+      # rarely, and they are reproducible from the tag.
+      - name: Collect and checksum
+        run: |
+          set -euo pipefail
+          mkdir -p release
+
+          # artifacts/<target>-pg<major>/dist/<target>/<arch>/<file>
+          while IFS= read -r f; do
+            case "$f" in *dbgsym*) continue ;; esac
+            target=$(echo "$f" | sed -n 's|^artifacts/\([^/]*\)-pg[0-9]*/.*|\1|p')
+            base=$(basename "$f")
+            case "$base" in
+              *.deb) out="${target}_${base}" ;;
+              *)     out="$base" ;;
+            esac
+            [ -e "release/$out" ] && { echo "collision: $out" >&2; exit 1; }
+            cp "$f" "release/$out"
+          done < <(find artifacts -type f \( -name '*.rpm' -o -name '*.deb' \) | sort)
+
+          cd release
+          ls -1
+          n=$(ls -1 | wc -l)
+          echo "--- $n packages ---"
+          # 8 targets x 5 majors, less amazon-2023/pg14 which that
+          # distribution does not carry.
+          [ "$n" -eq 39 ] || { echo "expected 39 packages, collected $n" >&2; exit 1; }
+          sha256sum * > SHA256SUMS
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          notes=$(awk '/^## /{n++} n==1' CHANGELOG.md)
+          gh release create '${{ github.ref_name }}' \
+            --title '${{ github.ref_name }}' \
+            --notes "$notes" \
+            release/*
