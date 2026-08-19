@@ -23,6 +23,17 @@
 -- closes, because "cannot read that key" is a claim about all of them at once
 -- and a reader should not have to hold half of it in their head.
 
+-- PostgreSQL 15 revoked CREATE on schema public from PUBLIC; 14 still grants
+-- it. One of the routes enumerated below is "create a foreign table of your
+-- own", and on 14 that route is open for a reason which has nothing to do
+-- with this wrapper - so the suite would report a door as closed on one major
+-- and open on another while the code under test was identical.
+--
+-- Stated here rather than inherited from whichever default the server shipped
+-- with. A precondition a test depends on and does not write down is one that
+-- changes underneath it.
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+
 CREATE SERVER priv_srv FOREIGN DATA WRAPPER valkey_fdw
     OPTIONS (host 'valkey', port '6379');
 CREATE USER MAPPING FOR CURRENT_USER SERVER priv_srv;

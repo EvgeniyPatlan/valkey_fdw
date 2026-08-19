@@ -224,12 +224,19 @@ FROM valkey_fdw_test_probe('dml_srv', 0, 'EXISTS', 'd:crolled') WHERE num = 1;
 -- One bad row aborts the whole COPY: the rows before it are buffered and go
 -- with the transaction, which is the only behaviour consistent with the unit
 -- being atomic.
+-- CONTEXT is suppressed for this one statement: PostgreSQL 16 began appending
+-- the offending line number and its raw text to a COPY error's context, so the
+-- line reads "COPY d_str" on 14 and 15 and "COPY d_str, line 2: ..." on 16 and
+-- later. The ERROR, DETAIL and HINT below are this wrapper's own and are what
+-- the block asserts; core's framing around them is not.
+\set SHOW_CONTEXT never
 BEGIN;
 COPY d_str (k, v) FROM STDIN;
 d:cok	x
 notaprefix	y
 \.
 ROLLBACK;
+\set SHOW_CONTEXT errors
 SELECT count(*) AS partial_copy_absent
 FROM valkey_fdw_test_probe('dml_srv', 0, 'EXISTS', 'd:cok') WHERE num = 1;
 

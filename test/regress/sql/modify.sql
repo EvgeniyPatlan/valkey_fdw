@@ -290,9 +290,25 @@ SELECT md_err($$INSERT INTO md_str VALUES ('md:oc','v') ON CONFLICT DO NOTHING$$
     AS on_conflict_nothing;
 SELECT md_err($$INSERT INTO md_str VALUES ('md:oc','v')
                 ON CONFLICT (k) DO UPDATE SET v = 'x'$$) AS on_conflict_update;
-SELECT md_err($$MERGE INTO md_str t USING (SELECT 1 AS x) s ON t.k = 'md:nope'
-                WHEN NOT MATCHED THEN INSERT (k,v) VALUES ('md:m','v')$$)
-    AS merge_stmt;
+-- MERGE arrived in PostgreSQL 15. Before it the grammar refuses the statement
+-- and no wrapper is reached at all, so pinning the message would assert the
+-- age of the server rather than anything about Valkey. Each major is held to
+-- the refusal it can actually produce - core's own 0A000 for a foreign table
+-- where MERGE exists, a syntax error where it does not - and both print the
+-- same thing, which is that the write did not happen.
+SELECT CASE WHEN current_setting('server_version_num')::int >= 150000
+            THEN md_err($$MERGE INTO md_str t USING (SELECT 1 AS x) s
+                             ON t.k = 'md:nope'
+                           WHEN NOT MATCHED THEN INSERT (k,v)
+                                VALUES ('md:m','v')$$)
+                 LIKE '0A000: cannot execute MERGE on relation "md_str"%' ||
+                      'This operation is not supported for foreign tables.'
+            ELSE md_err($$MERGE INTO md_str t USING (SELECT 1 AS x) s
+                             ON t.k = 'md:nope'
+                           WHEN NOT MATCHED THEN INSERT (k,v)
+                                VALUES ('md:m','v')$$)
+                 LIKE '42601: syntax error at or near "MERGE"%'
+       END AS merge_refused;
 SELECT md_err($$TRUNCATE md_str$$) AS truncate_stmt;
 SELECT md_err($$INSERT INTO md_str VALUES (NULL,'v')$$) AS null_key;
 SELECT md_err($$INSERT INTO md_pfx VALUES ('other:1','v')$$) AS out_of_prefix;

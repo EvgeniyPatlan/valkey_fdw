@@ -241,8 +241,32 @@ INSERT INTO fx_outer VALUES ('fx:j1'), ('fx:j3');
 SET enable_hashjoin = off;
 SET enable_mergejoin = off;
 
-EXPLAIN (COSTS OFF)
-SELECT o.k, j.v FROM fx_outer o JOIN fx_join j ON j.k = o.k;
+-- The plan is printed through a helper rather than raw, for the reason
+-- scan.sql gives about its own: the join clause here is an implied equality
+-- built from an equivalence class, and PostgreSQL 16 changed which side of it
+-- deparses first - the same filter prints as "(k = o.k)" on 16 and later and
+-- as "(o.k = k)" before. Sorting the two operands keeps what this block is
+-- for, which is the shape of the plan and the strategy the wrapper chose, and
+-- drops the one detail that is PostgreSQL's to decide.
+CREATE FUNCTION fx_plan(q text) RETURNS SETOF text LANGUAGE plpgsql AS $$
+DECLARE
+    line text;
+    lhs  text;
+    rhs  text;
+BEGIN
+    FOR line IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+        lhs := substring(line from 'Filter: \(([^=]*) = ([^=]*)\)');
+        rhs := substring(line from 'Filter: \([^=]* = ([^=]*)\)');
+        IF lhs IS NOT NULL AND rhs IS NOT NULL AND lhs > rhs THEN
+            line := replace(line, '(' || lhs || ' = ' || rhs || ')',
+                                  '(' || rhs || ' = ' || lhs || ')');
+        END IF;
+        RETURN NEXT line;
+    END LOOP;
+END $$;
+
+SELECT * FROM fx_plan($$
+SELECT o.k, j.v FROM fx_outer o JOIN fx_join j ON j.k = o.k$$);
 
 SELECT reply_type AS stats_reset
 FROM valkey_fdw_test_probe('fx_srv', 0, 'CONFIG', 'RESETSTAT');
