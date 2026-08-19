@@ -541,7 +541,7 @@ All builds run in containers. There is no supported host build.
 ```
 
 Useful flags: `--pg 16|17|18`, `--valkey 8.1.9|9.0.5|9.1.1`,
-`--topology standalone|tls|acl|cluster|search`, `--sanitize address,undefined`,
+`--topology standalone|tls|acl|cluster|search`, `--sanitize undefined`,
 `--coverage`, `--vendored`.
 
 `./scripts/harness.sh ci` runs the whole matrix.

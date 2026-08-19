@@ -93,6 +93,44 @@ valkey_major() {
     echo "${VALKEY_VERSION%%.*}"
 }
 
+# Which sanitizers this harness can actually run.
+#
+# ADDRESS IS REFUSED, and the refusal is the fix rather than a limitation left
+# to be discovered. The Makefile will happily build the shared library with
+# -fsanitize=address, and the result cannot be loaded: ASan has to be the first
+# runtime initialised in the process, which for an extension means preloading
+# it into the postmaster. `CREATE EXTENSION` answers "server closed the
+# connection unexpectedly" instead.
+#
+# Preloading is not the way out either. docker/Dockerfile.cassert records that
+# it hangs at startup - ASan's interceptors do not survive PostgreSQL's fork
+# and shared-memory setup - and an attempt to confirm that hung too. That image
+# exists because of it: the memory checks this tree needs come from
+# --enable-cassert (CLOBBER_FREED_MEMORY, MEMORY_CONTEXT_CHECKING), which see
+# what ASan would not anyway. palloc carves chunks out of large malloc'd
+# blocks, so a use-after-free of context memory happens INSIDE a region ASan
+# considers live - and the ledger pointing into the write buffer is exactly
+# that shape.
+#
+# So the flag now says what it supports. A build that cannot run is worse than
+# a flag that declines: the first looks like a defect in the code under test.
+check_sanitizers() {
+    local san="$1" one
+
+    # The comma split is done with tr rather than by setting IFS, because IFS
+    # stays set for the rest of the function - including the word splitting of
+    # die's arguments, which arrived with commas in the middle of the sentence.
+    for one in $(printf '%s' "$san" | tr ',' ' '); do
+        case "$one" in
+            undefined) ;;
+            address|leak)
+                die "--sanitize $one cannot run here. An ASan-built extension must be loaded into an ASan-built postmaster, and preloading the runtime hangs PostgreSQL's startup. Use --cassert, which is what this tree checks memory with; docker/Dockerfile.cassert says why." ;;
+            *)
+                die "--sanitize $one is not one this harness runs; it takes undefined." ;;
+        esac
+    done
+}
+
 suites_for_topology() {
     local ttl_suite=ttl_absent
 
@@ -146,7 +184,7 @@ parse_flags() {
             --topology)  TOPOLOGY="$2"; shift 2 ;;
             --cassert)   CASSERT=1; shift ;;
             --suite)     SUITE="$2"; shift 2 ;;
-            --sanitize)  SANITIZE="$2"; shift 2 ;;
+            --sanitize)  check_sanitizers "$2"; SANITIZE="$2"; shift 2 ;;
             --coverage)  COVERAGE=1; shift ;;
             --vendored)  VENDORED=1; shift ;;
             --no-strict) STRICT=0; shift ;;
