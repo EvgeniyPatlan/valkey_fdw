@@ -39,6 +39,16 @@
 #define VFDW_SEARCH_DIST_ALIAS "__vfdw_distance"
 
 /*
+ * How far over-fetching will go before it gives up.
+ *
+ * A filter that is not the query's qual can send the scan back for more rows,
+ * and against a clause almost nothing satisfies that could walk the whole
+ * index one doubling at a time. The cap turns that into an error naming the
+ * clause rather than a query that appears to hang.
+ */
+#define VFDW_SEARCH_MAX_K	65536
+
+/*
  * A search in progress.
  *
  * The reply is held across Iterate calls while its rows are emitted, which is
@@ -74,8 +84,30 @@ typedef struct VfdwKnnScan
 	bool		empty;
 
 	valkeyReply *reply;
-	int			row;			/* rows already emitted */
+	int			row;			/* rows taken from the reply */
 	bool		ran;
+
+	/*
+	 * OVER-FETCH, for a filter that is weaker than the query's own quals.
+	 *
+	 * A pushed filter that matches a SUPERSET is sound only if the scan can
+	 * tell how many of the k rows it got actually satisfy the query - and
+	 * fetch more when too few do. So the scan evaluates the quals itself and
+	 * counts survivors: if k of them survive, those are the k nearest
+	 * matching rows, because the ones it was given are the k nearest of the
+	 * superset and anything not given is farther than all of them.
+	 *
+	 * ps is the ForeignScanState, for its compiled qual. The SAME ExprState
+	 * the executor will apply above the scan, not a second compilation of the
+	 * same clauses - two would be two chances to disagree, and the
+	 * disagreement would be a row count.
+	 */
+	PlanState  *ps;
+	int			emitted;		/* rows that survived the quals */
+	int			fetched_k;		/* what the last FT.SEARCH asked for */
+	int			returned;		/* rows the last reply carried */
+	int			pass_survivors;	/* survivors seen in the current pass */
+	bool		exact;			/* the filter is the qual, so no over-fetch */
 } VfdwKnnScan;
 
 struct VfdwScanState;

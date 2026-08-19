@@ -593,7 +593,7 @@ MUTATIONS = [
     # it being wrong: a LIMIT 3 over a k of 1 returns one row, in order, and
     # looks like a table with one matching document.
     ("K3-k", "src/vfdw_search.c",
-     "\t\t\t\t\t knn->k, knn->field, VFDW_SEARCH_DIST_ALIAS);",
+     "\t\t\t\t\t knn->fetched_k, knn->field, VFDW_SEARCH_DIST_ALIAS);",
      "\t\t\t\t\t 1, knn->field, VFDW_SEARCH_DIST_ALIAS);",
      "search", "knn"),
 
@@ -684,12 +684,12 @@ MUTATIONS = [
     # with distances that are all correct - for the wrong set. Nothing about
     # the reply says which filter produced it.
     ("F2-endswap", "src/vfdw_filter.c",
-     "\t\tif (term->both)\n"
-     "\t\t\tappendStringInfo(out, \"%s %s\", num.data, num.data);\n"
-     "\t\telse if (term->lower)",
-     "\t\tif (term->both)\n"
-     "\t\t\tappendStringInfo(out, \"%s %s\", num.data, num.data);\n"
-     "\t\telse if (!term->lower)",
+     "\tif (term->both)\n"
+     "\t\tappendStringInfo(out, \"%s %s\", num.data, num.data);\n"
+     "\telse if (term->lower)",
+     "\tif (term->both)\n"
+     "\t\tappendStringInfo(out, \"%s %s\", num.data, num.data);\n"
+     "\telse if (!term->lower)",
      "search", "knn"),
 
     # Whether a bound is itself included.
@@ -698,10 +698,10 @@ MUTATIONS = [
     # above the scan then removes - so the count is short by one and the rows
     # that are there are right. The most invisible failure in this path.
     ("F3-exclusive", "src/vfdw_filter.c",
-     "\t\t\tappendStringInfo(out, \"%s%s +inf\",\n"
-     "\t\t\t\t\t\t\t term->exclusive ? \"(\" : \"\", num.data);",
-     "\t\t\tappendStringInfo(out, \"%s%s +inf\",\n"
-     "\t\t\t\t\t\t\t \"\", num.data);",
+     "\t\tappendStringInfo(out, \"%s%s +inf\",\n"
+     "\t\t\t\t\t\t term->exclusive ? \"(\" : \"\", num.data);",
+     "\t\tappendStringInfo(out, \"%s%s +inf\",\n"
+     "\t\t\t\t\t\t \"\", num.data);",
      "search", "knn"),
 
     # A type whose values do not survive being a double.
@@ -764,6 +764,50 @@ MUTATIONS = [
      "\tif (isnull)\n\t\treturn;",
      "\tif (false)\n\t\treturn;",
      "standalone", "fetch"),
+
+    # The over-fetch itself.
+    #
+    # A tag filter matches a SUPERSET of its clause, so the k rows the server
+    # returns can contain rows the query does not want - and the nearest row
+    # can be one of them. Without the re-issue the scan reports what is left
+    # after the recheck, which for k = 1 and a nearest row that fails is NO
+    # ROWS where one is correct. knn is built on exactly that shape.
+    ("T8-overfetch", "src/vfdw_search.c",
+     "\tif (knn->exact || knn->emitted >= knn->k)\n\t\treturn false;",
+     "\tif (true)\n\t\treturn false;",
+     "search", "knn"),
+
+    # Rows already given to the executor must not be given again.
+    #
+    # A re-issued search repeats the ranking it had with more of it, so its
+    # leading survivors are rows already emitted. Emitting them again is a
+    # duplicate - LIMIT 2 answered one key twice before this guard, and the
+    # row count was still 2, which is why knn asserts the KEYS.
+    ("T9-overfetchdup", "src/vfdw_search.c",
+     "\tif (knn->pass_survivors <= knn->emitted)",
+     "\tif (false)",
+     "search", "knn"),
+
+    # The scan applies the query's own quals, and counts what survives.
+    #
+    # Leaving them to the executor alone would be correct for an exact filter
+    # and silently short for a superset: the scan would think every row it got
+    # was wanted, stop at k, and the executor would then take some away.
+    ("TA-overfetchqual", "src/vfdw_search.c",
+     "\tif (knn->ps == NULL || knn->ps->qual == NULL)\n\t\treturn true;",
+     "\tif (true)\n\t\treturn true;",
+     "search", "knn"),
+
+    # A tag value carrying the query language's punctuation is not pushed.
+    #
+    # The value can come from a Param and therefore from a user, so a value
+    # holding a brace would add terms the query never contained. Not pushing
+    # it is sound - the recheck still decides - which is why the mutation is
+    # caught by the ROWS rather than by an error.
+    ("TB-tagvalue", "src/vfdw_filter.c",
+     "\t\tif (*p == '_' || *p == '-' || *p == '.' || *p == ' ')\n\t\t\tcontinue;",
+     "\t\tcontinue;",
+     "search", "knn"),
 ]
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

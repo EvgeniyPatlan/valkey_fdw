@@ -664,13 +664,33 @@ What compiles: `=`, `<`, `<=`, `>`, `>=` against a column that declares
 several terms, ANDed. `EXPLAIN` shows the filter's shape with `$` for each
 bound, which is the only place a pushdown is visible at all.
 
-What is refused, and why each one is not merely unimplemented:
+`=` on a column that declares `index_type 'tag'` compiles too, and it is the
+one term that is **not** the clause. A `TAG` field is tokenised on its
+separator, so `@tag:{a}` matches a document whose field holds `a,b` while SQL
+`tag = 'a'` does not — the filter is a **superset**.
 
-| Refused | Because |
+A superset is sound only because the scan **rechecks its own rows and asks for
+more when too few survive**. It evaluates the query's quals itself — the same
+compiled expression the executor applies above it, not a second copy — and
+counts survivors. If `k` survive, those are the `k` nearest matching rows,
+because the ones it was given are the `k` nearest of the superset and anything
+not given is farther than all of them. If too few survive, it doubles `k` and
+asks again, stopping when a reply comes back shorter than it asked for — the
+filter saying it has nothing else. Being a superset therefore costs round
+trips, not correctness.
+
+So a clause that cannot be compiled is simply **not pushed**, rather than
+refusing the query: a tag value carrying the query language's own punctuation,
+or the index's separator, is left out and the recheck still decides. Over-
+fetching gives up at 65536 rows with an error naming the clause, rather than
+walking an index one doubling at a time.
+
+What still cannot be pushed, and is answered by the recheck alone:
+
+| Not pushed | Because |
 |---|---|
-| `=` on a `tag` column | A `TAG` field is tokenised on its separator, so `@tag:{a}` matches a document whose field holds `a,b` while SQL `tag = 'a'` does not. The filter would be a **superset**, and a superset is the direction a recheck cannot recover from |
 | `bigint` and `numeric` columns | A valkey-search `NUMERIC` is a double, so a value beyond 2⁵³ rounds on the way into the index and two distinct values become one. A small bound does not help — it is the *stored* values that round |
-| `<>`, `OR`, `IS NULL`, functions | No range means them |
+| `<>`, `OR`, `IS NULL`, functions | No filter means them |
 | A bound referring to the table itself | That is a different filter per row, which one query string cannot express |
 
 A field name used on a vector table may hold only letters, digits, `_`, `-`
@@ -866,7 +886,7 @@ it on is not.
 | `position` | boolean | `false` | Column holds the member's zero-based index in its list; read-only, needs `tabletype 'list'` and `integer` or `bigint` | no |
 | `ttl` | boolean | `false` | Column holds the paired field's time to live, as an `interval`; needs `tabletype 'hash'`, a `field`, and Valkey 9+ | no |
 | `distance` | boolean | `false` | Column receives the search's distance for the row; needs `tabletype 'vector'` | no |
-| `index_type` | enum | — | `tag`, `numeric` or `vector`. `vector` marks the column a KNN query may rank by; `numeric` marks one a `WHERE` may be pushed down on. `tag` is accepted and not yet consulted | no |
+| `index_type` | enum | — | `tag`, `numeric` or `vector`. `vector` marks the column a KNN query may rank by; `numeric` and `tag` mark ones a `WHERE` may be pushed down on | no |
 
 <!-- options:end -->
 

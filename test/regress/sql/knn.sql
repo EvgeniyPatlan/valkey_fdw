@@ -169,6 +169,71 @@ RESET plan_cache_mode;
 DEALLOCATE qf;
 
 -- ---------------------------------------------------------------------------
+-- A TAG FILTER, which is a SUPERSET of the qual and sound only because the
+-- scan rechecks and asks again.
+--
+-- A TAG field is tokenised on its separator. kn:1 is the NEAREST document and
+-- its tag field holds "a,b": the index matches it for @tag:{a} and SQL's
+-- `tag = 'a'` does not. So a search asked for one row hands back exactly the
+-- row the query does not want.
+--
+-- Pushed and left there, the answer would be no rows. The right answer is
+-- kn:2, and getting it means fetching past the row that failed - which is
+-- what the over-fetch loop does, and this is the case that says so.
+-- ---------------------------------------------------------------------------
+-- kn:1 gets two tags, and kn:3 joins kn:2 in holding just 'a' - so TWO rows
+-- qualify and the nearest is not one of them. Both halves matter: without a
+-- second qualifying row the k=2 case below cannot show a duplicate.
+SELECT num AS retagged FROM valkey_fdw_test_probe('kn_srv', 0, 'HSET',
+    'kn:1', 'tag', 'a,b');
+SELECT num AS retagged_3 FROM valkey_fdw_test_probe('kn_srv', 0, 'HSET',
+    'kn:3', 'tag', 'a');
+
+DO $$
+DECLARE n text;
+BEGIN
+    FOR i IN 1..100 LOOP
+        SELECT convert_from(coalesce(key_part, val_part), 'UTF8') INTO n
+        FROM valkey_fdw_test_probe('kn_srv', 0, 'FT.INFO', 'knidx') WHERE ordinal = 10;
+        EXIT WHEN n = '3';
+        PERFORM pg_sleep(0.1);
+    END LOOP;
+END $$;
+
+-- k = 1, and the nearest row is the one the qual rejects.
+SELECT k, tag FROM kn WHERE tag = 'a'
+ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 1;
+
+-- k = 2, where the surplus must not come back TWICE. A re-issued search
+-- repeats the ranking it had, so its leading survivors are rows already
+-- emitted - and the first version of this loop answered the same key twice.
+SELECT k, tag FROM kn WHERE tag = 'a'
+ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 2;
+
+-- A tag nothing holds: no rows, and no growing forever looking for them. The
+-- search stops when a reply comes back shorter than it asked for, which is
+-- the filter saying it has nothing else.
+SELECT count(*) AS no_such_tag FROM (
+    SELECT k FROM kn WHERE tag = 'nope'
+    ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 3
+) s;
+
+-- A tag value carrying the query language's own punctuation is NOT pushed -
+-- and the answer is still right, because the scan's recheck is what decides
+-- which rows count. An unspellable term costs round trips, not correctness.
+SELECT count(*) AS punctuation_in_the_value FROM (
+    SELECT k FROM kn WHERE tag = 'a}b'
+    ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 3
+) s;
+
+-- Put kn:1 back, so the cases below read the keyspace the rest of this file
+-- describes.
+SELECT num AS restored FROM valkey_fdw_test_probe('kn_srv', 0, 'HSET',
+    'kn:1', 'tag', 'a');
+SELECT num AS restored_3 FROM valkey_fdw_test_probe('kn_srv', 0, 'HSET',
+    'kn:3', 'tag', 'b');
+
+-- ---------------------------------------------------------------------------
 -- The query vector as a parameter, which is the case the design was written
 -- around: a generic plan carries the expression, so the vector arrives with
 -- the execution and each execution may bring a different one.

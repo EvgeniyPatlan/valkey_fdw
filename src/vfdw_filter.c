@@ -49,6 +49,7 @@
 #include "optimizer/optimizer.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/lsyscache.h"
 
 bool
 vfdw_filter_name_is_safe(const char *name)
@@ -144,6 +145,39 @@ vfdw_filter_numeric_field(Node *node, RelOptInfo *baserel, VfdwTableMap *map)
 }
 
 /*
+ * The tag field this Var names, or NULL.
+ *
+ * Unlike the numeric one, the COLUMN's type is not constrained: a tag is
+ * compared as text by the index whatever PostgreSQL calls it, and the
+ * comparison this pushes is deliberately inexact anyway.
+ */
+static const char *
+vfdw_filter_tag_field(Node *node, RelOptInfo *baserel, VfdwTableMap *map)
+{
+	Var		   *var;
+	VfdwColumn *col;
+
+	node = (Node *) strip_implicit_coercions((Node *) node);
+
+	if (node == NULL || !IsA(node, Var))
+		return NULL;
+
+	var = (Var *) node;
+	if (var->varno != (int) baserel->relid || var->varlevelsup != 0)
+		return NULL;
+	if (var->varattno < 1 || var->varattno > map->natts)
+		return NULL;
+
+	col = &map->cols[var->varattno - 1];
+	if (col->kind != VFDW_COL_FIELD || col->index_type != VFDW_INDEX_TAG)
+		return NULL;
+	if (!vfdw_filter_name_is_safe(col->field))
+		return NULL;
+
+	return col->field;
+}
+
+/*
  * Which end of a range this operator bounds, from its name.
  *
  * By NAME, for the reason vfdw_knn.c recognises its own operators that way:
@@ -151,6 +185,21 @@ vfdw_filter_numeric_field(Node *node, RelOptInfo *baserel, VfdwTableMap *map)
  * <> cannot, because the query language's negation would have to exclude a
  * point and the spike did not establish that it can.
  */
+/* Is this operator "=", by name? See vfdw_filter_op_range for why by name. */
+static bool
+vfdw_filter_op_is_equality(Oid opno)
+{
+	char	   *name = get_opname(opno);
+	bool		ok;
+
+	if (name == NULL)
+		return false;
+
+	ok = strcmp(name, "=") == 0;
+	pfree(name);
+	return ok;
+}
+
 static bool
 vfdw_filter_op_range(Oid opno, bool var_on_left, VfdwFilterTerm *term)
 {
@@ -184,6 +233,43 @@ vfdw_filter_op_range(Oid opno, bool var_on_left, VfdwFilterTerm *term)
 
 	pfree(name);
 	return ok;
+}
+
+/*
+ * A TAG equality, which is a superset of its clause rather than the clause.
+ *
+ * Equality only: a range over tags is not a thing the query language has, and
+ * a tag is compared as text by the index whatever PostgreSQL calls the column.
+ * See VfdwFilterTerm.tag for why a superset is sound here and was not before.
+ */
+static VfdwFilterTerm *
+vfdw_filter_tag_term(PlannerInfo *root, RelOptInfo *baserel, VfdwTableMap *map,
+					 OpExpr *op)
+{
+	VfdwFilterTerm *term;
+	const char *field;
+	Node	   *bound;
+
+	field = vfdw_filter_tag_field(linitial(op->args), baserel, map);
+	bound = (Node *) lsecond(op->args);
+
+	if (field == NULL)
+	{
+		field = vfdw_filter_tag_field(lsecond(op->args), baserel, map);
+		bound = (Node *) linitial(op->args);
+	}
+	if (field == NULL)
+		return NULL;
+	if (bms_is_member(baserel->relid, pull_varnos(root, bound)))
+		return NULL;
+	if (!vfdw_filter_op_is_equality(op->opno))
+		return NULL;
+
+	term = (VfdwFilterTerm *) palloc0(sizeof(VfdwFilterTerm));
+	term->field = field;
+	term->bound = (Expr *) bound;
+	term->tag = true;
+	return term;
 }
 
 /*
@@ -222,7 +308,8 @@ vfdw_filter_one(PlannerInfo *root, RelOptInfo *baserel, VfdwTableMap *map,
 	}
 
 	if (field == NULL)
-		return NULL;
+		return vfdw_filter_tag_term(root, baserel, map, op);
+
 	if (bms_is_member(baserel->relid, pull_varnos(root, bound)))
 		return NULL;
 	if (!vfdw_filter_type_is_exact(exprType(bound)))
@@ -324,6 +411,105 @@ vfdw_filter_bound_text(Datum value, Oid typid, StringInfo out)
 	return true;
 }
 
+/*
+ * A tag term: `@field:{value}`.
+ *
+ * THE VALUE GOES INTO THE QUERY STRING, which is the same surface a field name
+ * is - and worse, because this one can come from a Param and therefore from a
+ * user. A value carrying the query language's punctuation would add terms the
+ * query never contained.
+ *
+ * Refused rather than escaped, for the reason the field-name check gives:
+ * valkey-search's grammar is not this tree's to model. But refusing the QUERY
+ * would be wrong here - the term is only an optimisation. A term that cannot
+ * be spelled is simply NOT PUSHED, and the scan's own recheck still gives the
+ * right rows; it just reads more of the index to find them.
+ *
+ * The separator is the same case. A value containing it can never match as one
+ * tag - vfilter.sql measured `@tg:{a,b}` matching nothing at all - so pushing
+ * it would return too few rows. Omitted for the same reason and with the same
+ * outcome.
+ *
+ * Returns false only when the value is NULL, which makes the whole query
+ * unsatisfiable and is the caller's cue to send nothing.
+ */
+static bool
+vfdw_filter_render_tag(VfdwFilterTerm *term, Datum value, ExprState *state,
+					   StringInfo out)
+{
+	Oid			typid = exprType((Node *) state->expr);
+	Oid			outfunc;
+	bool		varlena;
+	char	   *text;
+	const char *p;
+
+	getTypeOutputInfo(typid, &outfunc, &varlena);
+	text = OidOutputFunctionCall(outfunc, value);
+
+	for (p = text; *p != '\0'; p++)
+	{
+		if (*p >= 'a' && *p <= 'z')
+			continue;
+		if (*p >= 'A' && *p <= 'Z')
+			continue;
+		if (*p >= '0' && *p <= '9')
+			continue;
+		if (*p == '_' || *p == '-' || *p == '.' || *p == ' ')
+			continue;
+
+		/* Not spellable. Not pushed; the recheck still answers. */
+		pfree(text);
+		return true;
+	}
+
+	appendStringInfo(out, "@%s:{%s} ", term->field, text);
+	pfree(text);
+	return true;
+}
+
+/*
+ * A numeric term: `@field:[lo hi]`, with `(` for an exclusive end.
+ */
+static bool
+vfdw_filter_render_range(VfdwFilterTerm *term, Datum value, ExprState *state,
+						 StringInfo out)
+{
+	StringInfoData num;
+
+	initStringInfo(&num);
+	if (!vfdw_filter_bound_text(value, exprType((Node *) state->expr), &num))
+		return false;
+
+	/*
+	 * Equality against an infinity is refused rather than spelled. Both ends
+	 * would be the language's own "+inf", and whether that matches a field
+	 * whose text is "inf" is a question the spike did not put - so it is not
+	 * one this file answers by guessing.
+	 */
+	if (term->both && num.data[0] != '-' && num.data[1] == 'i')
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot search for a field equal to infinity"),
+				 errdetail("The search's filter language spells the "
+						   "infinities as range ends, and whether one matches "
+						   "a stored value is not established.")));
+
+	appendStringInfo(out, "@%s:[", term->field);
+
+	if (term->both)
+		appendStringInfo(out, "%s %s", num.data, num.data);
+	else if (term->lower)
+		appendStringInfo(out, "%s%s +inf",
+						 term->exclusive ? "(" : "", num.data);
+	else
+		appendStringInfo(out, "-inf %s%s",
+						 term->exclusive ? "(" : "", num.data);
+
+	appendStringInfoString(out, "] ");
+	pfree(num.data);
+	return true;
+}
+
 bool
 vfdw_filter_render(List *terms, ExprContext *econtext, List *bound_states,
 				   StringInfo out)
@@ -337,7 +523,6 @@ vfdw_filter_render(List *terms, ExprContext *econtext, List *bound_states,
 		ExprState  *state = (ExprState *) lfirst(sc);
 		Datum		value;
 		bool		isnull;
-		StringInfoData num;
 
 		value = ExecEvalExpr(state, econtext, &isnull);
 
@@ -350,38 +535,15 @@ vfdw_filter_render(List *terms, ExprContext *econtext, List *bound_states,
 		if (isnull)
 			return false;
 
-		initStringInfo(&num);
-		if (!vfdw_filter_bound_text(value, exprType((Node *) state->expr),
-									&num))
+		if (term->tag)
+		{
+			if (!vfdw_filter_render_tag(term, value, state, out))
+				return false;
+			continue;
+		}
+
+		if (!vfdw_filter_render_range(term, value, state, out))
 			return false;
-
-		/*
-		 * Equality against an infinity is refused rather than spelled. Both
-		 * ends would be the language's own "+inf", and whether that matches a
-		 * field whose text is "inf" is a question the spike did not put - so
-		 * it is not one this file answers by guessing.
-		 */
-		if (term->both && num.data[0] != '-' && num.data[1] == 'i')
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("cannot search for a field equal to infinity"),
-					 errdetail("The search's filter language spells the "
-							   "infinities as range ends, and whether one "
-							   "matches a stored value is not established.")));
-
-		appendStringInfo(out, "@%s:[", term->field);
-
-		if (term->both)
-			appendStringInfo(out, "%s %s", num.data, num.data);
-		else if (term->lower)
-			appendStringInfo(out, "%s%s +inf",
-							 term->exclusive ? "(" : "", num.data);
-		else
-			appendStringInfo(out, "-inf %s%s",
-							 term->exclusive ? "(" : "", num.data);
-
-		appendStringInfoString(out, "] ");
-		pfree(num.data);
 	}
 
 	return true;
@@ -413,6 +575,8 @@ vfdw_filter_encode(List *terms, List **bounds)
 			flags |= VFDW_FILTER_EXCLUSIVE;
 		if (term->both)
 			flags |= VFDW_FILTER_BOTH;
+		if (term->tag)
+			flags |= VFDW_FILTER_TAG;
 
 		out = lappend(out, list_make2(makeString(pstrdup(term->field)),
 									  makeInteger(flags)));
@@ -444,6 +608,7 @@ vfdw_filter_decode(List *encoded)
 		term->lower = (flags & VFDW_FILTER_LOWER) != 0;
 		term->exclusive = (flags & VFDW_FILTER_EXCLUSIVE) != 0;
 		term->both = (flags & VFDW_FILTER_BOTH) != 0;
+		term->tag = (flags & VFDW_FILTER_TAG) != 0;
 
 		out = lappend(out, term);
 	}
@@ -475,7 +640,9 @@ vfdw_filter_describe(List *terms)
 		if (buf.len > 0)
 			appendStringInfoChar(&buf, ' ');
 
-		if (term->both)
+		if (term->tag)
+			appendStringInfo(&buf, "@%s:{$}", term->field);
+		else if (term->both)
 			appendStringInfo(&buf, "@%s:[$ $]", term->field);
 		else if (term->lower)
 			appendStringInfo(&buf, "@%s:[%s$ +inf]", term->field,
@@ -486,4 +653,18 @@ vfdw_filter_describe(List *terms)
 	}
 
 	return buf.data;
+}
+
+bool
+vfdw_filter_is_exact(List *terms)
+{
+	ListCell   *lc;
+
+	foreach(lc, terms)
+	{
+		if (((VfdwFilterTerm *) lfirst(lc))->tag)
+			return false;
+	}
+
+	return true;
 }

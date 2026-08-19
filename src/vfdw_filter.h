@@ -44,6 +44,19 @@ typedef struct VfdwFilterTerm
 	bool		lower;			/* bound is the LOW end of the range */
 	bool		exclusive;		/* the bound itself does not match */
 	bool		both;			/* equality: the bound is both ends */
+
+	/*
+	 * A TAG term rather than a numeric range, and INEXACT.
+	 *
+	 * A TAG field is tokenised on its separator, so `@tg:{a}` matches a
+	 * document whose field holds "a,b" while SQL `tg = 'a'` does not. The
+	 * filter is therefore a SUPERSET of the qual, and a superset is only
+	 * sound if the scan rechecks and fetches more when too few rows survive -
+	 * which is what src/vfdw_search.c's over-fetch loop is for.
+	 *
+	 * Measured, not assumed: test/regress/sql/vfilter.sql.
+	 */
+	bool		tag;
 } VfdwFilterTerm;
 
 /*
@@ -65,6 +78,9 @@ typedef struct VfdwFilterTerm
 extern List *vfdw_filter_compile(PlannerInfo *root, RelOptInfo *baserel,
 								 VfdwTableMap *map, List *clauses,
 								 const char **why);
+
+/* True when every compiled term means EXACTLY what its clause means. */
+extern bool vfdw_filter_is_exact(List *terms);
 
 /*
  * Is this name safe to put in a query string?
@@ -96,6 +112,7 @@ extern bool vfdw_filter_render(List *terms, ExprContext *econtext,
 #define VFDW_FILTER_LOWER		0x01
 #define VFDW_FILTER_EXCLUSIVE	0x02
 #define VFDW_FILTER_BOTH		0x04
+#define VFDW_FILTER_TAG			0x08
 
 /*
  * Split the terms into what fdw_private carries and what fdw_exprs carries,

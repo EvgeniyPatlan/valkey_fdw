@@ -189,10 +189,25 @@ DEALLOCATE pf;
 -- And what is not pushed, each refused rather than applied locally.
 -- ---------------------------------------------------------------------------
 
--- A TAG field. The index tokenises it on its separator, so @tag:{a} matches a
--- document whose field holds "a,b" while SQL `tag = 'a'` does not - a filter
--- that is a SUPERSET, which is the direction the recheck cannot recover from.
+-- A TAG field COMPILES NOW, and it is the one term that is not the qual.
+--
+-- The index tokenises a tag on its separator, so @tag:{a} matches a document
+-- whose field holds "a,b" while SQL `tag = 'a'` does not: the filter is a
+-- SUPERSET. That was a refusal until the scan learned to recheck its own rows
+-- and ask for more when too few survive - see the over-fetch loop in
+-- src/vfdw_search.c. With it, a superset is sound, and being a superset costs
+-- round trips rather than correctness.
+--
+-- The plan shows `@tag:{$}` beside the numeric ranges, and the Filter line
+-- above the scan is the same clause: the scan applies it too, which is how it
+-- counts survivors.
+EXPLAIN (COSTS OFF)
 SELECT k FROM kp WHERE tag = 'a'
+ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 5;
+
+-- A tag term and a numeric one together: one exact, one not.
+EXPLAIN (COSTS OFF)
+SELECT k FROM kp WHERE tag = 'a' AND n >= 3
 ORDER BY emb <-> '[1,0,0,0]'::vector LIMIT 5;
 
 -- A bigint. A valkey-search NUMERIC is a double, so a value beyond 2^53 is
