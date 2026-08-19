@@ -74,7 +74,7 @@ vfdw_is_key_var(RelOptInfo *baserel, VfdwTableMap *map, Node *node)
 		return false;
 	var = (Var *) node;
 
-	if (var->varno != (int) baserel->relid || var->varlevelsup != 0)
+	if (!vfdw_var_of_rel(var, baserel->relid))
 		return false;
 	if (var->varattno <= 0 || var->varattno > map->natts)
 		return false;

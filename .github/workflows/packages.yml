@@ -41,9 +41,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg: ["16", "17", "18"]
+        pg: ["14", "15", "16", "17", "18"]
         # amazon-2023 is here now, and its absence was never about majors: it
-        # ships 15 through 18. Two other things stopped it, both since fixed.
+        # ships 15 through 18 - which is every major this tree supports except
+        # 14, so that one pair is excluded below. Two other things stopped it,
+        # both since fixed.
         # Its development package is named postgresql<n>-server-devel where
         # every other target here calls it postgresql<n>-devel, so the image
         # installed a package that does not exist; and its PostgreSQL lives at
@@ -64,6 +66,17 @@ jobs:
           - debian-13
           - ubuntu-24.04
           - ubuntu-26.04
+        # Amazon Linux 2023 packages PostgreSQL itself rather than taking
+        # PGDG, and starts at 15. Every other target here builds all five.
+        #
+        # Excluded by name rather than left to fail: a red cell in a matrix
+        # this wide reads as "the packaging broke", and the reason it did not
+        # break - a distribution that never shipped the major - is not
+        # something the log makes obvious. scripts/package.sh refuses the same
+        # pair with the same reason, so it is not discovered only in CI.
+        exclude:
+          - target: amazon-2023
+            pg: "14"
     steps:
       - uses: actions/checkout@v5
 

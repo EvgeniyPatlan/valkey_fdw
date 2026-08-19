@@ -59,16 +59,6 @@
 #include "vfdw_option.h"
 
 /*
- * PostgreSQL 18 replaced PathKey.pk_strategy with pk_cmptype. Both spell the
- * same two directions; only the name and the constant changed.
- */
-#if PG_VERSION_NUM >= 180000
-#define VFDW_PK_IS_ASC(pk)	((pk)->pk_cmptype == COMPARE_LT)
-#else
-#define VFDW_PK_IS_ASC(pk)	((pk)->pk_strategy == BTLessStrategyNumber)
-#endif
-
-/*
  * The three distance operators, and what each one measures.
  *
  * pgvector's names, because they are the ones a user will have written and
@@ -135,7 +125,7 @@ vfdw_knn_vector_field(Node *node, RelOptInfo *baserel, VfdwTableMap *map)
 		return NULL;
 
 	var = (Var *) node;
-	if (var->varno != (int) baserel->relid || var->varlevelsup != 0)
+	if (!vfdw_var_of_rel(var, baserel->relid))
 		return NULL;
 	if (var->varattno < 1 || var->varattno > map->natts)
 		return NULL;

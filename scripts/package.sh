@@ -117,8 +117,26 @@ ensure_libvalkey_source() {
     LIBVALKEY_REF="$ref" bash scripts/fetch-libvalkey.sh --archive
 }
 
+# What a distribution never shipped, this cannot build.
+#
+# Named rather than left to fail, for the same reason the binfmt check above
+# is: without it the build dies inside the container on a package that does
+# not exist, hundreds of lines from anything that mentions a version, and
+# reads like a broken image. The workflow excludes the same pair.
+unsupported_reason() {
+    case "$1:$PG_MAJOR" in
+        amazon-2023:14)
+            echo "Amazon Linux 2023 packages PostgreSQL itself rather than taking PGDG, and carries 15 through 18" ;;
+        *) echo "" ;;
+    esac
+}
+
 build_one() {
-    local target="$1" family base image out
+    local target="$1" family base image out why
+    why="$(unsupported_reason "$target")"
+    if [[ -n "$why" ]]; then
+        die "pg${PG_MAJOR} is not available on ${target}: ${why}"
+    fi
     family="$(family_for "$target")"
     base="$(base_for "$target")"
     image="valkey_fdw/pkg-${target}:pg${PG_MAJOR}"

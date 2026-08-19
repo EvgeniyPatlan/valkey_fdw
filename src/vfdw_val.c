@@ -65,12 +65,12 @@
 #include "utils/timestamp.h"
 
 /*
- * varatt.h explicitly rather than through utils/builtins.h: VARDATA_ANY and
- * VARSIZE_ANY_EXHDR are the whole reason the bytea branch is correct, so the
- * header that defines them is named here rather than arriving by accident
- * through something that might later stop including it.
+ * VARDATA_ANY and VARSIZE_ANY_EXHDR are the whole reason the bytea branch is
+ * correct, and the header that defines them moved out of postgres.h in
+ * PostgreSQL 16. It is therefore named in src/vfdw_compat.h - conditionally,
+ * because naming it here would not compile on 14 or 15 - rather than left to
+ * arrive through utils/builtins.h, which might later stop including it.
  */
-#include "varatt.h"
 
 #include "access/tupdesc.h"
 #include "utils/memutils.h"

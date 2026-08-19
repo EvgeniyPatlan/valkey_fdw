@@ -42,7 +42,7 @@ vfdw_scan_sample_replace(HeapTuple *rows, int targrows, TupleTableSlot *slot,
 
 	if (*rowstoskip <= 0)
 	{
-		int			k = (int) (targrows * sampler_random_fract(&rstate->randstate));
+		int			k = (int) (targrows * vfdw_sampler_fract(rstate));
 
 		Assert(k >= 0 && k < targrows);
 		heap_freetuple(rows[k]);

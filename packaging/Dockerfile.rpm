@@ -39,7 +39,10 @@ RUN set -eux; \
         # installing that name here succeeds at nothing: dnf reports no match,
         # `|| true` above swallows it, and the failure finally arrives as a
         # missing pgxs.mk hundreds of lines later. AL2023 carries 15 through
-        # 18, so no major in this matrix is excluded by the distribution.
+        # 18, so 14 - which this tree does support - cannot be built here.
+        # scripts/package.sh refuses that pair before reaching this image and
+        # the workflow excludes it from the matrix; nothing below would say
+        # anything useful about it.
         $PKG install -y "postgresql${PG_MAJOR}-server-devel" "postgresql${PG_MAJOR}-server"; \
     else \
         $PKG install -y \

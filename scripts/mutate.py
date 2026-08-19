@@ -172,8 +172,8 @@ MUTATIONS = [
     # logic with nothing observable is why this needs a mutation rather than a
     # reading: returning NIL from it once left every suite green.
     ("G7", "src/vfdw_modify.c",
-     "\tif (operation == CMD_UPDATE && rte->perminfoindex != 0)",
-     "\tif (false && operation == CMD_UPDATE && rte->perminfoindex != 0)",
+     "\tif (operation == CMD_UPDATE)\n\t{\n\t\tBitmapset  *updated",
+     "\tif (false)\n\t{\n\t\tBitmapset  *updated",
      "standalone", "wbuf"),
 
     # Phase 4 slice 1. Both are the mistakes a map-building parse actually

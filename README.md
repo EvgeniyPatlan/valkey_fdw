@@ -250,7 +250,7 @@ The diagrams above are generated, not drawn: `img/*.mmd` are the sources and
 directory and fails if a committed PNG no longer matches its source, which is
 what CI runs.
 
-All of it on PostgreSQL 16, 17 and 18.
+All of it on PostgreSQL 14 through 18.
 
 `mutate` is the unusual one and the most load-bearing. A test that has quietly
 stopped asserting looks exactly like a test that passes, so each closed defect
@@ -460,7 +460,7 @@ The suites run in containers, and that is how this is developed — but the
 build itself is plain PGXS and needs no container. The packaging does exactly
 what follows.
 
-Prerequisites: a C compiler, `make`, PostgreSQL 16, 17 or 18 server headers
+Prerequisites: a C compiler, `make`, PostgreSQL 14 to 18 server headers
 (`postgresql-server-dev-17`, `postgresql17-devel`, or your distribution's
 name for them), `libssl-dev`, and libvalkey 0.5.0+ — either the system package
 or the vendored build below. `cmake` as well if you vendor it.
@@ -506,7 +506,7 @@ shipped for exactly that reason.
 
 ## Requirements
 
-- PostgreSQL 16, 17 or 18
+- PostgreSQL 14 to 18
 - [libvalkey](https://github.com/valkey-io/libvalkey) 0.5.0+
 - Valkey 8.1+ **to write**. Reading uses ordinary commands, so a table can be
   read from any server this client can speak to. Writing is one Lua program
@@ -540,7 +540,7 @@ All builds run in containers. There is no supported host build.
 ./scripts/harness.sh down
 ```
 
-Useful flags: `--pg 16|17|18`, `--valkey 8.1.9|9.0.5|9.1.1`,
+Useful flags: `--pg 14|15|16|17|18`, `--valkey 8.1.9|9.0.5|9.1.1`,
 `--topology standalone|tls|acl|cluster|search`, `--sanitize undefined`,
 `--coverage`, `--vendored`.
 

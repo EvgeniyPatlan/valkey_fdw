@@ -17,33 +17,38 @@
 
 #include "postgres.h"
 
-#if PG_VERSION_NUM < 160000
-#error "valkey_fdw requires PostgreSQL 16 or later"
+/*
+ * 14 is the floor for two reasons, and only the second is about this tree.
+ * 13 left community support in November 2025. And row identity is expressed
+ * differently below 14: AddForeignUpdateTargets took the Query rather than
+ * the PlannerInfo, and add_row_identity_var - which src/vfdw_rowid.c is built
+ * around - did not exist, so a junk TargetEntry had to be appended to the
+ * plan's target list by hand. That is a different mechanism rather than a
+ * different spelling, so it is refused here instead of shimmed in
+ * vfdw_compat.h, which holds only renames and signature changes.
+ */
+#if PG_VERSION_NUM < 140000
+#error "valkey_fdw requires PostgreSQL 14 or later"
 #endif
 #if PG_VERSION_NUM >= 190000
 #error "valkey_fdw has not been validated against this PostgreSQL major version"
 #endif
 
 /*
+ * What each supported major calls the same thing. After the version gate
+ * above, so a major this tree refuses never reaches the shims.
+ */
+#include "nodes/pathnodes.h"
+#include "funcapi.h"
+#include "utils/tuplestore.h"
+
+#include "vfdw_compat.h"
+
+/*
  * Code version. Leading digits track the SQL API major version; the last two
  * digits are the minor. 0.1 -> 1.
  */
 #define VFDW_CODE_VERSION 1
-
-/*
- * Non-returning function declarations.
- *
- * PostgreSQL 18 replaced the trailing pg_attribute_noreturn() with a leading
- * pg_noreturn, so the attribute moved to the other end of the declaration.
- * Declaring through both spellings keeps one source working across 16 to 18.
- */
-#if PG_VERSION_NUM >= 180000
-#define VFDW_NORETURN		pg_noreturn
-#define VFDW_NORETURN_TAIL
-#else
-#define VFDW_NORETURN
-#define VFDW_NORETURN_TAIL	pg_attribute_noreturn()
-#endif
 
 /*
  * Error reporting.

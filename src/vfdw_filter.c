@@ -128,7 +128,7 @@ vfdw_filter_numeric_field(Node *node, RelOptInfo *baserel, VfdwTableMap *map)
 		return NULL;
 
 	var = (Var *) node;
-	if (var->varno != (int) baserel->relid || var->varlevelsup != 0)
+	if (!vfdw_var_of_rel(var, baserel->relid))
 		return NULL;
 	if (var->varattno < 1 || var->varattno > map->natts)
 		return NULL;
@@ -163,7 +163,7 @@ vfdw_filter_tag_field(Node *node, RelOptInfo *baserel, VfdwTableMap *map)
 		return NULL;
 
 	var = (Var *) node;
-	if (var->varno != (int) baserel->relid || var->varlevelsup != 0)
+	if (!vfdw_var_of_rel(var, baserel->relid))
 		return NULL;
 	if (var->varattno < 1 || var->varattno > map->natts)
 		return NULL;

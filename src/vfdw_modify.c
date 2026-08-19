@@ -66,13 +66,12 @@ vfdw_modify_target_attrs(PlannerInfo *root, RangeTblEntry *rte, Relation rel,
 	List	   *result = NIL;
 	int			i;
 
-	if (operation == CMD_UPDATE && rte->perminfoindex != 0)
+	if (operation == CMD_UPDATE)
 	{
-		RTEPermissionInfo *perminfo;
+		Bitmapset  *updated = vfdw_rte_updated_cols(root, rte);
 		int			col = -1;
 
-		perminfo = getRTEPermissionInfo(root->parse->rteperminfos, rte);
-		while ((col = bms_next_member(perminfo->updatedCols, col)) >= 0)
+		while ((col = bms_next_member(updated, col)) >= 0)
 		{
 			AttrNumber	attno = col + FirstLowInvalidHeapAttributeNumber;
 

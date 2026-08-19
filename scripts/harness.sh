@@ -43,7 +43,7 @@ CASSERT_IMAGE_PREFIX=valkey_fdw/cassert
 VALKEY_IMAGE_PREFIX=valkey_fdw/valkey
 
 # PG majors and Valkey versions the ci subcommand sweeps.
-CI_PG_MAJORS=(16 17 18)
+CI_PG_MAJORS=(14 15 16 17 18)
 CI_VALKEY_VERSIONS=(8.1.9 9.0.5 9.1.1)
 
 STATE_DIR="$REPO_ROOT/.harness"
