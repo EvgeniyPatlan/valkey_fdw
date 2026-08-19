@@ -216,6 +216,25 @@ else
     fail "META.json names ${meta_file}, which is not the full script for ${control_version}"
 fi
 
+# And the PostgreSQL it claims to need must be the one the code enforces.
+#
+# This drifted the moment 14 and 15 were added: the gate in src/vfdw.h came
+# down to 140000 and the README followed, while META.json went on telling PGXN
+# 16.0.0. Nothing here noticed, because the checks above compare META.json to
+# the control file and the floor is written in neither.
+#
+# A user on 14 would have been told by PGXN that the extension does not
+# support their server, about a build that passes its whole suite there.
+meta_pg="$(python3 -c "import json;print(json.load(open('META.json'))['prereqs']['runtime']['requires']['PostgreSQL'])")"
+gate="$(sed -n 's/^#if PG_VERSION_NUM < \([0-9]\{6\}\)$/\1/p' src/vfdw.h | head -1)"
+gate_major=$(( gate / 10000 ))
+
+if [[ "$meta_pg" == "${gate_major}.0.0" ]]; then
+    pass "META.json requires PostgreSQL ${meta_pg}, matching the gate in src/vfdw.h"
+else
+    fail "META.json requires ${meta_pg}, but src/vfdw.h refuses below ${gate_major}"
+fi
+
 # Leave the catalog as the rest of this file expects to find it.
 q "DROP EXTENSION IF EXISTS valkey_fdw_test CASCADE" >/dev/null
 q "DROP EXTENSION IF EXISTS valkey_fdw CASCADE" >/dev/null

@@ -312,6 +312,32 @@ jobs:
           [ "$n" -eq 39 ] || { echo "expected 39 packages, collected $n" >&2; exit 1; }
           sha256sum * > SHA256SUMS
 
+      # THE PGXN ARCHIVE.
+      #
+      # PGXN installs from a zip whose contents unpack into one directory with
+      # META.json at its root, and it builds from source rather than from the
+      # packages above - so this is a different artifact answering a different
+      # question, and it is produced here so that what gets uploaded to PGXN is
+      # byte-for-byte what the tag holds.
+      #
+      # git archive rather than zipping the working tree: it takes only what is
+      # committed at the tag, so no build output, no vendored tarball fetched
+      # during a build, and nothing gitignored can ride along.
+      - name: Build the PGXN archive
+        run: |
+          set -euo pipefail
+          v='${{ github.ref_name }}'; v="${v#v}"
+          git archive --format=zip \
+            --prefix="valkey_fdw-${v}/" \
+            -o "release/valkey_fdw-${v}.zip" '${{ github.ref_name }}'
+          # It has to contain META.json at the root of that one directory, or
+          # PGXN rejects it after the upload rather than before.
+          unzip -l "release/valkey_fdw-${v}.zip" | grep -q "valkey_fdw-${v}/META.json" \
+            || { echo "no META.json at the archive root" >&2; exit 1; }
+          echo "pgxn archive: $(du -h "release/valkey_fdw-${v}.zip" | cut -f1)"
+          # Checksummed with everything else, so re-run the sums.
+          ( cd release && sha256sum -- * > SHA256SUMS )
+
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
