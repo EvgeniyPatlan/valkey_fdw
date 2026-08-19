@@ -599,6 +599,57 @@ INSERT INTO cl_t VALUES ('cl:{w}d', 'four');
 ROLLBACK;
 SELECT count(*) AS rolled_back FROM cl_t WHERE k = 'cl:{w}d';
 
+-- ---------------------------------------------------------------------------
+-- READING ITS OWN UNCOMMITTED WRITES, THROUGH A SCAN THAT FANS OUT.
+--
+-- Every write case above commits before it reads, so none of them puts the
+-- overlay and the fan-out together - and that pairing is the one thing about
+-- writes here that is genuinely a CLUSTER question rather than a write-path
+-- one the standalone suites already answer.
+--
+-- The write goes to whichever node owns its slot. The scan visits every
+-- primary in turn. So the row has to appear no matter which node the scan
+-- happens to be walking when it reaches the overlay, and disappear the same
+-- way - the overlay is keyed by the transaction, not by the node, and a
+-- version that consulted it per node would show the row on one primary's
+-- pass and not on another's.
+--
+-- This is what running `overlay` on the cluster topology would have been for.
+-- The rest of that suite is the write buffer and the fold, which have no
+-- cluster interaction and are covered on standalone and under `fault`.
+-- ---------------------------------------------------------------------------
+BEGIN;
+INSERT INTO cl_t VALUES ('cl:{o}new', 'inserted');
+
+-- The whole table, which is a fan-out across every primary. The new row is in
+-- none of them yet.
+SELECT count(*) AS insert_visible_to_its_own_scan
+FROM cl_t WHERE k = 'cl:{o}new';
+
+-- And through the unqualified scan as well, which is the fan-out proper
+-- rather than a key lookup that never leaves the overlay.
+SELECT count(*) FILTER (WHERE v = 'inserted') AS insert_seen_by_fanout
+FROM cl_t;
+COMMIT;
+
+-- An UPDATE and a DELETE, read back the same way.
+BEGIN;
+UPDATE cl_t SET v = 'changed' WHERE k = 'cl:{o}new';
+SELECT v AS update_visible_to_its_own_scan FROM cl_t WHERE k = 'cl:{o}new';
+SELECT count(*) FILTER (WHERE v = 'changed') AS update_seen_by_fanout
+FROM cl_t;
+COMMIT;
+
+BEGIN;
+DELETE FROM cl_t WHERE k = 'cl:{o}new';
+SELECT count(*) AS delete_hidden_from_its_own_scan
+FROM cl_t WHERE k = 'cl:{o}new';
+SELECT count(*) FILTER (WHERE v = 'changed') AS delete_hidden_from_fanout
+FROM cl_t;
+COMMIT;
+
+SELECT count(*) AS gone_after_commit FROM cl_t WHERE k = 'cl:{o}new';
+
 DROP FOREIGN TABLE cl_t;
 
 -- ---------------------------------------------------------------------------

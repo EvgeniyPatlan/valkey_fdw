@@ -820,6 +820,24 @@ MUTATIONS = [
      "    IF current_setting('valkey_fdw_test.transport', true) = 'tls' THEN",
      "    IF false THEN",
      "tls", "wbuf"),
+
+    # The overlay and the cluster fan-out, together.
+    #
+    # A scan on a cluster visits every primary in turn, and the rows this
+    # transaction has written are on whichever node owns their slot - or on no
+    # node at all yet, since nothing is sent before pre-commit. The overlay is
+    # keyed by the TRANSACTION, so the injected rows have to arrive once,
+    # whichever primary the scan happens to have reached.
+    #
+    # Silencing the tail is how they would go missing: the fan-out finishes,
+    # every node has been asked, and the transaction's own INSERT is simply not
+    # there. cluster reads its own writes back before COMMIT for exactly this.
+    ("P5-clusteroverlay", "src/vfdw_scan_overlay.c",
+     "TupleTableSlot *\nvfdw_scan_drain_tail(VfdwScanState *state, TupleTableSlot *slot)\n{\n"
+     "\tif (!vfdw_overlay_active(state->map->relid))\n\t\treturn slot;",
+     "TupleTableSlot *\nvfdw_scan_drain_tail(VfdwScanState *state, TupleTableSlot *slot)\n{\n"
+     "\tif (true)\n\t\treturn slot;",
+     "cluster", "cluster"),
 ]
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
