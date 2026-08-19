@@ -11,17 +11,23 @@
 -- carries AllocSet block granularity and sizeof(VfdwWriteOp), so pinning it
 -- would make this a change detector across builds and majors. The assertions
 -- are relations: exceeded, unchanged, strictly greater.
-CREATE SERVER wb_srv FOREIGN DATA WRAPPER valkey_fdw
-    OPTIONS (host 'valkey', port '6379');
-CREATE USER MAPPING FOR CURRENT_USER SERVER wb_srv;
+SELECT valkey_fdw_test_server('wb_srv');
+ valkey_fdw_test_server 
+------------------------
+ 
+(1 row)
+
 -- A cap test MUST set the cap it tests. The defaults are 10000 operations and
 -- 67108864 bytes; a test that inserted a few thousand rows against those
 -- would never reach the code under test at all, and that exact defect has
 -- shipped in this tree before.
-CREATE SERVER wb_cap_srv FOREIGN DATA WRAPPER valkey_fdw
-    OPTIONS (host 'valkey', port '6379',
-             write_max_ops '5', write_max_bytes '65536');
-CREATE USER MAPPING FOR CURRENT_USER SERVER wb_cap_srv;
+SELECT valkey_fdw_test_server('wb_cap_srv',
+    'write_max_ops ''5'', write_max_bytes ''65536''');
+ valkey_fdw_test_server 
+------------------------
+ 
+(1 row)
+
 CREATE FOREIGN TABLE wb_str (k text OPTIONS (key 'true'), v text)
     SERVER wb_srv OPTIONS (tabletype 'string', keyprefix 'wb:');
 CREATE FOREIGN TABLE wb_hash (k text OPTIONS (key 'true'),
@@ -432,10 +438,13 @@ ROLLBACK;
 -- operation cap cannot fire, and if it somehow did it would mask the failure
 -- this block is looking for.
 -- ---------------------------------------------------------------------------
-CREATE SERVER wb_bytes_srv FOREIGN DATA WRAPPER valkey_fdw
-    OPTIONS (host 'valkey', port '6379',
-             write_max_ops '1000000', write_max_bytes '65536');
-CREATE USER MAPPING FOR CURRENT_USER SERVER wb_bytes_srv;
+SELECT valkey_fdw_test_server('wb_bytes_srv',
+    'write_max_ops ''1000000'', write_max_bytes ''65536''');
+ valkey_fdw_test_server 
+------------------------
+ 
+(1 row)
+
 CREATE FOREIGN TABLE wb_bytes_t (k text OPTIONS (key 'true'), v text)
     SERVER wb_bytes_srv OPTIONS (tabletype 'string', keyprefix 'wb:');
 BEGIN;

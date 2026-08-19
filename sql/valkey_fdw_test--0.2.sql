@@ -608,3 +608,48 @@ REVOKE ALL ON FUNCTION valkey_fdw_test_leak_stats() FROM PUBLIC;
 
 COMMENT ON FUNCTION valkey_fdw_test_leak_stats()
 IS 'Scan batch contexts against rescan resets, and flush batches opened against closed - two pairings that must stay balanced';
+
+/*
+ * A foreign server for a write suite, with the transport the topology chose.
+ *
+ * THE WRITE SUITES USED TO HARDCODE `host 'valkey', port '6379'`, which is why
+ * they could run on standalone and on the fault proxy - both plaintext, both
+ * answering to that name - and nowhere else. Running them under `tls` meant
+ * editing every CREATE SERVER in four files, so it was recorded as a gap and
+ * left there.
+ *
+ * One place decides now. A suite asks for a server and does not say how to
+ * reach it; valkey_fdw_test.transport says that, and the harness sets it per
+ * topology. A suite that named the transport itself would be a suite that runs
+ * on one topology, which is the thing being fixed.
+ *
+ * extra is for the options a suite is actually about - a write cap, a dead
+ * port - which are its own business and not the transport's.
+ */
+CREATE FUNCTION valkey_fdw_test_server(name text, extra text DEFAULT '')
+RETURNS void
+LANGUAGE plpgsql
+AS $fn$
+DECLARE
+    opts text;
+BEGIN
+    IF current_setting('valkey_fdw_test.transport', true) = 'tls' THEN
+        opts := 'host ''valkey'', port ''6379'', tls ''true'', '
+                'tls_ca_file ''/tls/ca.crt'', tls_verify ''full''';
+    ELSE
+        opts := 'host ''valkey'', port ''6379''';
+    END IF;
+
+    IF extra <> '' THEN
+        opts := opts || ', ' || extra;
+    END IF;
+
+    EXECUTE format('CREATE SERVER %I FOREIGN DATA WRAPPER valkey_fdw '
+                   'OPTIONS (%s)', name, opts);
+    EXECUTE format('CREATE USER MAPPING FOR CURRENT_USER SERVER %I', name);
+END
+$fn$;
+REVOKE ALL ON FUNCTION valkey_fdw_test_server(text, text) FROM PUBLIC;
+
+COMMENT ON FUNCTION valkey_fdw_test_server(text, text)
+IS 'A foreign server reached the way this topology reaches Valkey';

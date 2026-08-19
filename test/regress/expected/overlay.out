@@ -3,9 +3,12 @@
 -- Writes are buffered until pre-commit, so without the overlay a transaction
 -- would not merely fail to see its own INSERT - it would read the PRE-write
 -- state and present it as current, which is worse than an error.
-CREATE SERVER ov_srv FOREIGN DATA WRAPPER valkey_fdw
-    OPTIONS (host 'valkey', port '6379');
-CREATE USER MAPPING FOR CURRENT_USER SERVER ov_srv;
+SELECT valkey_fdw_test_server('ov_srv');
+ valkey_fdw_test_server 
+------------------------
+ 
+(1 row)
+
 CREATE FOREIGN TABLE ov (k text OPTIONS (key 'true'), v text)
     SERVER ov_srv OPTIONS (tabletype 'string', keyprefix 'ov:');
 CREATE FOREIGN TABLE ov2 (k text OPTIONS (key 'true'), v text)

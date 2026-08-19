@@ -6,9 +6,7 @@
 -- only that the two halves agree with each other, and they share a mapping
 -- layer that could be wrong in the same direction twice.
 
-CREATE SERVER dml_srv FOREIGN DATA WRAPPER valkey_fdw
-    OPTIONS (host 'valkey', port '6379');
-CREATE USER MAPPING FOR CURRENT_USER SERVER dml_srv;
+SELECT valkey_fdw_test_server('dml_srv');
 
 CREATE FOREIGN TABLE d_str (k text OPTIONS (key 'true'), v text)
     SERVER dml_srv OPTIONS (tabletype 'string', keyprefix 'd:');

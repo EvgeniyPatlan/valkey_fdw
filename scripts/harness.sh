@@ -144,7 +144,11 @@ suites_for_topology() {
         # smoke is no longer topology-neutral: now that it really scans, it
         # needs a server it can reach in plaintext. The tls suite covers the
         # load-and-connect path for this topology itself.
-        tls)        echo "tls probe_tls" ;;
+        # The write suites run here too, which is the whole of 5.4's tls half:
+        # they no longer name their transport, so the same files that run on a
+        # plain socket run over TLS with a verified certificate. Nothing about
+        # them changed except that they stopped saying how to connect.
+        tls)        echo "tls probe_tls wbuf overlay script dml" ;;
         # The default user is disabled on this topology, so nothing that
         # connects without credentials can run here - smoke included.
         acl)        echo "acl probe_acl" ;;
@@ -926,6 +930,15 @@ cmd_test() {
 
     ensure_vendored_libvalkey
 
+    #
+    # How this topology reaches Valkey, for the suites that ask rather than
+    # hardcode it. A name rather than an options string: PGOPTIONS is parsed
+    # by the backend and an options list is full of quotes and commas, where
+    # `tls` is one word that cannot be mangled on the way.
+    #
+    local transport=plain
+    [[ "$topo" == "tls" ]] && transport=tls
+
     say "build + install + test (pg${PG_MAJOR}, valkey ${VALKEY_VERSION}, ${topo})"
     run_in_build "
         set -e
@@ -933,6 +946,7 @@ cmd_test() {
         make -j\$(nproc)
         make install
         echo '--- regression ---'
+        export PGOPTIONS=\"-c valkey_fdw_test.transport=${transport}\"
         if ! make installcheck ${regress_arg}; then
             echo '--- regression.diffs ---'
             cat test/regress/regression.diffs 2>/dev/null || true

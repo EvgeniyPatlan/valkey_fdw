@@ -808,6 +808,18 @@ MUTATIONS = [
      "\t\tif (*p == '_' || *p == '-' || *p == '.' || *p == ' ')\n\t\t\tcontinue;",
      "\t\tcontinue;",
      "search", "knn"),
+
+    # The write suites reach Valkey the way the topology does.
+    #
+    # They used to hardcode `host 'valkey', port '6379'`, which is why they ran
+    # on standalone and the fault proxy and nowhere else. Sending them plaintext
+    # under tls is what that hardcoding amounted to, and the tls server does not
+    # answer plaintext - so the mutation is also the proof that those runs are
+    # really TLS rather than a second plaintext run wearing the name.
+    ("TC-transport", "sql/valkey_fdw_test--0.2.sql",
+     "    IF current_setting('valkey_fdw_test.transport', true) = 'tls' THEN",
+     "    IF false THEN",
+     "tls", "wbuf"),
 ]
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

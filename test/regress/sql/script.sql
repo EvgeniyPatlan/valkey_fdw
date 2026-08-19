@@ -6,9 +6,7 @@
 -- a digest that names a different script, a dispatch table that decodes the
 -- wrong opcode, a sentinel that reads as the wrong SQLSTATE.
 
-CREATE SERVER sc_srv FOREIGN DATA WRAPPER valkey_fdw
-    OPTIONS (host 'valkey', port '6379');
-CREATE USER MAPPING FOR CURRENT_USER SERVER sc_srv;
+SELECT valkey_fdw_test_server('sc_srv');
 
 -- ---------------------------------------------------------------------------
 -- The compiled-in SHA1 is the one the SERVER computes.
