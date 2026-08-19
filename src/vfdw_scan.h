@@ -51,7 +51,19 @@ typedef enum VfdwScanStrategy
 	 * This one produces a ranked LIST of exactly k rows, which is only the
 	 * right answer for the query that asked for that k - see vfdw_knn.c.
 	 */
-	VFDW_SCAN_KNN
+	VFDW_SCAN_KNN,
+
+	/*
+	 * One key, named by a value from ANOTHER relation.
+	 *
+	 * The parameterised form of VFDW_SCAN_KEYS: the key is not known when the
+	 * plan is made, so it is evaluated at each rescan. What it buys is the
+	 * difference between one GET per outer row and a walk of the whole
+	 * keyspace per outer row - which is what a join against this table cost
+	 * before, because a keyspace scan was the only path on offer and the join
+	 * clause could only ever be a filter above it.
+	 */
+	VFDW_SCAN_KEY_PARAM
 } VfdwScanStrategy;
 
 /*
@@ -77,12 +89,27 @@ typedef enum VfdwScanStrategy
 #define VFDW_PRIV_KNN_FILTER 6	/* List, the compiled WHERE terms */
 
 /*
+ * VFDW_SCAN_KEY_PARAM only. The key EXPRESSION travels in the plan's
+ * fdw_exprs, like the search's query vector and for the same reason: it may
+ * contain a Param, and only fdw_exprs is renumbered by setrefs.c.
+ */
+#define VFDW_PRIV_PARAM_KEY	7	/* Integer, 1 when the key is a parameter */
+
+/*
  * Choose the access path and encode it for the executor and for EXPLAIN.
  * Defined in vfdw_plan.c.
  */
 extern List *vfdw_scan_plan(PlannerInfo *root, RelOptInfo *baserel,
 							VfdwTableMap *map, List *clauses,
-							List **fdw_exprs);
+							List **fdw_exprs, bool parameterised);
+
+/*
+ * The join clause this table could be driven by, and the relations it needs.
+ * NULL when there is none. Read by GetForeignPaths to decide whether to offer
+ * a parameterised path at all.
+ */
+extern Node *vfdw_plan_param_key(PlannerInfo *root, RelOptInfo *baserel,
+								 VfdwTableMap *map, Relids *outer);
 
 extern List *vfdw_plan_keys(List *fdw_private);
 extern const char *vfdw_plan_pattern(List *fdw_private);

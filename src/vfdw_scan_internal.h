@@ -184,6 +184,16 @@ typedef struct VfdwScanState
 
 	/* VFDW_SCAN_KNN only; zeroed and unused for every other strategy. */
 	VfdwKnnScan knn;
+
+	/*
+	 * VFDW_SCAN_KEY_PARAM only: the key expression, and where to evaluate it.
+	 *
+	 * Evaluated at every (re)scan rather than once, because that is the whole
+	 * point - the value comes from the outer row of a nested loop and is a
+	 * different key each time round.
+	 */
+	ExprState  *param_key;
+	ExprContext *param_econtext;
 } VfdwScanState;
 
 /*
@@ -201,5 +211,8 @@ extern void vfdw_scan_queue_page(VfdwScanState *state);
 extern valkeyReply *vfdw_scan_take_replies(VfdwScanState *state);
 
 extern void vfdw_scan_seen_reset(VfdwScanState *state);
+
+/* Evaluate the parameterised key for this pass; see the definition. */
+extern void vfdw_scan_param_refresh(VfdwScanState *state);
 
 #endif							/* VFDW_SCAN_INTERNAL_H */

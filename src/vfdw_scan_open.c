@@ -47,6 +47,8 @@
 #include "vfdw_search.h"
 #include "vfdw_ttl.h"
 
+#include "utils/builtins.h"
+
 /* See vfdw_scan_batch_stats in vfdw_scan.h for what these are for. */
 static uint64 vfdw_scan_batch_contexts = 0;
 static uint64 vfdw_scan_batch_resets = 0;
@@ -56,6 +58,53 @@ vfdw_scan_batch_stats(uint64 *contexts, uint64 *resets)
 {
 	*contexts = vfdw_scan_batch_contexts;
 	*resets = vfdw_scan_batch_resets;
+}
+
+/*
+ * The key this pass will fetch, from the outer row.
+ *
+ * THE SCOPING RULE MOVES HERE. A table confined to a keyprefix must never
+ * fetch a key outside it - src/vfdw_plan.c states why: the key column would
+ * then be filled with a name that satisfies the very recheck meant to exclude
+ * it. For a constant key vfdw_keys_refine drops it while planning. A
+ * parameterised key has no value until now, so the same check runs now, and a
+ * key outside the prefix leaves this pass with NO keys rather than one.
+ *
+ * A NULL key is the same answer: `key = NULL` matches nothing, so there is
+ * nothing to fetch.
+ */
+void
+vfdw_scan_param_refresh(VfdwScanState *state)
+{
+	Datum		value;
+	bool		isnull;
+	char	   *key;
+	MemoryContext old;
+
+	state->n_plan_keys = 0;
+
+	if (state->param_key == NULL)
+		return;
+
+	value = ExecEvalExpr(state->param_key, state->param_econtext, &isnull);
+	if (isnull)
+		return;
+
+	old = MemoryContextSwitchTo(state->scan_cxt);
+	key = TextDatumGetCString(value);
+
+	if (state->map->keyprefix == NULL ||
+		strncmp(key, state->map->keyprefix,
+				strlen(state->map->keyprefix)) == 0)
+	{
+		state->plan_keys = palloc(sizeof(char *));
+		state->plan_keylens = palloc(sizeof(size_t));
+		state->plan_keys[0] = key;
+		state->plan_keylens[0] = strlen(key);
+		state->n_plan_keys = 1;
+	}
+
+	MemoryContextSwitchTo(old);
 }
 
 /*
@@ -106,6 +155,14 @@ vfdw_scan_adopt_plan(VfdwScanState *state, ForeignScan *plan)
 		vfdw_search_adopt(state, plan);
 		return;
 	}
+
+	/*
+	 * The parameterised key has no value yet - it names a column of another
+	 * relation - so nothing is set here. vfdw_scan_param_refresh fills it at
+	 * every (re)scan, which is where the outer row exists.
+	 */
+	if (state->strategy == VFDW_SCAN_KEY_PARAM)
+		return;
 
 	if (state->strategy != VFDW_SCAN_KEYSPACE)
 		vfdw_scan_set_keys(state, vfdw_plan_keys(plan->fdw_private));
@@ -200,6 +257,15 @@ vfdw_scan_begin(ForeignScanState *node, int eflags)
 	if (state->strategy == VFDW_SCAN_KNN)
 		vfdw_search_init(state, node);
 
+	if (state->strategy == VFDW_SCAN_KEY_PARAM)
+	{
+		ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
+
+		state->param_key = ExecInitExpr((Expr *) linitial(fsplan->fdw_exprs),
+										(PlanState *) node);
+		state->param_econtext = node->ss.ps.ps_ExprContext;
+	}
+
 	/*
 	 * The snapshot's curcid, captured once per scan. An entry is visible only
 	 * if it is OLDER than this, which is PostgreSQL's own heap rule and is
@@ -256,6 +322,13 @@ vfdw_scan_rescan(ForeignScanState *node)
 	vfdw_scan_batch_resets++;
 	MemoryContextReset(state->batch_cxt);
 	state->batch = vfdw_batch_begin(state->vconn, state->batch_cxt);
+
+	/*
+	 * The parameterised key is re-evaluated, because the outer row moved and
+	 * that is the entire reason this strategy exists.
+	 */
+	if (state->strategy == VFDW_SCAN_KEY_PARAM)
+		vfdw_scan_param_refresh(state);
 
 	/*
 	 * A search runs again rather than rewinding. Its query vector may be a

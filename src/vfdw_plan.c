@@ -29,6 +29,7 @@
 
 #include "vfdw_filter.h"
 #include "vfdw_knn.h"
+#include "vfdw_plan_internal.h"
 
 #include "catalog/pg_operator_d.h"
 #include "catalog/pg_type.h"
@@ -64,7 +65,7 @@
  * vfdw_key_column_pushable still refuses what it should: a domain over bytea
  * is binary in both directions, and it would become reachable here.
  */
-static bool
+bool
 vfdw_is_key_var(RelOptInfo *baserel, VfdwTableMap *map, Node *node)
 {
 	Var		   *var;
@@ -82,7 +83,7 @@ vfdw_is_key_var(RelOptInfo *baserel, VfdwTableMap *map, Node *node)
 }
 
 /* The type's own equality, rather than a hardcoded pg_proc OID. */
-static bool
+bool
 vfdw_is_equality(Oid opno, Oid vartype)
 {
 	TypeCacheEntry *typentry = lookup_type_cache(vartype, TYPECACHE_EQ_OPR);
@@ -152,7 +153,7 @@ vfdw_collation_is_deterministic(Oid collid)
  * is injective - which the type system does not expose, and getting it wrong
  * loses rows rather than costing a round trip.
  */
-static bool
+bool
 vfdw_key_column_pushable(VfdwTableMap *map)
 {
 	const VfdwColumn *col;
@@ -610,9 +611,40 @@ vfdw_plan_search(PlannerInfo *root, RelOptInfo *baserel, VfdwTableMap *map,
 	return vfdw_plan_private(VFDW_SCAN_KNN, NIL, NULL, &knn, filter);
 }
 
+/*
+ * The parameterised key, into fdw_exprs. True when there is one.
+ *
+ * Called only when the planner says it chose a parameterised path -
+ * best_path->param_info - rather than whenever a join clause exists. Deciding
+ * it here instead would encode a path the planner may not have taken, and the
+ * executor would then wait for a parameter nobody supplies.
+ *
+ * fdw_exprs and not fdw_private, for the reason the search's query vector
+ * gives: it holds a Param, and only fdw_exprs is renumbered by setrefs.c.
+ */
+static bool
+vfdw_plan_param_encode(PlannerInfo *root, RelOptInfo *baserel,
+					   VfdwTableMap *map, List **fdw_exprs)
+{
+	Relids		outer = NULL;
+	Node	   *key = vfdw_plan_param_key(root, baserel, map, &outer);
+
+	if (key == NULL)
+		return false;
+
+	*fdw_exprs = list_make1(key);
+	return true;
+}
+
+/*
+ * The parameterised key, for GetForeignPaths to decide whether to offer the
+ * path at all. Exposed because the decision and the encoding happen in
+ * different callbacks and must agree; re-deriving it in each is what keeps
+ * them from drifting, exactly as the KNN matcher does.
+ */
 List *
 vfdw_scan_plan(PlannerInfo *root, RelOptInfo *baserel, VfdwTableMap *map,
-			   List *clauses, List **fdw_exprs)
+			   List *clauses, List **fdw_exprs, bool parameterised)
 {
 	List	   *keys = NIL;
 
@@ -627,6 +659,10 @@ vfdw_scan_plan(PlannerInfo *root, RelOptInfo *baserel, VfdwTableMap *map,
 	 * the key column with the value the recheck tests against, so rows from
 	 * the wrong key would pass a filter meant to exclude them.
 	 */
+	if (parameterised &&
+		vfdw_plan_param_encode(root, baserel, map, fdw_exprs))
+		return vfdw_plan_private(VFDW_SCAN_KEY_PARAM, NIL, NULL, NULL, NIL);
+
 	if (map->singleton_key != NULL)
 		return vfdw_plan_private(VFDW_SCAN_SINGLETON,
 								 list_make1(makeString(pstrdup(map->singleton_key))),
@@ -720,6 +756,8 @@ vfdw_scan_strategy_name(List *fdw_private)
 			return "Singleton Key";
 		case VFDW_SCAN_KNN:
 			return "Vector KNN";
+		case VFDW_SCAN_KEY_PARAM:
+			return "Key Lookup (parameterised)";
 		case VFDW_SCAN_KEYSPACE:
 			break;
 	}

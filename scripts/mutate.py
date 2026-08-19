@@ -724,6 +724,46 @@ MUTATIONS = [
      "\t\t!vfdw_filter_name_is_safe(col->field))",
      "\t\tfalse)",
      "standalone", "knnplan"),
+
+    # The parameterised path itself.
+    #
+    # Without it a join against a foreign table has one plan available: walk
+    # the whole keyspace and filter above the scan. It returns the RIGHT ROWS
+    # - which is why nothing caught it for so long - and asks the server for
+    # every key to do it. fetch asserts the scan count, not the rows.
+    ("P1-parampath", "src/valkey_fdw.c",
+     "\t\t\t\t\t\t\t\t\t outer,\n\t\t\t\t\t\t\t\t\t NULL,",
+     "\t\t\t\t\t\t\t\t\t NULL,\n\t\t\t\t\t\t\t\t\t NULL,",
+     "standalone", "fetch"),
+
+    # The prefix rule, moved to run time with the key.
+    #
+    # A constant key outside the keyprefix is dropped while planning. A
+    # parameterised one has no value until the scan runs, so the check runs
+    # there - and without it the scan fetches a key outside the table's own
+    # keyspace and fills the key column with a name that satisfies the very
+    # recheck meant to exclude it. src/vfdw_plan.c's header states the rule;
+    # this is the second place it now has to hold.
+    #
+    # Came back GREEN first time, against a test that asserted the GET count
+    # for `WHERE o.k = 'other:9'`. The planner folds that into a CONSTANT key,
+    # so the runtime path was never taken - and a key that does not exist
+    # answers nil either way. fetch now seeds the outside key and counts ROWS.
+    ("P2-paramprefix", "src/vfdw_scan_open.c",
+     "\tif (state->map->keyprefix == NULL ||\n"
+     "\t\tstrncmp(key, state->map->keyprefix,\n"
+     "\t\t\t\tstrlen(state->map->keyprefix)) == 0)",
+     "\tif (true)",
+     "standalone", "fetch"),
+
+    # A NULL key matches nothing, so there is nothing to fetch.
+    #
+    # Without the check the NULL Datum is handed to TextDatumGetCString, which
+    # is a read through a pointer the executor never set.
+    ("P3-paramnull", "src/vfdw_scan_open.c",
+     "\tif (isnull)\n\t\treturn;",
+     "\tif (false)\n\t\treturn;",
+     "standalone", "fetch"),
 ]
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

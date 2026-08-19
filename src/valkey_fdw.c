@@ -512,6 +512,55 @@ vfdwKnnPathkeys(PlannerInfo *root, RelOptInfo *baserel, Oid relid, double *rows)
 	return root->query_pathkeys;
 }
 
+/*
+ * Offer a path that fetches ONE key named by another relation.
+ *
+ * Without this the only path on offer is a keyspace walk, so a join against
+ * this table can only be answered by walking every key and filtering above the
+ * scan - which is what it cost: a three-row join over 2500 keys sent 2503
+ * commands. With it the planner may put this relation on the inner side of a
+ * nested loop and ask for one key per outer row.
+ *
+ * The path is OFFERED, not imposed. It carries a cost the planner compares
+ * against the walk, so a join that really does want most of the keyspace still
+ * gets the scan - which is the right answer, and not one this file should be
+ * making on the planner's behalf.
+ */
+static void
+vfdw_plan_param_path(PlannerInfo *root, RelOptInfo *baserel)
+{
+	VfdwTableMap *map = (VfdwTableMap *) baserel->fdw_private;
+	Relids		outer = NULL;
+	ParamPathInfo *ppi;
+
+	if (vfdw_plan_param_key(root, baserel, map, &outer) == NULL)
+		return;
+
+	ppi = get_baserel_parampathinfo(root, baserel, outer);
+
+	/*
+	 * One round trip and one row. The row count is the planner's own estimate
+	 * for the parameterised clause rather than a number invented here; the
+	 * cost is a single fetch, which is what this path actually does.
+	 */
+	add_path(baserel, (Path *)
+			 create_foreignscan_path(root, baserel,
+									 NULL,
+									 ppi != NULL ? ppi->ppi_rows : 1,
+#if PG_VERSION_NUM >= 180000
+									 0,
+#endif
+									 1,		/* startup: one command */
+									 1 + cpu_tuple_cost,
+									 NIL,
+									 outer,
+									 NULL,
+#if PG_VERSION_NUM >= 170000
+									 NIL,
+#endif
+									 NIL));
+}
+
 static void
 vfdwGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
 {
@@ -546,6 +595,8 @@ vfdwGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
 									 NIL,	/* no fdw_restrictinfo */
 #endif
 									 NIL));	/* no fdw_private */
+
+	vfdw_plan_param_path(root, baserel);
 }
 
 static ForeignScan *
@@ -557,7 +608,6 @@ vfdwGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 	List	   *fdw_exprs;
 
 	(void) foreigntableid;
-	(void) best_path;
 
 	/*
 	 * Every restriction clause stays with the scan node for the executor to
@@ -570,7 +620,8 @@ vfdwGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 
 	fdw_private = vfdw_scan_plan(root, baserel,
 								 (VfdwTableMap *) baserel->fdw_private,
-								 scan_clauses, &fdw_exprs);
+								 scan_clauses, &fdw_exprs,
+								 best_path->path.param_info != NULL);
 
 	/*
 	 * fdw_exprs holds the query vector of a search and nothing otherwise. It

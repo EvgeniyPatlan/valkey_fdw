@@ -39,7 +39,7 @@ including against a cluster. Vector search does not.
 | List order | a `position` column reports a member's index, so `ORDER BY` can restore the order the list is in |
 | Table shapes | one column per field or member, or `legacy_value 'true'` for the whole collection in one array column, written whole |
 | Discovery | keyspace scan, `keyprefix`, `keyset` index, `singleton_key` |
-| Pushdown | `key = 'literal'` answered with a single fetch, including on a `keyset` table |
+| Pushdown | `key = 'literal'` answered with a single fetch, including on a `keyset` table. A join on the key column is answered one fetch per outer row rather than by walking the keyspace |
 | Estimates | `singleton_key` and `keyset` tables are counted at plan time; every other shape needs `ANALYZE`, which is never automatic for a foreign table |
 | Writes | `INSERT`, `UPDATE`, `DELETE`, `COPY FROM` — one atomic unit per transaction |
 | Transport | TLS with hostname verification, ACL auth, RESP3 with a tested RESP2 fallback |
@@ -400,6 +400,35 @@ stand for is described under *Usage*: a vector table answers one query shape,
 and walking its keyspace for the others would answer a plain `SELECT`
 correctly and a nearest-neighbour query with the wrong rows in the wrong
 order.
+
+### A join on the key column
+
+A foreign table joined to a local one on its key column is read **one key per
+outer row**, not by walking the keyspace and filtering afterwards:
+
+```
+Nested Loop
+  ->  Seq Scan on outer_keys o
+  ->  Foreign Scan on t
+        Filter: (k = o.k)
+        Valkey Strategy: Key Lookup (parameterised)
+```
+
+Measured against 2500 keys, a three-row join: **2503 commands before, 6
+after**. The rows were correct either way, which is why it went unnoticed —
+the only externally visible difference is how much the server was asked to do,
+and that is what the suite asserts.
+
+The path is *offered*, not imposed: it carries a cost the planner compares
+against the keyspace walk, so a join that really does want most of the
+keyspace still gets the walk.
+
+A key that falls outside the table's `keyprefix` is **not fetched**. For a
+literal the planner drops it while building the plan; a key that arrives from
+another relation has no value until the scan runs, so the same rule is applied
+there. Without it the scan would return a row whose key column holds a name
+outside the table's own keyspace — a name that satisfies the very recheck
+meant to exclude it.
 
 A `ttl` column is refused only when the server has no per-field expiry, which
 is a fact about the server rather than about the wrapper. It is reported when

@@ -205,9 +205,105 @@ SELECT fx_plan_rows('SELECT * FROM fx_ks') AS estimated_after_growth;
 SELECT fx_plan_rows('SELECT * FROM fx') AS estimated_keyspace;
 
 DROP FUNCTION fx_plan_rows(text);
+-- ---------------------------------------------------------------------------
+-- A JOIN DRIVEN BY ANOTHER RELATION'S KEYS, one GET per outer row.
+--
+-- Until this path existed, a join against a foreign table had exactly one
+-- plan available: walk the whole keyspace and let the join clause filter above
+-- the scan. Three outer rows cost a walk of every key - measured against 2500
+-- keys, 2503 commands for three rows.
+--
+-- The clause is NOT in baserel->joininfo, which is where the first version of
+-- this looked and found nothing: `t.key = o.key` is mergejoinable, so the
+-- planner folds it into an EquivalenceClass and joininfo is empty. It has to
+-- be asked for with generate_implied_equalities_for_column, which is what
+-- postgres_fdw does for the same reason.
+--
+-- ASSERTED ON COMMANDS SENT, like everything else in this file: the rows come
+-- back either way, and the only externally visible difference between the two
+-- plans is how much the server was asked to do.
+-- ---------------------------------------------------------------------------
+SELECT num AS join_keys_seeded
+FROM valkey_fdw_test_probe('fx_srv', 0, 'MSET',
+    'fx:j1', 'one', 'fx:j2', 'two', 'fx:j3', 'three', 'fx:j4', 'four');
+
+CREATE FOREIGN TABLE fx_join (
+    k text OPTIONS (key 'true'),
+    v text
+) SERVER fx_srv OPTIONS (tabletype 'string', keyprefix 'fx:j');
+
+CREATE TABLE fx_outer (k text);
+INSERT INTO fx_outer VALUES ('fx:j1'), ('fx:j3');
+
+-- A nested loop is forced, because what is being asserted is the SCAN's
+-- behaviour on the inner side and a hash join would answer correctly without
+-- ever putting the question.
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+
+EXPLAIN (COSTS OFF)
+SELECT o.k, j.v FROM fx_outer o JOIN fx_join j ON j.k = o.k;
+
+SELECT reply_type AS stats_reset
+FROM valkey_fdw_test_probe('fx_srv', 0, 'CONFIG', 'RESETSTAT');
+
+SELECT o.k, j.v FROM fx_outer o JOIN fx_join j ON j.k = o.k ORDER BY o.k;
+
+-- TWO gets, one per outer row, and NO scan of the keyspace. The scan count is
+-- the half that matters: a plan that fetched the right rows after walking
+-- every key would pass the row assertion above and fail this one.
+SELECT fx_calls('get')  AS gets,
+       fx_calls('scan') AS scans;
+
+-- A KEY OUTSIDE THE PREFIX IS NEVER FETCHED, and the key has to EXIST for the
+-- case to mean anything.
+--
+-- For a constant key the planner drops it while building the plan. A
+-- parameterised key has no value until the scan runs, so the same rule is
+-- applied there.
+--
+-- The first version of this asserted `WHERE o.k = 'other:9'` and counted the
+-- GETs. It proved nothing twice over: the planner folds that into a CONSTANT
+-- key, so the runtime path was never taken - and even on the runtime path, a
+-- key that does not exist answers nil and yields no row either way. A mutation
+-- that removed the check came back GREEN.
+--
+-- So the key is seeded, and the assertion is the ROW COUNT of a join with no
+-- WHERE at all. Without the rule the scan fetches other:9, gets a value, and
+-- emits a row whose key column holds a name outside this table's keyspace -
+-- which is the wrong answer the rule exists to prevent, and it is only wrong
+-- when the key is there.
+SELECT valkey_fdw_test_poke('fx_srv', 'other:9'::bytea, 'leaked'::bytea)
+    AS seeded_outside;
+
+INSERT INTO fx_outer VALUES ('other:9');
+
+SELECT reply_type AS stats_reset
+FROM valkey_fdw_test_probe('fx_srv', 0, 'CONFIG', 'RESETSTAT');
+
+SELECT count(*) AS rows_with_an_outside_key_in_the_join
+FROM fx_outer o JOIN fx_join j ON j.k = o.k;
+
+-- Two gets, for the two keys inside the prefix. The third outer row is not
+-- asked about at all.
+SELECT fx_calls('get') AS gets;
+
+-- A NULL key matches nothing, so there is nothing to fetch.
+INSERT INTO fx_outer VALUES (NULL);
+
+SELECT count(*) AS rows_including_null_key
+FROM fx_outer o JOIN fx_join j ON j.k = o.k;
+
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+
+DROP TABLE fx_outer;
+DROP FOREIGN TABLE fx_join;
+
 DROP FUNCTION fx_calls(text);
 SELECT num AS keys_removed
 FROM valkey_fdw_test_probe('fx_srv', 0, 'DEL', 'fx:1', 'fx:2',
-                           'fx:set', 'fx:m1', 'fx:stranger', 'fx:z');
+                           'fx:set', 'fx:m1', 'fx:stranger', 'fx:z',
+                           'fx:j1', 'fx:j2', 'fx:j3', 'fx:j4', 'other:9');
 
 DROP SERVER fx_srv CASCADE;
