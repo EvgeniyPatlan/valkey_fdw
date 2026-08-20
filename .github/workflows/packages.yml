@@ -285,7 +285,7 @@ jobs:
       #
       # dbgsym packages are not published. They are large, they are wanted
       # rarely, and they are reproducible from the tag.
-      - name: Collect and checksum
+      - name: Collect the packages
         run: |
           set -euo pipefail
           mkdir -p release
@@ -310,7 +310,6 @@ jobs:
           # 8 targets x 5 majors, less amazon-2023/pg14 which that
           # distribution does not carry.
           [ "$n" -eq 39 ] || { echo "expected 39 packages, collected $n" >&2; exit 1; }
-          sha256sum * > SHA256SUMS
 
       # THE PGXN ARCHIVE.
       #
@@ -335,8 +334,13 @@ jobs:
           unzip -l "release/valkey_fdw-${v}.zip" | grep -q "valkey_fdw-${v}/META.json" \
             || { echo "no META.json at the archive root" >&2; exit 1; }
           echo "pgxn archive: $(du -h "release/valkey_fdw-${v}.zip" | cut -f1)"
-          # Checksummed with everything else, so re-run the sums.
-          ( cd release && sha256sum -- * > SHA256SUMS )
+          # Every artifact the release will carry now exists, so the sums are
+          # written once, here, rather than written twice and the second one
+          # summing the first. SHA256SUMS is removed before the glob is taken:
+          # a sums file that lists itself records the hash of the empty file
+          # the redirection just made, and `sha256sum -c SHA256SUMS` then
+          # reports FAILED for the one line nobody can fix.
+          ( cd release && rm -f SHA256SUMS && sha256sum -- * > SHA256SUMS )
 
       - name: Create the release
         env:
