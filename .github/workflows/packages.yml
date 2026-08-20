@@ -334,13 +334,33 @@ jobs:
           unzip -l "release/valkey_fdw-${v}.zip" | grep -q "valkey_fdw-${v}/META.json" \
             || { echo "no META.json at the archive root" >&2; exit 1; }
           echo "pgxn archive: $(du -h "release/valkey_fdw-${v}.zip" | cut -f1)"
-          # Every artifact the release will carry now exists, so the sums are
-          # written once, here, rather than written twice and the second one
-          # summing the first. SHA256SUMS is removed before the glob is taken:
-          # a sums file that lists itself records the hash of the empty file
-          # the redirection just made, and `sha256sum -c SHA256SUMS` then
-          # reports FAILED for the one line nobody can fix.
-          ( cd release && rm -f SHA256SUMS && sha256sum -- * > SHA256SUMS )
+
+      # THE SUMS, LAST, AND CHECKED.
+      #
+      # Its own step because the two previous attempts were each written at
+      # the foot of whichever step happened to be last at the time, and the
+      # second of them summed the file the first had left behind: shell
+      # redirection truncates SHA256SUMS before sha256sum reads it, so the
+      # file recorded itself as the hash of an empty file. v0.2.0 shipped
+      # that - forty correct lines and one that reports FAILED, on a download
+      # with nothing whatever wrong with it.
+      #
+      # Verified here rather than assumed, because that is the check which
+      # would have caught it. A sums file is worth shipping only if it
+      # verifies, and this run is the only place that can find out for free.
+      - name: Checksum the release
+        run: |
+          set -euo pipefail
+          cd release
+          # Removed before the glob is taken, so a re-run cannot sum a sums
+          # file. Nothing has written one at this point; the rm is what keeps
+          # that true if a step is ever added above.
+          rm -f SHA256SUMS
+          sha256sum -- * > SHA256SUMS
+          # The 39 packages asserted above, plus the PGXN archive.
+          n=$(wc -l < SHA256SUMS)
+          [ "$n" -eq 40 ] || { echo "expected 40 sums, wrote $n" >&2; exit 1; }
+          sha256sum -c --quiet SHA256SUMS
 
       - name: Create the release
         env:
